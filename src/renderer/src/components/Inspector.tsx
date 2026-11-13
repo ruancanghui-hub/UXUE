@@ -12,16 +12,23 @@ import {
   type GenerationConfig,
   type PromptSettings,
 } from '../../../shared/generation';
+import type { ExportResult } from '../../../shared/export';
 import {
   currentVersion,
+  DEVICE_PRESETS,
   isImageCard,
+  isPageCard,
   isPromptCard,
+  isRefCard,
   isThemeCard,
+  pageLogicalSize,
   normalizeHex,
   RULE_LABELS,
   themeSuffix,
   type ImageCard,
+  type PageCard,
   type PromptCard,
+  type RefCard,
   type ThemeCard,
   type ThemeColor,
   type ThemeRules,
@@ -63,6 +70,12 @@ interface InspectorProps {
   onNewPrompt(): void;
   onUpdateTheme(id: string, patch: Partial<Omit<ThemeCard, 'kind' | 'id'>>): void;
   onSetActiveTheme(id: string | null): void;
+  onUpdatePage(id: string, patch: Partial<Omit<PageCard, 'kind' | 'id'>>): void;
+  onSetPagePreset(id: string, presetId: string | null): void;
+  onReplaceLowFi(pageId: string): void;
+  onExportPage(pageId: string): void;
+  onPlaceInPage(imageCardId: string, pageId: string): void;
+  exports: ReadonlyMap<string, ExportResult | 'running' | { error: string }>;
 }
 
 export const Inspector = forwardRef<InspectorHandle, InspectorProps>(function Inspector(props, ref) {
@@ -85,6 +98,8 @@ export const Inspector = forwardRef<InspectorHandle, InspectorProps>(function In
       {only && isImageCard(only) && <ImageInfo card={only} {...props} />}
       {only && isPromptCard(only) && <PromptInfo card={only} textareaRef={promptRef} {...props} />}
       {only && isThemeCard(only) && <ThemeInfo card={only} {...props} />}
+      {only && isPageCard(only) && <PageInfo card={only} {...props} />}
+      {only && isRefCard(only) && <RefInfo card={only} {...props} />}
       {selected.length > 1 && (
         <section className="inspector-section">
           <div className="panel-title">已选 {selected.length} 个对象</div>
@@ -193,6 +208,8 @@ function ImageInfo(props: InspectorProps & { card: ImageCard }) {
         <button onClick={() => props.onImportVersion(card.id)}>导入为新版本…</button>
         <button onClick={props.onNewPrompt}>用这张图新建提示词卡（P）</button>
       </section>
+
+      <PlaceInPage {...props} />
 
       <section className="inspector-section">
         <CardActions {...props} />
@@ -334,6 +351,160 @@ function PromptInfo(props: InspectorProps & { card: PromptCard; textareaRef: Rea
         )}
       </section>
 
+      <section className="inspector-section">
+        <CardActions {...props} />
+      </section>
+    </>
+  );
+}
+
+function PlaceInPage(props: InspectorProps & { card: ImageCard }) {
+  const pages = props.state.cards.filter(isPageCard);
+  const [pageId, setPageId] = useState(pages[0]?.id ?? '');
+  const refs = props.state.cards.filter((c) => isRefCard(c) && c.imageCardId === props.card.id).length;
+  if (pages.length === 0) return null;
+  const target = pages.some((p) => p.id === pageId) ? pageId : pages[0].id;
+  return (
+    <section className="inspector-section">
+      <div className="panel-title">
+        放进页面 {refs > 0 && <span className="dim">已被引用 {refs} 次</span>}
+      </div>
+      <p className="hint">也可以直接把它拖到页面框上松手（按住 ⌥ 拖则只是移动）。</p>
+      <div className="button-row tight">
+        <select className="grow" value={target} onChange={(e) => setPageId(e.target.value)}>
+          {pages.map((page) => (
+            <option key={page.id} value={page.id}>
+              {page.name}
+            </option>
+          ))}
+        </select>
+        <button onClick={() => props.onPlaceInPage(props.card.id, target)}>放进去</button>
+      </div>
+    </section>
+  );
+}
+
+function PageInfo(props: InspectorProps & { card: PageCard }) {
+  const { card, state, cacheBust } = props;
+  const logical = pageLogicalSize(card);
+  const refs = state.cards.filter((c): c is RefCard => isRefCard(c) && c.pageId === card.id);
+  const exported = props.exports.get(card.id);
+  return (
+    <>
+      <section className="inspector-section">
+        <div className="panel-title">页面框</div>
+        <NameInput id={card.id} name={card.name} onRename={props.onRename} label="页面名称" />
+        <div className="field">
+          <span className="field-label">设备</span>
+          <select value={card.devicePreset ?? ''} onChange={(e) => props.onSetPagePreset(card.id, e.target.value || null)}>
+            <option value="">{card.base ? '跟随低保真原型' : '画布尺寸'}</option>
+            {DEVICE_PRESETS.map((preset) => (
+              <option key={preset.id} value={preset.id}>
+                {preset.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <Field label="逻辑尺寸" value={`${logical.width} × ${logical.height}`} />
+        <div className="field">
+          <span className="field-label">导出倍数</span>
+          <div className="segmented small">
+            {[1, 2, 3].map((scale) => (
+              <button key={scale} className={card.exportScale === scale ? 'active' : ''} onClick={() => props.onUpdatePage(card.id, { exportScale: scale })}>
+                {scale}x
+              </button>
+            ))}
+          </div>
+        </div>
+        <Field label="导出尺寸" value={`${logical.width * card.exportScale} × ${logical.height * card.exportScale} px`} />
+        <div className="field">
+          <span className="field-label">背景色</span>
+          <ColorInput value={card.background} onCommit={(background) => props.onUpdatePage(card.id, { background })} />
+        </div>
+      </section>
+
+      <section className="inspector-section">
+        <div className="panel-title">低保真原型</div>
+        {card.base ? (
+          <img className="lowfi-thumb" src={thumbnailUrl(card.base, cacheBust.get(card.base.id))} alt="" />
+        ) : (
+          <p className="hint">还没有低保真原型，现在只有背景色。</p>
+        )}
+        <div className="button-row tight">
+          <button onClick={() => props.onReplaceLowFi(card.id)}>{card.base ? '替换…' : '选择图片…'}</button>
+          {card.base && <button onClick={() => props.onUpdatePage(card.id, { base: null })}>移除</button>}
+        </div>
+      </section>
+
+      <section className="inspector-section">
+        <div className="panel-title">
+          页面里的素材 <span className="dim">{refs.length}</span>
+        </div>
+        {refs.length === 0 && <p className="hint">把核心素材拖到这个页面框上松手，就会放进来一个引用。</p>}
+        {[...refs].reverse().map((ref) => {
+          const source = state.cards.find((c) => c.id === ref.imageCardId);
+          if (!source || !isImageCard(source)) return null;
+          return (
+            <button key={ref.id} className="layer-row" onClick={() => props.onSelectCard(ref.id)}>
+              <img className="layer-thumb" src={thumbnailUrl(currentVersion(source), cacheBust.get(source.currentVersionId))} alt="" />
+              <span className="layer-name">{source.name}</span>
+            </button>
+          );
+        })}
+      </section>
+
+      <section className="inspector-section">
+        <div className="panel-title">导出</div>
+        <p className="hint">导出到项目的 exports/{card.name}/：整页 PNG、分层 SVG（可直接拖进 Figma）、素材包（每个素材 @1x/@2x/@3x）和坐标清单。</p>
+        <button className="primary" disabled={exported === 'running'} onClick={() => props.onExportPage(card.id)}>
+          {exported === 'running' ? '导出中…' : '导出页面  ⌘⇧E'}
+        </button>
+        {exported && exported !== 'running' && 'error' in exported && <p className="warning">导出失败：{exported.error}</p>}
+        {exported && exported !== 'running' && 'folder' in exported && (
+          <>
+            <p className="good-text">
+              已导出 {exported.png.width} × {exported.png.height} PNG、{exported.svg.layers.length} 层 SVG、{exported.files.length - 3} 个素材文件
+            </p>
+            <button className="link" onClick={() => props.onReveal(`${props.projectDir}/${exported.folder}/page.png`)}>
+              在 Finder 中显示
+            </button>
+          </>
+        )}
+      </section>
+
+      <section className="inspector-section">
+        <CardActions {...props} />
+      </section>
+    </>
+  );
+}
+
+function RefInfo(props: InspectorProps & { card: RefCard }) {
+  const { card, state, cacheBust } = props;
+  const source = state.cards.find((c) => c.id === card.imageCardId);
+  const page = card.pageId ? state.cards.find((c) => c.id === card.pageId) : undefined;
+  return (
+    <>
+      <section className="inspector-section">
+        <div className="panel-title">素材引用</div>
+        {source && isImageCard(source) ? (
+          <>
+            <div className="ref-source">
+              <img className="lowfi-thumb" src={thumbnailUrl(currentVersion(source), cacheBust.get(source.currentVersionId))} alt="" />
+              <div>
+                <div className="field-value">{source.name}</div>
+                <div className="hint">版本 {source.versions.indexOf(currentVersion(source)) + 1} / {source.versions.length}</div>
+              </div>
+            </div>
+            <p className="hint">显示的是原图像卡的当前版本；在原图像卡的版本栈里换版本，这里会跟着变。</p>
+            <button onClick={() => props.onSelectCard(source.id)}>选中原图像卡</button>
+          </>
+        ) : (
+          <p className="warning">引用的图像卡已经不在了</p>
+        )}
+        <Field label="所在页面" value={page && isPageCard(page) ? page.name : '不在任何页面里'} />
+        <Field label="画布尺寸" value={`${Math.round(card.width)} × ${Math.round(card.height)}`} />
+      </section>
       <section className="inspector-section">
         <CardActions {...props} />
       </section>

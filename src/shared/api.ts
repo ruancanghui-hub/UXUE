@@ -1,5 +1,6 @@
 import type { AssistantRequest, AssistantResponse } from './assistant';
 import type { BenchManifest, BenchProgress, BenchReport } from './bench';
+import type { ExportResult, PageExportPlan } from './export';
 import type { GenerationConfig, GenerationRequest, JobUpdate, ProviderId } from './generation';
 import type { ProjectFile, Version } from './project';
 
@@ -16,6 +17,8 @@ export interface LaunchFlags {
   m2Check: CheckPhase | null;
   /** M3 验收自检：用本地模拟助手生成主题卡、为四个金刚位写提示词卡 */
   m3Check: CheckPhase | null;
+  /** M4 验收自检：完整跑一遍寿司首页（主题 → 素材 → 页面 → 导出） */
+  m4Check: CheckPhase | null;
 }
 
 export interface RecentProject {
@@ -72,6 +75,9 @@ export type MenuCommand =
   | 'generate'
   | 'openSettings'
   | 'toggleAssistant'
+  | 'newPageFromLowFi'
+  | 'newBlankPage'
+  | 'exportPage'
   | `openRecent:${string}`;
 
 export interface AnyeApi {
@@ -102,6 +108,9 @@ export interface AnyeApi {
   cancelAllGenerations(): void;
   onGenerationUpdate(listener: (update: JobUpdate) => void): () => void;
   askAssistant(request: AssistantRequest): Promise<AssistantResponse>;
+  exportPage(projectDir: string, plan: PageExportPlan): Promise<ExportResult>;
+  /** 开发和验收用：生成一张首页低保真线框图，返回它的路径 */
+  sampleLowFi(): Promise<string>;
 
   prepareBench(count: number): Promise<BenchManifest>;
   onBenchProgress(listener: (progress: BenchProgress) => void): () => void;

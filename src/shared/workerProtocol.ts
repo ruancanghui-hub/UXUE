@@ -28,6 +28,10 @@ export type WorkerRequest =
   | { requestId: number; type: 'ensureCache'; dir: string; key: string; file: string }
   /** 把输入图缩到长边 ≤ 2048 的 PNG，减小上传体积和图像输入 token */
   | { requestId: number; type: 'prepareInput'; path: string; maxEdge?: number }
+  /** 导出一个页面：整页 PNG、分层 SVG、素材包（每个素材 @1x/@2x/@3x）和清单 */
+  | ({ requestId: number; type: 'exportPage' } & ExportRequest)
+  /** 开发和验收用：生成一张 iPhone 3 倍尺寸的首页低保真线框图 */
+  | { requestId: number; type: 'sampleLowFi'; path: string }
   /** 本地模拟生成：基于输入图做明显可辨的变换，不联网 */
   | {
       requestId: number;
@@ -39,6 +43,8 @@ export type WorkerRequest =
       count: number;
       seed: number;
     };
+
+export type ExportRequest = { dir: string; folder: string; plan: import('./export').PageExportPlan };
 
 export interface PreparedInput {
   base64: string;

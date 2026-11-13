@@ -1,9 +1,11 @@
 import { copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
-import sharp from 'sharp';
+import sharp, { type OverlayOptions } from 'sharp';
+import { safeFileName, type ExportResult } from '../shared/export';
 import { CACHE_VERSION, cacheFiles, computeTiles, l2Size, tileExtent } from '../shared/textures';
 import type {
   EnsureCacheResult,
+  ExportRequest,
   GeneratedImage,
   ImportedImage,
   MockGenerateResult,
@@ -55,6 +57,12 @@ async function handle(request: WorkerRequest): Promise<void> {
         break;
       case 'mockGenerate':
         data = await mockGenerate(request);
+        break;
+      case 'exportPage':
+        data = await exportPage(request);
+        break;
+      case 'sampleLowFi':
+        data = await sampleLowFi(request.path);
         break;
     }
     parentPort.postMessage({ requestId: request.requestId, type: 'result', ok: true, data });
@@ -205,6 +213,151 @@ function gradientSvg(width: number, height: number, hue: number): string {
 
 function escapeXml(text: string): string {
   return text.replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' })[c]!);
+}
+
+// ───────────────────────── 导出 ─────────────────────────
+
+const ASSET_SCALES = [1, 2, 3];
+
+async function exportPage({ dir, folder, plan }: ExportRequest): Promise<ExportResult> {
+  const out = join(dir, folder);
+  await mkdir(join(out, 'assets'), { recursive: true });
+  const { width, height } = plan;
+
+  const base = plan.base
+    ? await sharp(join(dir, plan.base.file)).rotate().resize(width, height, { fit: 'fill' }).png().toBuffer()
+    : null;
+  const layers = await Promise.all(
+    plan.layers.map(async (layer) => ({
+      layer,
+      png: await sharp(join(dir, layer.file)).rotate().resize(layer.width, layer.height, { fit: 'fill' }).png().toBuffer(),
+    })),
+  );
+
+  // 整页 PNG：超出页面的部分裁掉（sharp 不允许叠加图超出底图）
+  const composites: OverlayOptions[] = [];
+  if (base) composites.push({ input: base, left: 0, top: 0 });
+  for (const { layer, png } of layers) {
+    const left = Math.max(0, -layer.x);
+    const top = Math.max(0, -layer.y);
+    const visibleWidth = Math.min(layer.width, width - layer.x) - left;
+    const visibleHeight = Math.min(layer.height, height - layer.y) - top;
+    if (visibleWidth <= 0 || visibleHeight <= 0) continue;
+    const input =
+      left === 0 && top === 0 && visibleWidth === layer.width && visibleHeight === layer.height
+        ? png
+        : await sharp(png).extract({ left, top, width: visibleWidth, height: visibleHeight }).toBuffer();
+    composites.push({ input, left: layer.x + left, top: layer.y + top });
+  }
+  const pagePng = 'page.png';
+  await sharp({ create: { width, height, channels: 4, background: plan.background } })
+    .composite(composites)
+    .png()
+    .toFile(join(out, pagePng));
+
+  // 分层 SVG：每个素材一个 <image>，id 就是 Figma 里的图层名
+  const dataUrl = (buffer: Buffer): string => `data:image/png;base64,${buffer.toString('base64')}`;
+  const svgLayers = layers.map(
+    ({ layer, png }) =>
+      `      <image id="${xmlAttr(layer.name)}" x="${layer.x}" y="${layer.y}" width="${layer.width}" height="${layer.height}" preserveAspectRatio="none" href="${dataUrl(png)}"/>`,
+  );
+  const svg = [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
+    `  <g id="${xmlAttr(plan.pageName)}">`,
+    `    <rect id="背景" width="${width}" height="${height}" fill="${plan.background}"/>`,
+    base ? `    <image id="低保真原型" width="${width}" height="${height}" preserveAspectRatio="none" href="${dataUrl(base)}"/>` : '',
+    `    <g id="素材">`,
+    ...svgLayers,
+    `    </g>`,
+    `  </g>`,
+    `</svg>`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+  const pageSvg = 'page.svg';
+  await writeFile(join(out, pageSvg), svg);
+
+  // 素材包：每个素材按逻辑尺寸导出 @1x/@2x/@3x，超过原图分辨率的倍数跳过
+  const files = [pagePng, pageSvg];
+  const manifest: { name: string; x: number; y: number; width: number; height: number; files: string[] }[] = [];
+  for (const { layer } of layers) {
+    const logicalWidth = layer.width / plan.exportScale;
+    const logicalHeight = layer.height / plan.exportScale;
+    const meta = await sharp(join(dir, layer.file)).metadata();
+    const originalWidth = meta.autoOrient?.width ?? meta.width ?? 0;
+    const entry = {
+      name: layer.name,
+      x: round2(layer.x / plan.exportScale),
+      y: round2(layer.y / plan.exportScale),
+      width: round2(logicalWidth),
+      height: round2(logicalHeight),
+      files: [] as string[],
+    };
+    for (const scale of ASSET_SCALES) {
+      const targetWidth = Math.round(logicalWidth * scale);
+      if (scale > 1 && targetWidth > originalWidth) continue;
+      const file = `assets/${safeFileName(layer.name)}@${scale}x.png`;
+      await sharp(join(dir, layer.file))
+        .rotate()
+        .resize(Math.max(1, targetWidth), Math.max(1, Math.round(logicalHeight * scale)), { fit: 'fill' })
+        .png()
+        .toFile(join(out, file));
+      entry.files.push(file);
+      files.push(file);
+    }
+    manifest.push(entry);
+  }
+  await writeFile(
+    join(out, 'manifest.json'),
+    JSON.stringify(
+      { page: plan.pageName, logicalWidth: plan.logicalWidth, logicalHeight: plan.logicalHeight, exportScale: plan.exportScale, layers: manifest },
+      null,
+      2,
+    ),
+  );
+  files.push('manifest.json');
+  return {
+    folder,
+    files,
+    png: { width, height },
+    svg: { layers: layers.map(({ layer }) => layer.name), bytes: Buffer.byteLength(svg) },
+  };
+}
+
+function xmlAttr(text: string): string {
+  return text.replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' })[c]!);
+}
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+/** 首页线框：顶部 Banner 区、一排四个金刚位圆、两行瓷片、底部导航，全是灰块和占位文字 */
+async function sampleLowFi(path: string): Promise<{ path: string; width: number; height: number }> {
+  const w = 1179;
+  const h = 2556;
+  const box = (x: number, y: number, bw: number, bh: number, r = 24, fill = '#D9D9DE'): string =>
+    `<rect x="${x}" y="${y}" width="${bw}" height="${bh}" rx="${r}" fill="${fill}"/>`;
+  const label = (x: number, y: number, text: string, size = 40, fill = '#7A7A85'): string =>
+    `<text x="${x}" y="${y}" font-family="PingFang SC, Helvetica" font-size="${size}" fill="${fill}">${text}</text>`;
+  const icons = [0, 1, 2, 3].map((i) => {
+    const cx = 160 + i * 286;
+    return `<circle cx="${cx}" cy="1060" r="110" fill="#D9D9DE"/>${label(cx - 80, 1230, ['热门寿司', '今日上新', '店长推荐', '全部菜单'][i], 38)}`;
+  });
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">
+    <rect width="100%" height="100%" fill="#FFFFFF"/>
+    ${label(72, 230, '寿司点餐', 64, '#2B2A2E')}
+    ${box(72, 300, 1035, 520, 36)}${label(450, 580, 'Banner', 56)}
+    ${icons.join('')}
+    ${label(72, 1400, '今日推荐', 52, '#2B2A2E')}
+    ${box(72, 1460, 500, 420)}${box(607, 1460, 500, 420)}
+    ${box(72, 1920, 500, 300)}${box(607, 1920, 500, 300)}
+    ${box(0, 2340, 1179, 216, 0, '#EFEFF2')}
+    ${[0, 1, 2, 3].map((i) => `<circle cx="${147 + i * 295}" cy="2420" r="34" fill="#C9C9CF"/>`).join('')}
+  </svg>`;
+  await mkdir(join(path, '..'), { recursive: true });
+  await sharp(Buffer.from(svg)).png().toFile(path);
+  return { path, width: w, height: h };
 }
 
 // ───────────────────────── 性能测试图 ─────────────────────────

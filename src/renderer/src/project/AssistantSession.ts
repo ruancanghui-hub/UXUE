@@ -69,8 +69,9 @@ export class AssistantSession {
       images: images.map((card, i) => ({ index: i + 1, name: card.name, file: currentVersion(card).file })),
       activeTheme: theme ? themeSuffix(theme) : null,
       selectedPrompts: state.cards
-        .filter((card) => isPromptCard(card) && session.selection.has(card.id))
-        .map((card) => ({ name: card.name, text: isPromptCard(card) ? card.text : '' })),
+        .filter(isPromptCard)
+        .filter((card) => session.selection.has(card.id))
+        .map((card) => ({ name: card.name, text: card.text })),
     };
 
     this.push({ id: crypto.randomUUID(), role: 'user', text: message });

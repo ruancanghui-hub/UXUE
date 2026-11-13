@@ -4,6 +4,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import type { CheckPhase, ImportSource, LaunchFlags, MenuCommand, StartupInfo } from '../shared/api';
 import { BENCH_HOST, PROJECT_HOST, type BenchManifest, type BenchReport } from '../shared/bench';
 import type { AssistantRequest } from '../shared/assistant';
+import { safeFileName, type ExportResult, type PageExportPlan } from '../shared/export';
 import type { GenerationRequest, ProviderId } from '../shared/generation';
 import { MockAssistant, OpenAIAssistant } from './assistant/providers';
 import { GenerationQueue } from './generation/GenerationQueue';
@@ -29,9 +30,10 @@ const flags: LaunchFlags = {
   m1Check: checkPhase('m1-check'),
   m2Check: checkPhase('m2-check'),
   m3Check: checkPhase('m3-check'),
+  m4Check: checkPhase('m4-check'),
 };
-const checkName = flags.m1Check ? 'm1' : flags.m2Check ? 'm2' : flags.m3Check ? 'm3' : null;
-const checkPhaseValue = flags.m1Check ?? flags.m2Check ?? flags.m3Check;
+const checkName = flags.m1Check ? 'm1' : flags.m2Check ? 'm2' : flags.m3Check ? 'm3' : flags.m4Check ? 'm4' : null;
+const checkPhaseValue = flags.m1Check ?? flags.m2Check ?? flags.m3Check ?? flags.m4Check;
 const selfTestMode = hasFlag('--self-test', 'ANYE_SELF_TEST');
 /** 开发用：窗口加载完 1.5 秒后把界面截图存到这个路径并退出 */
 const capturePath = process.argv.find((arg) => arg.startsWith('--capture='))?.slice('--capture='.length) ?? null;
@@ -190,6 +192,16 @@ function registerIpc(): void {
   });
   ipcMain.on('gen:cancel', (_event, jobId: string) => generationQueue.cancel(jobId));
   ipcMain.on('gen:cancel-all', () => generationQueue.cancelAll());
+  ipcMain.handle('export:page', async (_event, projectDir: string, plan: PageExportPlan) => {
+    if (projectDir !== projects.currentDir()) throw new Error('只能导出当前打开的项目');
+    const files = [plan.base?.file, ...plan.layers.map((layer) => layer.file)].filter((f): f is string => !!f);
+    if (files.some((file) => file.includes('..') || file.startsWith('/'))) throw new Error('图片路径不合法');
+    return worker.request<ExportResult>({ type: 'exportPage', dir: projectDir, folder: `exports/${safeFileName(plan.pageName)}`, plan });
+  });
+  ipcMain.handle('dev:sample-lowfi', async () => {
+    const result = await worker.request<{ path: string }>({ type: 'sampleLowFi', path: join(benchDir(), 'lowfi-home.png') });
+    return result.path;
+  });
   ipcMain.handle('assistant:ask', (_event, request: AssistantRequest) => {
     if (request.projectDir !== projects.currentDir()) throw new Error('只能为当前打开的项目提问');
     if (request.images.some((image) => image.file.includes('..') || image.file.startsWith('/'))) throw new Error('图片路径不合法');

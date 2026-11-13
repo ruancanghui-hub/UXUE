@@ -73,6 +73,15 @@ export function buildMenu(recent: RecentProject[], send: (command: MenuCommand) 
       ],
     },
     {
+      label: '页面',
+      submenu: [
+        item('从低保真原型新建页面框…', 'newPageFromLowFi', 'CmdOrCtrl+Shift+L'),
+        canvasKey('新建空白页面框', 'newBlankPage', 'F'),
+        { type: 'separator' },
+        item('导出选中的页面', 'exportPage', 'CmdOrCtrl+Shift+E'),
+      ],
+    },
+    {
       label: '视图',
       submenu: [
         item('视觉主题区', 'region:theme', 'CmdOrCtrl+1'),

@@ -1149,3 +1149,37 @@ button.icon:hover:not(:disabled) {
   background: #1d1b23;
   border: 1px solid #3a3448;
 }
+
+.layer-thumb.page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #5ad19a;
+  background: #18211d;
+  border: 1px solid #2d4a3c;
+}
+
+.layer-row.indent {
+  padding-left: 22px;
+}
+
+.lowfi-thumb {
+  max-width: 100%;
+  max-height: 180px;
+  object-fit: contain;
+  border-radius: 8px;
+  background: #26262c;
+  align-self: flex-start;
+}
+
+.ref-source {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.ref-source .lowfi-thumb {
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+}

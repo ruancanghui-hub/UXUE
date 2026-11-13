@@ -1,8 +1,9 @@
 import { forwardRef, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 import type { ImportSource, MenuCommand, StartupInfo } from '../../shared/api';
 import { PROJECT_HOST } from '../../shared/bench';
+import { planPageExport, type ExportResult } from '../../shared/export';
 import type { GenerationConfig, PromptSettings } from '../../shared/generation';
-import type { RegionId } from '../../shared/project';
+import { isPageCard, type PageCard, type RegionId } from '../../shared/project';
 import { isTyping, type CanvasEngine, type EngineStatus } from './canvas/CanvasEngine';
 import { AssistantPanel } from './components/AssistantPanel';
 import { CanvasView } from './components/CanvasView';
@@ -16,7 +17,12 @@ import { Welcome } from './components/Welcome';
 import {
   addCards,
   addVersions,
+  fitIntoPage,
   layoutNewCards,
+  newPageCard,
+  placeIntoPage,
+  setPagePreset,
+  updatePage,
   movePromptInput,
   removePromptInput,
   renameCard,
@@ -32,6 +38,7 @@ import { describeImportErrors, pickImageSources, sourcesFromFiles } from './proj
 import { runM1Check } from './project/m1Check';
 import { runM2Check } from './project/m2Check';
 import { runM3Check } from './project/m3Check';
+import { runM4Check } from './project/m4Check';
 import { ProjectSession, type SaveState } from './project/ProjectSession';
 
 interface Toast {
@@ -58,6 +65,7 @@ export function ProjectApp() {
   const [dropActive, setDropActive] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [rightTab, setRightTab] = useState<RightTab>('inspector');
+  const [exports, setExports] = useState<ReadonlyMap<string, ExportResult | 'running' | { error: string }>>(new Map());
   const sessionRef = useRef<ProjectSession | null>(null);
   const engineRef = useRef<CanvasEngine | null>(null);
   const inspectorRef = useRef<InspectorHandle>(null);
@@ -246,6 +254,94 @@ export function ProjectApp() {
     [toast, tracker],
   );
 
+  // ───────────── 页面 ─────────────
+
+  /** 新建页面框；传了图片就用第一张作为低保真原型（导入流程和普通图片一样） */
+  const createPage = useCallback(
+    async (sources: ImportSource[] | null): Promise<PageCard | null> => {
+      const current = sessionRef.current;
+      const canvas = engineRef.current;
+      if (!current || !canvas) return null;
+      let base = null;
+      if (sources) {
+        if (sources.length === 0) return null;
+        const result = await window.anye.importImages(sources.slice(0, 1));
+        base = result.versions[0] ?? null;
+        if (!base) {
+          toast(describeImportErrors(result) ?? '低保真原型导入失败', 'error');
+          return null;
+        }
+      }
+      const pages = current.doc.get().cards.filter(isPageCard).length;
+      const name = base?.sourceName?.replace(/\.[^.]+$/, '') || (pages === 0 ? '首页' : `页面 ${pages + 1}`);
+      const page = newPageCard(current.doc.get(), { id: crypto.randomUUID(), name, base });
+      current.doc.apply('新建页面框', addCards(current.doc.get(), [page]));
+      current.selection.set([page.id]);
+      canvas.zoomToCard(page.id);
+      return page;
+    },
+    [toast],
+  );
+
+  const replaceLowFi = useCallback(
+    async (pageId: string) => {
+      const current = sessionRef.current;
+      if (!current) return;
+      const sources = await pickImageSources();
+      if (sources.length === 0) return;
+      const result = await window.anye.importImages(sources.slice(0, 1));
+      const base = result.versions[0];
+      if (!base) {
+        toast(describeImportErrors(result) ?? '低保真原型导入失败', 'error');
+        return;
+      }
+      current.doc.apply('替换低保真原型', updatePage(current.doc.get(), pageId, { base }));
+    },
+    [toast],
+  );
+
+  const exportPage = useCallback(
+    async (pageId: string): Promise<ExportResult | null> => {
+      const current = sessionRef.current;
+      if (!current) return null;
+      const state = current.doc.get();
+      const page = state.cards.find((card) => card.id === pageId);
+      if (!page || !isPageCard(page)) return null;
+      const plan = planPageExport(page, state.cards);
+      const missing = plan.layers.find((layer) => current.missingVersionIds.has(layer.versionId));
+      if (missing) {
+        toast(`素材「${missing.name}」的原图不见了，无法导出`, 'error');
+        return null;
+      }
+      setExports((map) => new Map(map).set(pageId, 'running'));
+      try {
+        const result = await window.anye.exportPage(current.dir, plan);
+        setExports((map) => new Map(map).set(pageId, result));
+        toast(`「${page.name}」已导出到 ${result.folder}`);
+        return result;
+      } catch (error) {
+        const message = error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : String(error);
+        setExports((map) => new Map(map).set(pageId, { error: message }));
+        toast(`导出失败：${message}`, 'error');
+        return null;
+      }
+    },
+    [toast],
+  );
+
+  const placeInPage = useCallback((imageCardId: string, pageId: string) => {
+    const current = sessionRef.current;
+    if (!current) return;
+    const state = current.doc.get();
+    const page = state.cards.find((card) => card.id === pageId);
+    const card = state.cards.find((c) => c.id === imageCardId);
+    if (!page || !card) return;
+    const rect = fitIntoPage(page, card, page.x + page.width / 2, page.y + page.height / 2);
+    const placed = placeIntoPage(state, pageId, [{ imageCardId, rect }], () => crypto.randomUUID());
+    current.doc.apply('放入页面', placed.state);
+    current.selection.set(placed.refIds);
+  }, []);
+
   // ───────────── 菜单命令 ─────────────
 
   const handleCommand = useCallback(
@@ -332,6 +428,18 @@ export function ProjectApp() {
         case 'newPrompt':
           if (!typing) canvas.createPromptFromSelection();
           break;
+        case 'newPageFromLowFi':
+          await createPage(await pickImageSources());
+          break;
+        case 'newBlankPage':
+          if (!typing) await createPage(null);
+          break;
+        case 'exportPage': {
+          const pages = current.doc.get().cards.filter((card) => isPageCard(card) && current.selection.has(card.id));
+          if (pages.length === 0) toast('先选中一个页面框');
+          for (const page of pages) await exportPage(page.id);
+          break;
+        }
         case 'generate': {
           const prompts = current.doc.get().cards.filter((card) => card.kind === 'prompt' && current.selection.has(card.id));
           if (prompts.length === 0) toast('先选中一张提示词卡');
@@ -340,7 +448,7 @@ export function ProjectApp() {
         }
       }
     },
-    [generate, importInto, openDir, toast],
+    [createPage, exportPage, generate, importInto, openDir, toast],
   );
 
   useEffect(() => window.anye.onMenuCommand((command) => void handleCommand(command)), [handleCommand]);
@@ -348,18 +456,20 @@ export function ProjectApp() {
   // ───────────── 验收自检 ─────────────
 
   useEffect(() => {
-    const { m1Check, m2Check, m3Check } = window.anye.flags;
-    if ((!m1Check && !m2Check && !m3Check) || !engine || !session || !assistant || checkStarted.current) return;
+    const { m1Check, m2Check, m3Check, m4Check } = window.anye.flags;
+    if ((!m1Check && !m2Check && !m3Check && !m4Check) || !engine || !session || !assistant || checkStarted.current) return;
     checkStarted.current = true;
     const run = m1Check
       ? runM1Check(m1Check, { engine, session, importInto })
       : m2Check
         ? runM2Check(m2Check, { engine, session, importInto, tracker })
-        : runM3Check(m3Check!, { engine, session, importInto, tracker, assistant, setRightTab });
+        : m3Check
+          ? runM3Check(m3Check, { engine, session, importInto, tracker, assistant, setRightTab })
+          : runM4Check(m4Check!, { engine, session, importInto, tracker, assistant, setRightTab, createPage, exportPage });
     void run
       .catch((error: unknown) => console.error(`[check] 异常 ${error instanceof Error ? error.stack : String(error)}`))
       .finally(() => window.anye.quit());
-  }, [engine, session, importInto, tracker, assistant]);
+  }, [engine, session, importInto, tracker, assistant, createPage, exportPage]);
 
   const providerLabel = !config ? '' : config.provider === 'mock' ? '本地模拟' : config.hasApiKey ? 'OpenAI' : 'OpenAI · 未设置 Key';
 
@@ -441,6 +551,10 @@ export function ProjectApp() {
             jobs={jobs}
             onImportVersion={importAsVersion}
             onGenerate={generate}
+            exports={exports}
+            onReplaceLowFi={replaceLowFi}
+            onExportPage={exportPage}
+            onPlaceInPage={placeInPage}
           />
         )}
       </div>
@@ -506,10 +620,14 @@ interface RightPanelProps extends PanelProps {
   jobs: TrackedJob[];
   onImportVersion(cardId: string): void;
   onGenerate(promptId: string): void;
+  exports: ReadonlyMap<string, ExportResult | 'running' | { error: string }>;
+  onReplaceLowFi(pageId: string): void;
+  onExportPage(pageId: string): void;
+  onPlaceInPage(imageCardId: string, pageId: string): void;
 }
 
 const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function RightPanel(
-  { tab, onTab, assistant, providerLabel, session, engine, cacheBust, config, jobs, onImportVersion, onGenerate },
+  { tab, onTab, assistant, providerLabel, session, engine, cacheBust, config, jobs, onImportVersion, onGenerate, exports, onReplaceLowFi, onExportPage, onPlaceInPage },
   ref,
 ) {
   const state = useCommittedDoc(session.doc);
@@ -571,6 +689,12 @@ const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function Ri
       onNewPrompt={() => engine.createPromptFromSelection()}
       onUpdateTheme={(id, patch) => doc.apply('编辑主题卡', updateTheme(doc.get(), id, patch))}
       onSetActiveTheme={(id) => doc.apply(id ? '设为生效主题卡' : '取消生效主题卡', setActiveTheme(doc.get(), id))}
+      onUpdatePage={(id, patch) => doc.apply('编辑页面框', updatePage(doc.get(), id, patch))}
+      onSetPagePreset={(id, presetId) => doc.apply('更换设备', setPagePreset(doc.get(), id, presetId))}
+      exports={exports}
+      onReplaceLowFi={onReplaceLowFi}
+      onExportPage={onExportPage}
+      onPlaceInPage={onPlaceInPage}
     />
   );
 }));

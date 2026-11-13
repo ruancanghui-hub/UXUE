@@ -111,7 +111,74 @@ export interface ThemeCard {
   rules: ThemeRules;
 }
 
-export type CanvasCard = ImageCard | PromptCard | ThemeCard;
+/** 以低保真原型为底、摆放核心素材的框；导出时就是一张高保真页面 */
+export interface PageCard {
+  kind: 'page';
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** 低保真原型；没有时只画背景色 */
+  base: Version | null;
+  background: string;
+  /** 设备预设 id；null 表示按低保真原型（或画布）尺寸 */
+  devicePreset: string | null;
+  /** 导出倍数，相对页面的逻辑尺寸 */
+  exportScale: number;
+}
+
+/** 页面框里对某张核心素材的引用：显示它的当前版本 */
+export interface RefCard {
+  kind: 'ref';
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  imageCardId: string;
+  /** 所在页面框；拖出页面后为 null */
+  pageId: string | null;
+}
+
+export type CanvasCard = ImageCard | PromptCard | ThemeCard | PageCard | RefCard;
+
+export function isPageCard(card: CanvasCard): card is PageCard {
+  return card.kind === 'page';
+}
+
+export function isRefCard(card: CanvasCard): card is RefCard {
+  return card.kind === 'ref';
+}
+
+export const DEVICE_PRESETS = [
+  { id: 'iphone', label: 'iPhone 393 × 852', width: 393, height: 852 },
+  { id: 'android', label: 'Android 360 × 800', width: 360, height: 800 },
+  { id: 'ipad', label: 'iPad 820 × 1180', width: 820, height: 1180 },
+  { id: 'desktop', label: '桌面 1440 × 900', width: 1440, height: 900 },
+  { id: 'desktop-hd', label: '桌面 1920 × 1080', width: 1920, height: 1080 },
+] as const;
+
+/** 低保真原型的像素尺寸正好是某个设备的 1/2/3 倍时认出来 */
+export function detectPreset(width: number, height: number): { presetId: string; scale: number } | null {
+  for (const preset of DEVICE_PRESETS) {
+    for (const scale of [1, 2, 3]) {
+      if (Math.abs(width - preset.width * scale) <= 2 && Math.abs(height - preset.height * scale) <= 4) {
+        return { presetId: preset.id, scale };
+      }
+    }
+  }
+  return null;
+}
+
+/** 页面的逻辑尺寸：有设备预设用预设，否则用低保真原型像素尺寸，再否则用画布尺寸 */
+export function pageLogicalSize(page: PageCard): { width: number; height: number } {
+  const preset = DEVICE_PRESETS.find((p) => p.id === page.devicePreset);
+  if (preset) return { width: preset.width, height: preset.height };
+  if (page.base) return { width: page.base.width, height: page.base.height };
+  return { width: Math.round(page.width), height: Math.round(page.height) };
+}
 
 export function isImageCard(card: CanvasCard): card is ImageCard {
   return card.kind === 'image';
@@ -231,7 +298,11 @@ export function parseProject(raw: unknown): ParseResult {
         ? parsePromptCard(value)
         : value.kind === 'theme'
           ? parseThemeCard(value)
-          : parseCard(value);
+          : value.kind === 'page'
+            ? parsePageCard(value)
+            : value.kind === 'ref'
+              ? parseRefCard(value)
+              : parseCard(value);
     if (!card) {
       warnings.push(`第 ${index + 1} 个对象结构不完整，已跳过`);
       continue;
@@ -260,12 +331,59 @@ export function parseProject(raw: unknown): ParseResult {
     ? { originX: raw.viewport.originX, originY: raw.viewport.originY, zoom: raw.viewport.zoom }
     : null;
 
+  // 引用指向的图像卡、所在页面不存在时：图像卡丢了就去掉引用，页面丢了就让它脱离页面
+  const pageIds = new Set(cards.filter(isPageCard).map((card) => card.id));
+  for (let index = cards.length - 1; index >= 0; index--) {
+    const card = cards[index];
+    if (!isRefCard(card)) continue;
+    if (!imageIds.has(card.imageCardId)) {
+      warnings.push('一个素材引用指向的图像卡不存在，已去掉');
+      cards.splice(index, 1);
+    } else if (card.pageId && !pageIds.has(card.pageId)) {
+      cards[index] = { ...card, pageId: null };
+    }
+  }
+
   const activeThemeCardId =
     typeof raw.activeThemeCardId === 'string' && cards.some((card) => card.id === raw.activeThemeCardId && isThemeCard(card))
       ? raw.activeThemeCardId
       : null;
 
   return { project: { schemaVersion: PROJECT_SCHEMA_VERSION, regions, cards, activeThemeCardId, viewport }, warnings };
+}
+
+function parsePageCard(value: Record<string, unknown>): PageCard | null {
+  if (typeof value.id !== 'string' || !isRect(value) || value.width <= 0 || value.height <= 0) return null;
+  const preset = DEVICE_PRESETS.find((p) => p.id === value.devicePreset);
+  const scale = isFiniteNumber(value.exportScale) ? Math.round(value.exportScale) : 1;
+  return {
+    kind: 'page',
+    id: value.id,
+    name: typeof value.name === 'string' ? value.name : '页面',
+    x: value.x,
+    y: value.y,
+    width: value.width,
+    height: value.height,
+    base: value.base === null ? null : parseVersion(value.base),
+    background: normalizeHex(typeof value.background === 'string' ? value.background : '') ?? '#FFFFFF',
+    devicePreset: preset ? preset.id : null,
+    exportScale: Math.min(4, Math.max(1, scale)),
+  };
+}
+
+function parseRefCard(value: Record<string, unknown>): RefCard | null {
+  if (typeof value.id !== 'string' || typeof value.imageCardId !== 'string' || !isRect(value)) return null;
+  if (value.width <= 0 || value.height <= 0) return null;
+  return {
+    kind: 'ref',
+    id: value.id,
+    x: value.x,
+    y: value.y,
+    width: value.width,
+    height: value.height,
+    imageCardId: value.imageCardId,
+    pageId: typeof value.pageId === 'string' ? value.pageId : null,
+  };
 }
 
 function parseThemeCard(value: Record<string, unknown>): ThemeCard | null {

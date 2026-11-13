@@ -2,16 +2,20 @@ import 'pixi.js/unsafe-eval';
 import { Application, Container, Graphics, Sprite, Text, Texture, TilingSprite } from 'pixi.js';
 import { BENCH_HOST, type BenchImage, type FrameSummary, type TextureLevel } from '../../../shared/bench';
 import {
-  currentVersion,
   defaultRegions,
   isImageCard,
+  isPageCard,
   isPromptCard,
+  isRefCard,
   isThemeCard,
+  pageLogicalSize,
   type CanvasCard,
   type ImageCard,
+  type PageCard,
   type PromptCard,
   type RegionId,
   type ThemeCard,
+  type Version,
   type ViewportState,
 } from '../../../shared/project';
 import { texturedImage } from '../../../shared/textures';
@@ -19,13 +23,19 @@ import { DocumentStore, type DocChange } from '../document/DocumentStore';
 import {
   addPromptInput,
   createPromptCard,
+  displayVersion,
   duplicateCards,
+  fitIntoPage,
   moveCards,
   outputPlacement,
+  placeIntoPage,
+  reassignRefPages,
   regionOf,
   removeCards,
+  renderOrder,
   reorderCards,
   scaleCards,
+  withPageChildren,
   type DocState,
 } from '../document/operations';
 import { Selection } from '../document/Selection';
@@ -64,6 +74,8 @@ type Interaction =
       origins: Map<string, CanvasCard>;
       moved: boolean;
       toggleOnClickId: string | null;
+      /** 拖着图像卡经过的页面框：松手就放进去变成引用 */
+      dropPageId: string | null;
     }
   | { kind: 'marquee'; startWorldX: number; startWorldY: number; base: Set<string>; rect: Rect }
   | {
@@ -148,12 +160,18 @@ export class CanvasEngine {
 
   /** 已经同步到 Pixi 的卡片快照，用于和新快照对比，只更新变化的部分 */
   private rendered = new Map<string, CanvasCard>();
-  private renderedOrder: readonly CanvasCard[] = [];
   private readonly nodes = new Map<string, Container>();
   private readonly promptNodes = new Map<string, PromptNode>();
   private readonly themeNodes = new Map<string, ThemeNode>();
   private renderedActiveTheme: string | null = null;
   private readonly keyToCards = new Map<string, Set<string>>();
+  /** 每张带图卡片当前绑定的纹理（版本 id）：图像卡、引用、有低保真原型的页面框 */
+  private readonly boundKeys = new Map<string, string>();
+  /** 放精灵的容器：图像卡和引用就是节点本身，页面框是背景上面那一层 */
+  private readonly spriteLayers = new Map<string, Container>();
+  private readonly pageBackgrounds = new Map<string, Graphics>();
+  private readonly pageLabels = new Map<string, Text>();
+  private renderedSequence: CanvasCard[] = [];
   private regionLabels = new Map<RegionId, Text>();
   private readonly slotLabels: Text[] = [];
   private jobViews: ReadonlyMap<string, PromptJobView> = new Map();
@@ -238,7 +256,7 @@ export class CanvasEngine {
     this.detachDoc?.();
     for (const id of [...this.nodes.keys()]) this.removeNode(id);
     this.rendered.clear();
-    this.renderedOrder = [];
+    this.renderedSequence = [];
     this.interaction = { kind: 'none' };
     this.focusRegion = null;
     this.jobViews = new Map();
@@ -287,6 +305,11 @@ export class CanvasEngine {
     this.needsRender = true;
   }
 
+  /** 这张卡片当前显示的纹理（版本 id），验收用 */
+  boundKeyFor(cardId: string): string | null {
+    return this.boundKeys.get(cardId) ?? null;
+  }
+
   /** 缓存在后台重建好了，失败过的纹理重新加载 */
   retryTexture(versionId: string): void {
     this.textures.retry(versionId);
@@ -294,8 +317,11 @@ export class CanvasEngine {
     this.needsRender = true;
   }
 
-  isMissing(card: ImageCard): boolean {
-    const key = card.currentVersionId;
+  /** 图缺失：图像卡的原图不在、引用指向的图像卡不在或它的原图不在、页面框的低保真原型不在 */
+  isMissing(card: CanvasCard): boolean {
+    if (isRefCard(card) && !this.rendered.has(card.imageCardId)) return true;
+    const key = this.boundKeys.get(card.id);
+    if (!key) return false;
     return this.missingVersionIds.has(key) || (this.textures.isFailed(key) && !this.textures.bestTiles(key));
   }
 
@@ -361,7 +387,7 @@ export class CanvasEngine {
 
   nudgeSelection(dx: number, dy: number): void {
     if (this.selection.size === 0) return;
-    this.doc.apply('微调位置', moveCards(this.doc.get(), this.selectedOrigins(), dx, dy));
+    this.doc.apply('微调位置', moveCards(this.doc.get(), this.selectedOrigins(true), dx, dy));
   }
 
   selectAll(): void {
@@ -635,7 +661,8 @@ export class CanvasEngine {
     // 同一个版本被多张卡片引用时，取需要最清晰的那张
     const wanted = new Map<string, { level: TextureLevel; priority: number }>();
     for (const card of this.doc.get().cards) {
-      if (!isImageCard(card)) continue;
+      const key = this.boundKeys.get(card.id);
+      if (!key) continue;
       const distance = Math.hypot(card.x + card.width / 2 - centerX, card.y + card.height / 2 - centerY);
       let level: TextureLevel = 0;
       let priority = 1e6 + distance;
@@ -644,9 +671,9 @@ export class CanvasEngine {
         level = screenPx > 1024 * LEVEL_HYSTERESIS ? 2 : screenPx > 256 * LEVEL_HYSTERESIS ? 1 : 0;
         priority = distance;
       }
-      const previous = wanted.get(card.currentVersionId);
+      const previous = wanted.get(key);
       if (!previous || level > previous.level || (level === previous.level && priority < previous.priority)) {
-        wanted.set(card.currentVersionId, { level, priority });
+        wanted.set(key, { level, priority });
       }
     }
     for (const [key, { level, priority }] of wanted) this.textures.setWanted(key, level, priority, now);
@@ -664,7 +691,7 @@ export class CanvasEngine {
     }
   }
 
-  /** 只更新和上一次快照相比变了的卡片 */
+  /** 只更新和上一次快照相比变了的卡片；引用在它指向的图像卡换了当前版本时也要换纹理 */
   private syncFromDoc(state: DocState, full: boolean): void {
     const next = new Map(state.cards.map((card) => [card.id, card]));
     for (const id of [...this.rendered.keys()]) {
@@ -674,18 +701,26 @@ export class CanvasEngine {
 
     for (const card of state.cards) {
       const previous = this.rendered.get(card.id);
-      if (!full && previous === card) continue;
-      if (isImageCard(card)) this.syncImageCard(card, previous as ImageCard | undefined);
-      else if (isPromptCard(card)) this.syncPromptCard(card);
-      else this.syncThemeCard(card);
+      const version = displayVersion(card, next);
+      const keyChanged = (this.boundKeys.get(card.id) ?? null) !== (version?.id ?? null);
+      if (!full && previous === card && !keyChanged) continue;
+
+      if (isPromptCard(card)) this.syncPromptCard(card);
+      else if (isThemeCard(card)) this.syncThemeCard(card);
+      else this.ensureSpriteNode(card);
+      if (keyChanged) this.rebindTexture(card.id, version);
+      this.rendered.set(card.id, card);
+      if (isPageCard(card)) this.drawPageBackground(card);
+      if (this.spriteLayers.has(card.id)) this.refreshNodeTexture(card.id);
       this.nodes.get(card.id)!.position.set(card.x, card.y);
     }
 
-    if (full || !sameOrder(this.renderedOrder, state.cards)) {
+    const sequence = renderOrder(state.cards);
+    if (full || !sameOrder(this.renderedSequence, sequence)) {
       this.world.removeChildren();
-      for (const card of state.cards) this.world.addChild(this.nodes.get(card.id)!);
+      for (const card of sequence) this.world.addChild(this.nodes.get(card.id)!);
     }
-    this.renderedOrder = state.cards;
+    this.renderedSequence = sequence;
     // 输入数量会影响提示词卡底部的说明；生效主题卡变了要更新标记
     for (const id of this.promptNodes.keys()) this.refreshPromptNode(id);
     if (full || this.renderedActiveTheme !== state.activeThemeCardId) {
@@ -698,14 +733,29 @@ export class CanvasEngine {
     this.needsRender = true;
   }
 
-  private syncImageCard(card: ImageCard, previous: ImageCard | undefined): void {
-    if (!this.nodes.has(card.id)) this.nodes.set(card.id, new Container());
-    if (previous?.currentVersionId !== card.currentVersionId) {
-      if (previous) this.unbindTexture(card.id, previous.currentVersionId);
-      this.bindTexture(card);
+  /** 图像卡、引用：节点本身放精灵；页面框：背景 + 精灵层 */
+  private ensureSpriteNode(card: CanvasCard): void {
+    if (this.nodes.has(card.id)) return;
+    if (isPageCard(card)) {
+      const node = new Container();
+      const background = new Graphics();
+      const layer = new Container();
+      node.addChild(background, layer);
+      this.nodes.set(card.id, node);
+      this.pageBackgrounds.set(card.id, background);
+      this.spriteLayers.set(card.id, layer);
+      return;
     }
-    this.rendered.set(card.id, card);
-    this.refreshNodeTexture(card.id);
+    const node = new Container();
+    this.nodes.set(card.id, node);
+    this.spriteLayers.set(card.id, node);
+  }
+
+  private drawPageBackground(page: PageCard): void {
+    const g = this.pageBackgrounds.get(page.id);
+    if (!g) return;
+    g.clear();
+    g.rect(0, 0, page.width, page.height).fill({ color: page.background });
   }
 
   private syncPromptCard(card: PromptCard): void {
@@ -746,37 +796,42 @@ export class CanvasEngine {
     node.update(card, inputCount, this.jobViews.get(id) ?? null, performance.now());
   }
 
-  private bindTexture(card: ImageCard): void {
-    const version = currentVersion(card);
+  private rebindTexture(cardId: string, version: Version | null): void {
+    const previous = this.boundKeys.get(cardId);
+    if (previous) {
+      this.textures.unregister(previous);
+      const ids = this.keyToCards.get(previous);
+      ids?.delete(cardId);
+      if (ids?.size === 0) this.keyToCards.delete(previous);
+      this.boundKeys.delete(cardId);
+    }
+    if (!version) return;
     this.textures.register(texturedImage(this.assetHost, version.id, version.width, version.height));
+    this.boundKeys.set(cardId, version.id);
     let ids = this.keyToCards.get(version.id);
     if (!ids) {
       ids = new Set();
       this.keyToCards.set(version.id, ids);
     }
-    ids.add(card.id);
+    ids.add(cardId);
   }
 
-  private unbindTexture(cardId: string, key: string): void {
-    this.textures.unregister(key);
-    const ids = this.keyToCards.get(key);
-    ids?.delete(cardId);
-    if (ids?.size === 0) this.keyToCards.delete(key);
-  }
-
-  /** 节点里放一个精灵（L0 / L1 / 占位）或多块 L2 tile 精灵，精灵按需复用 */
+  /** 精灵层里放一个精灵（L0 / L1 / 占位）或多块 L2 tile 精灵，精灵按需复用 */
   private refreshNodeTexture(id: string): void {
     const card = this.rendered.get(id);
-    const node = this.nodes.get(id);
-    if (!card || !node || !isImageCard(card)) return;
-    const tileSet = this.textures.bestTiles(card.currentVersionId);
-    const count = tileSet ? tileSet.tiles.length : 1;
+    const layer = this.spriteLayers.get(id);
+    if (!card || !layer) return;
+    const key = this.boundKeys.get(id);
+    const tileSet = key ? this.textures.bestTiles(key) : null;
+    // 没有低保真原型的页面框只有背景
+    const count = tileSet ? tileSet.tiles.length : isPageCard(card) && !key ? 0 : 1;
 
-    while (node.children.length > count) node.removeChildAt(node.children.length - 1).destroy();
-    while (node.children.length < count) node.addChild(new Sprite(Texture.WHITE));
+    while (layer.children.length > count) layer.removeChildAt(layer.children.length - 1).destroy();
+    while (layer.children.length < count) layer.addChild(new Sprite(Texture.WHITE));
+    if (count === 0) return;
 
     if (!tileSet) {
-      const sprite = node.children[0] as Sprite;
+      const sprite = layer.children[0] as Sprite;
       sprite.texture = Texture.WHITE;
       sprite.tint = this.isMissing(card) ? MISSING_TINT : PLACEHOLDER_TINT;
       sprite.position.set(0, 0);
@@ -786,7 +841,7 @@ export class CanvasEngine {
     const scaleX = card.width / tileSet.imageWidth;
     const scaleY = card.height / tileSet.imageHeight;
     tileSet.tiles.forEach((tile, index) => {
-      const sprite = node.children[index] as Sprite;
+      const sprite = layer.children[index] as Sprite;
       sprite.texture = tile.texture;
       sprite.tint = 0xffffff;
       sprite.position.set(tile.x * scaleX, tile.y * scaleY);
@@ -795,8 +850,7 @@ export class CanvasEngine {
   }
 
   private removeNode(id: string): void {
-    const card = this.rendered.get(id);
-    if (card && isImageCard(card)) this.unbindTexture(id, card.currentVersionId);
+    this.rebindTexture(id, null);
     const prompt = this.promptNodes.get(id);
     const theme = this.themeNodes.get(id);
     if (prompt) {
@@ -808,6 +862,10 @@ export class CanvasEngine {
     } else {
       this.nodes.get(id)?.destroy({ children: true });
     }
+    this.pageLabels.get(id)?.destroy();
+    this.pageLabels.delete(id);
+    this.spriteLayers.delete(id);
+    this.pageBackgrounds.delete(id);
     this.nodes.delete(id);
     this.rendered.delete(id);
   }
@@ -879,10 +937,11 @@ export class CanvasEngine {
     this.drawLinks(state);
 
     for (const card of state.cards) {
-      if (isImageCard(card) && intersects(card, view) && this.isMissing(card)) {
+      if ((isImageCard(card) || isRefCard(card) || isPageCard(card)) && intersects(card, view) && this.isMissing(card)) {
         this.strokeWorldRect(g, card, 1, 0.9, MISSING_OUTLINE);
       }
     }
+    this.drawPageFrames(g, state);
     this.drawJobs(g, state, now);
 
     if (this.hoverId && !selection.has(this.hoverId) && this.interaction.kind === 'none') {
@@ -918,6 +977,77 @@ export class CanvasEngine {
       curve(g, end.x, end.y, fromX, fromY);
       g.stroke({ color: ACCENT, width: 2, alpha: 0.9 });
     }
+  }
+
+  /** 页面框的细边框和名字标签（字号不随缩放变化）；拖着图像卡经过时高亮目标页面 */
+  private drawPageFrames(g: Graphics, state: DocState): void {
+    const dropPageId = this.interaction.kind === 'drag' ? this.interaction.dropPageId : null;
+    const alive = new Set<string>();
+    for (const card of state.cards) {
+      if (!isPageCard(card)) continue;
+      alive.add(card.id);
+      const dropping = card.id === dropPageId;
+      this.strokeWorldRect(g, card, dropping ? 3 : 1, dropping ? 1 : 0.35, dropping ? OUTPUT_LINK : 0xffffff);
+      let label = this.pageLabels.get(card.id);
+      if (!label) {
+        label = new Text({
+          text: '',
+          style: { fontFamily: 'PingFang SC, -apple-system, sans-serif', fontSize: 12, fill: 0x9a9aa8 },
+          resolution: window.devicePixelRatio * 2,
+        });
+        this.labels.addChild(label);
+        this.pageLabels.set(card.id, label);
+      }
+      const logical = pageLogicalSize(card);
+      label.text = `${card.name}  ${logical.width} × ${logical.height} @${card.exportScale}x${dropping ? '  · 松手放进页面' : ''}`;
+      label.style.fill = dropping ? OUTPUT_LINK : 0x9a9aa8;
+      const corner = this.viewport.worldToScreen(card.x, card.y);
+      label.position.set(Math.round(corner.x), Math.round(corner.y - label.height - 4));
+      label.visible = card.width * this.viewport.zoom > 60;
+    }
+    for (const [id, label] of this.pageLabels) {
+      if (!alive.has(id)) {
+        label.destroy();
+        this.pageLabels.delete(id);
+      }
+    }
+  }
+
+  /** 拖动的是图像卡（不含页面框）时，指针下最上层的页面框就是放入目标 */
+  private dropTargetFor(origins: ReadonlyMap<string, CanvasCard>, worldX: number, worldY: number): string | null {
+    const cards = [...origins.values()];
+    if (!cards.some(isImageCard) || cards.some(isPageCard)) return null;
+    const page = this.hitTest(worldX, worldY, (card) => isPageCard(card) && !origins.has(card.id));
+    return page?.id ?? null;
+  }
+
+  /**
+   * 图像卡放进页面：原图回到原处，页面里多出指向它的引用（按页面大小缩放、以松手位置为中心）；
+   * 一起拖动的引用直接移进这个页面。整体是一条撤销记录。
+   */
+  private dropIntoPage(origins: ReadonlyMap<string, CanvasCard>, pageId: string): void {
+    const moved = this.doc.get();
+    const page = moved.cards.find((card) => card.id === pageId);
+    if (!page) {
+      this.doc.commitGesture();
+      return;
+    }
+    const items = [...origins.values()].filter(isImageCard).map((origin) => {
+      const now = moved.cards.find((card) => card.id === origin.id) ?? origin;
+      return { imageCardId: origin.id, rect: fitIntoPage(page, origin, now.x + now.width / 2, now.y + now.height / 2) };
+    });
+    const refPositions = new Map(
+      [...origins.values()].filter(isRefCard).map((origin) => [origin.id, moved.cards.find((card) => card.id === origin.id) ?? origin]),
+    );
+    this.doc.cancelGesture();
+    let next = this.doc.get();
+    if (refPositions.size) {
+      next = { ...next, cards: next.cards.map((card) => refPositions.get(card.id) ?? card) };
+      next = reassignRefPages(next, new Set(refPositions.keys()));
+    }
+    const placed = placeIntoPage(next, pageId, items, () => crypto.randomUUID());
+    this.doc.apply('放入页面', placed.state);
+    this.selection.set([...placed.refIds, ...refPositions.keys()]);
   }
 
   /** 来源连线：输入图 → 提示词卡左侧各自的槽位，提示词卡右侧 → 输出图 */
@@ -1068,12 +1198,15 @@ export class CanvasEngine {
     return this.doc.get().cards.filter((card) => selection.has(card.id));
   }
 
-  private selectedOrigins(): Map<string, CanvasCard> {
-    return new Map(this.selectedCards().map((card) => [card.id, card]));
+  /** withChildren：选中的页面框连同它里面的引用一起 */
+  private selectedOrigins(withChildren = false): Map<string, CanvasCard> {
+    const state = this.doc.get();
+    const ids = withChildren ? withPageChildren(state, this.selection.get()) : this.selection.get();
+    return new Map(state.cards.filter((card) => ids.has(card.id)).map((card) => [card.id, card]));
   }
 
   private hitTest(worldX: number, worldY: number, filter: (card: CanvasCard) => boolean = () => true): CanvasCard | undefined {
-    const cards = this.doc.get().cards;
+    const cards = this.renderedSequence;
     for (let i = cards.length - 1; i >= 0; i--) {
       const card = cards[i];
       if (!filter(card)) continue;
@@ -1212,7 +1345,7 @@ export class CanvasEngine {
         anchorY: anchor.y,
         cornerX: cornerPoint.x,
         cornerY: cornerPoint.y,
-        origins: this.selectedOrigins(),
+        origins: this.selectedOrigins(true),
       };
       return;
     }
@@ -1255,9 +1388,10 @@ export class CanvasEngine {
       startScreenY: y,
       startWorldX: world.x,
       startWorldY: world.y,
-      origins: this.selectedOrigins(),
+      origins: this.selectedOrigins(true),
       moved: false,
       toggleOnClickId,
+      dropPageId: null,
     };
   }
 
@@ -1290,6 +1424,11 @@ export class CanvasEngine {
         this.doc.updateGesture(
           moveCards(this.doc.get(), interaction.origins, world.x - interaction.startWorldX, world.y - interaction.startWorldY),
         );
+        const dropPageId = event.altKey ? null : this.dropTargetFor(interaction.origins, world.x, world.y);
+        if (dropPageId !== interaction.dropPageId) {
+          interaction.dropPageId = dropPageId;
+          this.overlayDirty = true;
+        }
         return;
       }
       case 'marquee': {
@@ -1329,8 +1468,12 @@ export class CanvasEngine {
     if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
     const interaction = this.interaction;
     if (interaction.kind === 'drag') {
-      if (interaction.moved) this.doc.commitGesture();
-      else if (interaction.toggleOnClickId) this.selection.toggle(interaction.toggleOnClickId);
+      if (interaction.moved && interaction.dropPageId) this.dropIntoPage(interaction.origins, interaction.dropPageId);
+      else if (interaction.moved) {
+        const refIds = new Set([...interaction.origins.values()].filter(isRefCard).map((card) => card.id));
+        if (refIds.size) this.doc.updateGesture(reassignRefPages(this.doc.get(), refIds));
+        this.doc.commitGesture();
+      } else if (interaction.toggleOnClickId) this.selection.toggle(interaction.toggleOnClickId);
     }
     if (interaction.kind === 'resize') this.doc.commitGesture();
     if (interaction.kind === 'link' && interaction.targetId) {

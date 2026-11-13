@@ -1,12 +1,19 @@
 import type { PromptDraft, ThemeDraft } from '../../../shared/assistant';
 import { DEFAULT_PROMPT_SETTINGS, type PromptSettings } from '../../../shared/generation';
 import {
+  currentVersion,
+  detectPreset,
+  DEVICE_PRESETS,
   isImageCard,
+  isPageCard,
   isPromptCard,
+  isRefCard,
   isThemeCard,
   type CanvasCard,
   type ImageCard,
+  type PageCard,
   type PromptCard,
+  type RefCard,
   type Region,
   type RegionId,
   type ThemeCard,
@@ -96,7 +103,12 @@ export function addCards(state: DocState, cards: CanvasCard[]): DocState {
 }
 
 /** 删除卡片时一并去掉提示词卡对它们的引用和生效主题卡，撤销时整体恢复 */
-export function removeCards(state: DocState, ids: ReadonlySet<string>): DocState {
+export function removeCards(state: DocState, requested: ReadonlySet<string>): DocState {
+  // 页面框带走它里面的引用；图像卡带走指向它的引用
+  const ids = new Set(requested);
+  for (const card of state.cards) {
+    if (isRefCard(card) && ((card.pageId && requested.has(card.pageId)) || requested.has(card.imageCardId))) ids.add(card.id);
+  }
   const activeThemeCardId = state.activeThemeCardId && ids.has(state.activeThemeCardId) ? null : state.activeThemeCardId;
   const cards = state.cards
     .filter((card) => !ids.has(card.id))
@@ -143,13 +155,21 @@ export function scaleCards(
 
 /** 副本不带生成关系：提示词卡副本不继承输出图，避免两张提示词卡往同一张图里追加版本 */
 export function duplicateCards(state: DocState, ids: ReadonlySet<string>, makeId: () => string): { state: DocState; newIds: string[] } {
+  const newIds: string[] = [];
+  const pageCopies = new Map<string, string>();
   const copies = state.cards
     .filter((card) => ids.has(card.id))
     .map((card): CanvasCard => {
       const moved = { ...card, id: makeId(), x: card.x + DUPLICATE_OFFSET, y: card.y + DUPLICATE_OFFSET };
+      newIds.push(moved.id);
+      if (isPageCard(card)) pageCopies.set(card.id, moved.id);
       return isPromptCard(moved) ? { ...moved, outputCardId: null } : moved;
     });
-  return { state: { ...state, cards: [...state.cards, ...copies] }, newIds: copies.map((card) => card.id) };
+  // 复制页面框时一起复制里面的引用（单独选中的引用已经在上面复制过）
+  const childCopies = state.cards
+    .filter((card): card is RefCard => isRefCard(card) && !!card.pageId && pageCopies.has(card.pageId) && !ids.has(card.id))
+    .map((card) => ({ ...card, id: makeId(), x: card.x + DUPLICATE_OFFSET, y: card.y + DUPLICATE_OFFSET, pageId: pageCopies.get(card.pageId!)! }));
+  return { state: { ...state, cards: [...state.cards, ...copies, ...childCopies] }, newIds };
 }
 
 export function reorderCards(state: DocState, ids: ReadonlySet<string>, to: 'front' | 'back'): DocState {
@@ -164,11 +184,15 @@ export function renameCard(state: DocState, id: string, name: string): DocState 
 
 /** 切换当前版本：保持宽度和左上角不变，高度跟着新版本的比例走 */
 export function setCurrentVersion(state: DocState, id: string, versionId: string): DocState {
+  const target = state.cards.find((card) => card.id === id);
+  const version = target && isImageCard(target) ? target.versions.find((v) => v.id === versionId) : undefined;
+  if (!version || !target || !isImageCard(target) || target.currentVersionId === versionId) return state;
+  const aspect = version.height / version.width;
+  // 页面里的引用跟着当前版本走：宽度不变，高度按新比例
   return mapCards(state, (card) => {
-    if (card.id !== id || !isImageCard(card) || card.currentVersionId === versionId) return card;
-    const version = card.versions.find((v) => v.id === versionId);
-    if (!version) return card;
-    return { ...card, currentVersionId: versionId, height: card.width * (version.height / version.width) };
+    if (card.id === id && isImageCard(card)) return { ...card, currentVersionId: versionId, height: card.width * aspect };
+    if (isRefCard(card) && card.imageCardId === id) return { ...card, height: card.width * aspect };
+    return card;
   });
 }
 
@@ -283,7 +307,7 @@ export function applyGenerationResult(state: DocState, result: GenerationResult)
     const output: ImageCard = {
       kind: 'image',
       id: result.outputCardId,
-      name: prompt ? `${prompt.name} · 结果` : '生成结果',
+      name: prompt && isPromptCard(prompt) ? `${prompt.name} · 结果` : '生成结果',
       x: result.placement.x,
       y: result.placement.y,
       width: result.placement.width,
@@ -404,6 +428,130 @@ export function applyAssistantDrafts(
   });
   if (cards.length) next = addCards(next, cards);
   return { state: next, themeId, promptIds };
+}
+
+// ───────────────────────── 页面框与素材引用 ─────────────────────────
+
+/** 画布上页面框的宽度：竖版 480、横版 960，高度按逻辑尺寸的比例 */
+const PAGE_WIDTH_PORTRAIT = 480;
+const PAGE_WIDTH_LANDSCAPE = 960;
+const PAGE_GAP = 120;
+
+export function newPageCard(
+  state: DocState,
+  options: { id: string; name: string; base: Version | null },
+): PageCard {
+  const detected = options.base ? detectPreset(options.base.width, options.base.height) : { presetId: 'iphone', scale: 3 };
+  const logical = detected
+    ? DEVICE_PRESETS.find((p) => p.id === detected.presetId)!
+    : { width: options.base!.width, height: options.base!.height };
+  const width = logical.width >= logical.height ? PAGE_WIDTH_LANDSCAPE : PAGE_WIDTH_PORTRAIT;
+  const height = width * (logical.height / logical.width);
+  const region = state.regions.find((r) => r.id === 'pages') ?? state.regions[state.regions.length - 1];
+  const pages = state.cards.filter(isPageCard);
+  const x = pages.length ? Math.max(...pages.map((p) => p.x + p.width)) + PAGE_GAP : (region?.x ?? 0) + PAGE_GAP;
+  const y = pages.length ? pages[0].y : (region?.y ?? 0) + PAGE_GAP;
+  return {
+    kind: 'page',
+    id: options.id,
+    name: options.name,
+    x,
+    y,
+    width,
+    height,
+    base: options.base,
+    background: '#FFFFFF',
+    devicePreset: detected?.presetId ?? null,
+    exportScale: detected?.scale ?? 1,
+  };
+}
+
+export function updatePage(state: DocState, id: string, patch: Partial<Omit<PageCard, 'kind' | 'id'>>): DocState {
+  return mapCards(state, (card) => (card.id === id && isPageCard(card) ? { ...card, ...patch } : card));
+}
+
+/** 换设备预设：宽度不变，高度按预设比例 */
+export function setPagePreset(state: DocState, id: string, presetId: string | null): DocState {
+  return mapCards(state, (card) => {
+    if (card.id !== id || !isPageCard(card) || card.devicePreset === presetId) return card;
+    const preset = DEVICE_PRESETS.find((p) => p.id === presetId);
+    const logical = preset ?? (card.base ? { width: card.base.width, height: card.base.height } : null);
+    const height = logical ? card.width * (logical.height / logical.width) : card.height;
+    return { ...card, devicePreset: preset ? preset.id : null, height };
+  });
+}
+
+/** 页面里摆进素材：每项是一张图像卡和它在画布上的目标位置 */
+export function placeIntoPage(
+  state: DocState,
+  pageId: string,
+  items: { imageCardId: string; rect: Rect }[],
+  makeId: () => string,
+): { state: DocState; refIds: string[] } {
+  const refs: RefCard[] = items.map(({ imageCardId, rect }) => ({ kind: 'ref', id: makeId(), ...rect, imageCardId, pageId }));
+  return { state: addCards(state, refs), refIds: refs.map((ref) => ref.id) };
+}
+
+/** 图像卡拖进页面时的大小：比页面宽就缩到页面宽度的 90%，以松手处为中心 */
+export function fitIntoPage(page: Rect, card: Rect, centerX: number, centerY: number): Rect {
+  const scale = Math.min(1, (page.width * 0.9) / card.width, (page.height * 0.9) / card.height);
+  const width = card.width * scale;
+  const height = card.height * scale;
+  return { x: centerX - width / 2, y: centerY - height / 2, width, height };
+}
+
+/** 页面框连同它里面的引用：拖动、缩放、微调页面时一起动 */
+export function withPageChildren(state: DocState, ids: Iterable<string>): Set<string> {
+  const result = new Set(ids);
+  const pages = new Set(state.cards.filter((card) => result.has(card.id) && isPageCard(card)).map((card) => card.id));
+  if (pages.size === 0) return result;
+  for (const card of state.cards) if (isRefCard(card) && card.pageId && pages.has(card.pageId)) result.add(card.id);
+  return result;
+}
+
+/** 引用按中心点重新认页面：落在哪个页面框里就属于哪个，都不在就脱离页面 */
+export function reassignRefPages(state: DocState, refIds: ReadonlySet<string>): DocState {
+  const pages = state.cards.filter(isPageCard);
+  return mapCards(state, (card) => {
+    if (!isRefCard(card) || !refIds.has(card.id)) return card;
+    const cx = card.x + card.width / 2;
+    const cy = card.y + card.height / 2;
+    const page = [...pages].reverse().find((p) => cx >= p.x && cx <= p.x + p.width && cy >= p.y && cy <= p.y + p.height);
+    const pageId = page?.id ?? null;
+    return pageId === card.pageId ? card : { ...card, pageId };
+  });
+}
+
+/** 绘制和命中顺序：引用总是紧跟在它所在的页面框后面，页面挪到最前或最后时引用一起走 */
+export function renderOrder(cards: readonly CanvasCard[]): CanvasCard[] {
+  const pageIds = new Set(cards.filter(isPageCard).map((card) => card.id));
+  const children = new Map<string, RefCard[]>();
+  for (const card of cards) {
+    if (isRefCard(card) && card.pageId && pageIds.has(card.pageId)) {
+      const list = children.get(card.pageId) ?? [];
+      list.push(card);
+      children.set(card.pageId, list);
+    }
+  }
+  if (children.size === 0) return [...cards];
+  const ordered: CanvasCard[] = [];
+  for (const card of cards) {
+    if (isRefCard(card) && card.pageId && pageIds.has(card.pageId)) continue;
+    ordered.push(card);
+    if (isPageCard(card)) ordered.push(...(children.get(card.id) ?? []));
+  }
+  return ordered;
+}
+
+/** 画布上显示这张卡片需要的版本：图像卡是当前版本，引用是被引用图像卡的当前版本，页面框是低保真原型 */
+export function displayVersion(card: CanvasCard, byId: ReadonlyMap<string, CanvasCard>): Version | null {
+  if (isImageCard(card)) return currentVersion(card);
+  if (isPageCard(card)) return card.base;
+  if (isRefCard(card)) {
+    const source = byId.get(card.imageCardId);
+    return source && isImageCard(source) ? currentVersion(source) : null;
+  }
+  return null;
 }
 
 export function regionOf(state: DocState, card: Rect): RegionId | null {
