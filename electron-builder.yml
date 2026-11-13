@@ -1,0 +1,15 @@
+appId: com.orico.anyejingling
+productName: 暗夜精灵
+directories:
+  output: dist
+files:
+  - out/**/*
+  - package.json
+# sharp 的原生二进制不能放在 asar 里
+asarUnpack:
+  - node_modules/sharp/**/*
+  - node_modules/@img/**/*
+mac:
+  target: dir
+  category: public.app-category.graphics-design
+  identity: null

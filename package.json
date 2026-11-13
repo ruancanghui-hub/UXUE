@@ -1,0 +1,38 @@
+{
+  "name": "anye-jingling",
+  "productName": "暗夜精灵",
+  "version": "0.0.1",
+  "description": "私人用的 AI 设计稿编排画布",
+  "private": true,
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "selftest": "electron-vite build && electron . --self-test",
+    "bench": "electron-vite build && electron . --auto-bench && node scripts/print-bench.mjs",
+    "bench:uncapped": "electron-vite build && electron . --auto-bench --uncapped && node scripts/print-bench.mjs",
+    "check:m1": "electron-vite build && electron . --m1-check=write && electron . --m1-check=verify; node scripts/print-m1-check.mjs",
+    "test": "vitest run",
+    "pack": "electron-vite build && electron-builder --mac --dir"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "electron": "^45.3.1",
+    "electron-builder": "^26.18.0",
+    "electron-vite": "^6.0.0",
+    "pixi.js": "^8.23.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
+  },
+  "dependencies": {
+    "sharp": "^0.35.5"
+  }
+}

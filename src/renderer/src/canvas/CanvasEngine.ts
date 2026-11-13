@@ -1,0 +1,1205 @@
+import 'pixi.js/unsafe-eval';
+import { Application, Container, Graphics, Sprite, Text, Texture, TilingSprite } from 'pixi.js';
+import { BENCH_HOST, type BenchImage, type FrameSummary, type TextureLevel } from '../../../shared/bench';
+import { currentVersion, defaultRegions, type ImageCard, type RegionId, type ViewportState } from '../../../shared/project';
+import { texturedImage } from '../../../shared/textures';
+import { DocumentStore, type DocChange } from '../document/DocumentStore';
+import {
+  duplicateCards,
+  moveCards,
+  regionOf,
+  removeCards,
+  reorderCards,
+  scaleCards,
+  type DocState,
+} from '../document/operations';
+import { Selection } from '../document/Selection';
+import { expandRect, intersects, rectFromPoints, unionRects, type Rect } from './geometry';
+import { PerfMonitor } from './PerfMonitor';
+import { TextureManager, type TextureStats } from './TextureManager';
+import { clamp, MAX_ZOOM, MIN_ZOOM, Viewport } from './Viewport';
+
+export type Tool = 'select' | 'hand';
+
+export interface EngineStatus {
+  tool: Tool;
+  zoom: number;
+  itemCount: number;
+  selectionCount: number;
+  focusRegion: RegionId | null;
+  perf: FrameSummary | null;
+  idle: boolean;
+  textures: TextureStats;
+  refreshRateHz: number;
+}
+
+type Corner = 'nw' | 'ne' | 'sw' | 'se';
+
+type Interaction =
+  | { kind: 'none' }
+  | { kind: 'pan'; lastX: number; lastY: number }
+  | {
+      kind: 'drag';
+      startScreenX: number;
+      startScreenY: number;
+      startWorldX: number;
+      startWorldY: number;
+      origins: Map<string, ImageCard>;
+      moved: boolean;
+      toggleOnClickId: string | null;
+    }
+  | { kind: 'marquee'; startWorldX: number; startWorldY: number; base: Set<string>; rect: Rect }
+  | {
+      kind: 'resize';
+      corner: Corner;
+      anchorX: number;
+      anchorY: number;
+      cornerX: number;
+      cornerY: number;
+      origins: Map<string, ImageCard>;
+    };
+
+interface ViewAnimation {
+  from: { centerX: number; centerY: number; logZoom: number };
+  to: { centerX: number; centerY: number; logZoom: number };
+  startedAt: number;
+  duration: number;
+}
+
+export interface AttachOptions {
+  /** ue-asset:// 的主机名：项目用 project，性能测试用 bench */
+  assetHost: string;
+  /** 原图已经不在的版本 */
+  missingVersionIds?: ReadonlySet<string>;
+  viewport?: ViewportState | null;
+}
+
+const BACKGROUND = 0x111114;
+const PLACEHOLDER_TINT = 0x26262c;
+const MISSING_TINT = 0x4a2028;
+const MISSING_OUTLINE = 0xff6b7a;
+const ACCENT = 0x7c8cff;
+const REGION_FILL = 0x17171c;
+const REGION_STROKE = 0x2a2a33;
+const FOCUS_DIM_ALPHA = 0.16;
+const HANDLE_SIZE = 8;
+const HANDLE_HIT = 7;
+const NUDGE_SMALL = 1;
+const NUDGE_LARGE = 10;
+const SCHEDULE_INTERVAL_MS = 100;
+const STATUS_INTERVAL_MS = 250;
+const DRAG_THRESHOLD_PX = 3;
+/** 屏幕上的像素尺寸超过级别上限的 15% 才升级，避免在临界点来回切换 */
+const LEVEL_HYSTERESIS = 1.15;
+
+const BENCH_CELL = 440;
+const BENCH_ITEM_MAX = 400;
+const BENCH_COLUMNS = 20;
+
+export class CanvasEngine {
+  readonly viewport = new Viewport();
+  readonly perf = new PerfMonitor();
+  readonly textures = new TextureManager({
+    upload: (texture) => this.app.renderer.texture.initSource(texture.source),
+  });
+
+  private readonly app = new Application();
+  private readonly regionLayer = new Graphics();
+  private readonly world = new Container();
+  private readonly overlay = new Graphics();
+  private readonly labels = new Container();
+  private grid: TilingSprite | null = null;
+  private host: HTMLElement | null = null;
+  private resizeObserver: ResizeObserver | null = null;
+
+  private doc: DocumentStore = new DocumentStore({ cards: [], regions: defaultRegions() });
+  private selection = new Selection();
+  private assetHost = BENCH_HOST;
+  private missingVersionIds: ReadonlySet<string> = new Set();
+  private detachDoc: (() => void) | null = null;
+
+  /** 已经同步到 Pixi 的卡片快照，用于和新快照对比，只更新变化的部分 */
+  private rendered = new Map<string, ImageCard>();
+  private renderedOrder: readonly ImageCard[] = [];
+  private readonly nodes = new Map<string, Container>();
+  private readonly keyToCards = new Map<string, Set<string>>();
+  private regionLabels = new Map<RegionId, Text>();
+
+  private tool: Tool = 'select';
+  private spaceHeld = false;
+  private interaction: Interaction = { kind: 'none' };
+  private hoverId: string | null = null;
+  private hoverCorner: Corner | null = null;
+  private animation: ViewAnimation | null = null;
+  private focusRegion: RegionId | null = null;
+
+  private needsRender = true;
+  private renderedPreviousTick = false;
+  private viewChanged = true;
+  private overlayDirty = true;
+  private rafId = 0;
+  private lastScheduleAt = 0;
+  private lastStatusAt = 0;
+  private refreshRateHz = 0;
+  private readonly frameHooks = new Set<(now: number) => void>();
+  private readonly statusListeners = new Set<(status: EngineStatus) => void>();
+  private readonly viewportListeners = new Set<(viewport: ViewportState) => void>();
+  private readonly cleanups: (() => void)[] = [];
+  private destroyed = false;
+
+  static async create(host: HTMLElement): Promise<CanvasEngine> {
+    const engine = new CanvasEngine();
+    await engine.init(host);
+    return engine;
+  }
+
+  private async init(host: HTMLElement): Promise<void> {
+    this.host = host;
+    const { width, height } = host.getBoundingClientRect();
+    await this.app.init({
+      width: Math.max(1, width),
+      height: Math.max(1, height),
+      background: BACKGROUND,
+      antialias: false,
+      resolution: window.devicePixelRatio,
+      autoDensity: true,
+      autoStart: false,
+      sharedTicker: false,
+      preference: 'webgl',
+      powerPreference: 'high-performance',
+      // 纹理的生命周期由 TextureManager 管理；Pixi 自带的回收会把视口外的纹理卸掉，滑回来时重新上传造成卡顿
+      gcActive: false,
+    });
+    if (this.destroyed) return;
+
+    const canvas = this.app.canvas;
+    canvas.style.display = 'block';
+    canvas.style.touchAction = 'none';
+    host.appendChild(canvas);
+
+    this.grid = new TilingSprite({ texture: createDotTexture(), width, height });
+    this.grid.alpha = 0.55;
+    this.app.stage.addChild(this.grid, this.regionLayer, this.world, this.overlay, this.labels);
+    this.viewport.resize(width, height);
+
+    this.bindEvents(canvas);
+    this.resizeObserver = new ResizeObserver(() => this.handleResize());
+    this.resizeObserver.observe(host);
+
+    this.warmUpShaders();
+    this.attach(this.doc, this.selection, { assetHost: BENCH_HOST });
+    void this.measureRefreshRate();
+    this.rafId = requestAnimationFrame(this.loop);
+  }
+
+  // ───────────────────────── 文档 ─────────────────────────
+
+  /** 换一份文档来显示（打开项目、进入性能测试） */
+  attach(doc: DocumentStore, selection: Selection, options: AttachOptions): void {
+    this.detachDoc?.();
+    for (const id of [...this.nodes.keys()]) this.removeNode(id);
+    this.rendered.clear();
+    this.renderedOrder = [];
+    this.interaction = { kind: 'none' };
+    this.focusRegion = null;
+
+    this.doc = doc;
+    this.selection = selection;
+    this.assetHost = options.assetHost;
+    this.missingVersionIds = options.missingVersionIds ?? new Set();
+
+    const unsubscribeDoc = doc.subscribe((state, change) => this.onDocChange(state, change));
+    const unsubscribeSelection = selection.subscribe(() => {
+      this.overlayDirty = true;
+      this.emitStatus();
+    });
+    this.detachDoc = () => {
+      unsubscribeDoc();
+      unsubscribeSelection();
+    };
+
+    this.syncFromDoc(doc.get(), true);
+    this.drawRegions();
+    if (options.viewport) {
+      this.viewport.zoom = clamp(options.viewport.zoom, MIN_ZOOM, MAX_ZOOM);
+      this.viewport.originX = options.viewport.originX;
+      this.viewport.originY = options.viewport.originY;
+      this.viewChanged = true;
+    } else {
+      this.fitAll(false);
+    }
+    this.emitStatus();
+  }
+
+  getDoc(): DocumentStore {
+    return this.doc;
+  }
+
+  getSelection(): Selection {
+    return this.selection;
+  }
+
+  /** 缓存在后台重建好了，失败过的纹理重新加载 */
+  retryTexture(versionId: string): void {
+    this.textures.retry(versionId);
+    for (const id of this.keyToCards.get(versionId) ?? []) this.refreshNodeTexture(id);
+    this.needsRender = true;
+  }
+
+  isMissing(card: ImageCard): boolean {
+    const key = card.currentVersionId;
+    return this.missingVersionIds.has(key) || (this.textures.isFailed(key) && !this.textures.bestTiles(key));
+  }
+
+  /** 性能测试：按网格摆放测试图，返回全部 L0 纹理上屏的耗时 */
+  loadBench(images: BenchImage[]): Promise<number> {
+    const cards: ImageCard[] = images.map((image, index) => {
+      const scale = BENCH_ITEM_MAX / Math.max(image.width, image.height);
+      const width = image.width * scale;
+      const height = image.height * scale;
+      const column = index % BENCH_COLUMNS;
+      const row = Math.floor(index / BENCH_COLUMNS);
+      return {
+        kind: 'image',
+        id: image.key,
+        name: image.key,
+        width,
+        height,
+        x: column * BENCH_CELL + (BENCH_ITEM_MAX - width) / 2,
+        y: row * BENCH_CELL + (BENCH_ITEM_MAX - height) / 2,
+        versions: [
+          {
+            id: image.key,
+            file: '',
+            width: image.width,
+            height: image.height,
+            createdAt: '',
+            origin: 'import',
+          },
+        ],
+        currentVersionId: image.key,
+      };
+    });
+    const bounds = unionRects(cards) ?? { x: 0, y: 0, width: 1, height: 1 };
+    const region = { id: 'assets' as const, name: '性能测试', ...expandRect(bounds, 0.02) };
+    this.attach(new DocumentStore({ cards, regions: [region] }), new Selection(), { assetHost: BENCH_HOST });
+    return this.whenAllL0Settled();
+  }
+
+  whenAllL0Settled(): Promise<number> {
+    const startedAt = performance.now();
+    return new Promise((resolve) => {
+      const check = (): void => {
+        if (this.textures.isAllL0Settled()) {
+          this.frameHooks.delete(check);
+          resolve(Math.round(performance.now() - startedAt));
+        }
+      };
+      this.frameHooks.add(check);
+    });
+  }
+
+  // ───────────────────────── 编辑命令 ─────────────────────────
+
+  deleteSelection(): void {
+    if (this.selection.size === 0) return;
+    const ids = new Set(this.selection.get());
+    this.doc.apply('删除', removeCards(this.doc.get(), ids));
+    this.selection.set([]);
+  }
+
+  duplicateSelection(): void {
+    if (this.selection.size === 0) return;
+    const { state, newIds } = duplicateCards(this.doc.get(), this.selection.get(), () => crypto.randomUUID());
+    this.doc.apply('创建副本', state);
+    this.selection.set(newIds);
+  }
+
+  reorderSelection(to: 'front' | 'back'): void {
+    if (this.selection.size === 0) return;
+    this.doc.apply(to === 'front' ? '移到最前' : '移到最后', reorderCards(this.doc.get(), this.selection.get(), to));
+  }
+
+  nudgeSelection(dx: number, dy: number): void {
+    if (this.selection.size === 0) return;
+    const origins = this.selectedOrigins();
+    this.doc.apply('微调位置', moveCards(this.doc.get(), origins, dx, dy));
+  }
+
+  selectAll(): void {
+    this.selection.set(this.doc.get().cards.map((card) => card.id));
+  }
+
+  // ───────────────────────── 视口 ─────────────────────────
+
+  setTool(tool: Tool): void {
+    this.tool = tool;
+    this.updateCursor();
+    this.emitStatus();
+  }
+
+  fitAll(animate = true): void {
+    const state = this.doc.get();
+    const bounds = unionRects([...state.regions, ...state.cards]);
+    if (bounds) this.animateToRect(bounds, animate);
+  }
+
+  zoomToSelection(): void {
+    const bounds = unionRects(this.selectedCards());
+    if (bounds) this.animateToRect(bounds, true);
+  }
+
+  zoomToCard(id: string): void {
+    const card = this.doc.get().cards.find((c) => c.id === id);
+    if (card) this.animateToRect(card, true, 0.6);
+  }
+
+  flyToRegion(id: RegionId): void {
+    const region = this.doc.get().regions.find((r) => r.id === id);
+    if (!region) return;
+    if (this.focusRegion) this.setFocusRegion(id);
+    this.animateToRect(region, true);
+  }
+
+  /** 只看某个区域：其他区域的内容变暗；传 null 恢复 */
+  setFocusRegion(id: RegionId | null): void {
+    this.focusRegion = id;
+    this.applyFocus();
+    this.drawRegions();
+    this.needsRender = true;
+    this.emitStatus();
+  }
+
+  /** 当前视口中心所在的区域；不在任何区域里时返回最近的 */
+  regionAtViewCenter(): RegionId | null {
+    const center = this.viewCenterWorld();
+    const regions = this.doc.get().regions;
+    let best: { id: RegionId; distance: number } | null = null;
+    for (const region of regions) {
+      const dx = Math.max(region.x - center.x, 0, center.x - (region.x + region.width));
+      const dy = Math.max(region.y - center.y, 0, center.y - (region.y + region.height));
+      const distance = Math.hypot(dx, dy);
+      if (!best || distance < best.distance) best = { id: region.id, distance };
+    }
+    return best?.id ?? null;
+  }
+
+  getFocusRegion(): RegionId | null {
+    return this.focusRegion;
+  }
+
+  zoomBy(factor: number): void {
+    const center = this.viewCenterWorld();
+    this.animateTo(center.x, center.y, clamp(this.viewport.zoom * factor, MIN_ZOOM, MAX_ZOOM));
+  }
+
+  setZoom(zoom: number): void {
+    const center = this.viewCenterWorld();
+    this.animateTo(center.x, center.y, zoom);
+  }
+
+  viewCenterWorld(): { x: number; y: number } {
+    return this.viewport.screenToWorld(this.viewport.screenWidth / 2, this.viewport.screenHeight / 2);
+  }
+
+  clientToWorld(clientX: number, clientY: number): { x: number; y: number } {
+    const bounds = this.app.canvas.getBoundingClientRect();
+    return this.viewport.screenToWorld(clientX - bounds.left, clientY - bounds.top);
+  }
+
+  /** 视口被外部直接修改后调用（性能测试脚本使用） */
+  invalidateView(): void {
+    this.animation = null;
+    this.viewChanged = true;
+  }
+
+  addFrameHook(hook: (now: number) => void): () => void {
+    this.frameHooks.add(hook);
+    return () => this.frameHooks.delete(hook);
+  }
+
+  onStatus(listener: (status: EngineStatus) => void): () => void {
+    this.statusListeners.add(listener);
+    listener(this.status());
+    return () => this.statusListeners.delete(listener);
+  }
+
+  /** 视口每次变化都会通知，调用方自己决定多久保存一次 */
+  onViewportChange(listener: (viewport: ViewportState) => void): () => void {
+    this.viewportListeners.add(listener);
+    return () => this.viewportListeners.delete(listener);
+  }
+
+  getRefreshRateHz(): number {
+    return this.refreshRateHz;
+  }
+
+  destroy(): void {
+    this.destroyed = true;
+    cancelAnimationFrame(this.rafId);
+    this.resizeObserver?.disconnect();
+    this.detachDoc?.();
+    for (const cleanup of this.cleanups) cleanup();
+    this.frameHooks.clear();
+    this.statusListeners.clear();
+    this.viewportListeners.clear();
+    this.textures.destroy();
+    if (this.app.renderer) this.app.destroy({ removeView: true }, { children: true });
+  }
+
+  // ───────────────────────── 帧循环 ─────────────────────────
+
+  private readonly loop = (now: number): void => {
+    if (this.destroyed) return;
+    this.rafId = requestAnimationFrame(this.loop);
+    const frameStart = performance.now();
+
+    for (const hook of this.frameHooks) hook(now);
+    this.stepAnimation(now);
+    const hooksEnd = performance.now();
+
+    if (this.viewChanged) {
+      this.applyViewport();
+      this.viewChanged = false;
+      this.needsRender = true;
+      this.overlayDirty = true;
+      const snapshot = this.viewport.snapshot();
+      for (const listener of this.viewportListeners) listener(snapshot);
+    }
+    const viewEnd = performance.now();
+
+    if (now - this.lastScheduleAt >= SCHEDULE_INTERVAL_MS) {
+      this.lastScheduleAt = now;
+      this.scheduleTextures(now);
+    }
+
+    const commitStart = performance.now();
+    const changed = this.textures.commitDecoded();
+    const evicted = this.textures.evict();
+    const rewanted = this.textures.takeWantedChanges();
+    for (const key of [...changed, ...evicted, ...rewanted]) {
+      for (const id of this.keyToCards.get(key) ?? []) this.refreshNodeTexture(id);
+    }
+    if (changed.length > 0 || evicted.length > 0 || rewanted.length > 0) {
+      this.needsRender = true;
+      this.overlayDirty = true;
+    }
+    const commitMs = performance.now() - commitStart;
+
+    if (this.overlayDirty) {
+      this.drawOverlay();
+      this.overlayDirty = false;
+      this.needsRender = true;
+    }
+
+    const rendered = this.needsRender;
+    if (rendered) {
+      const renderStart = performance.now();
+      this.app.render();
+      this.needsRender = false;
+      const frameEnd = performance.now();
+      this.perf.recordFrame(frameStart, frameEnd - frameStart, this.renderedPreviousTick, {
+        hooksMs: hooksEnd - frameStart,
+        viewMs: viewEnd - hooksEnd,
+        scheduleMs: commitStart - viewEnd,
+        commitMs,
+        renderMs: frameEnd - renderStart,
+        commits: changed.length,
+      });
+    }
+    this.renderedPreviousTick = rendered;
+
+    if (now - this.lastStatusAt >= STATUS_INTERVAL_MS) {
+      this.lastStatusAt = now;
+      this.emitStatus();
+    }
+  };
+
+  private applyViewport(): void {
+    const { zoom, originX, originY } = this.viewport;
+    this.world.scale.set(zoom);
+    this.world.position.set(-originX * zoom, -originY * zoom);
+    this.regionLayer.scale.set(zoom);
+    this.regionLayer.position.set(-originX * zoom, -originY * zoom);
+    this.updateGrid();
+    this.updateCulling();
+    this.positionRegionLabels();
+  }
+
+  private updateCulling(): void {
+    const view = expandRect(this.viewport.visibleWorldRect(), 0.1);
+    for (const card of this.doc.get().cards) {
+      const node = this.nodes.get(card.id);
+      if (node) node.visible = intersects(card, view);
+    }
+  }
+
+  private updateGrid(): void {
+    if (!this.grid) return;
+    const { zoom, originX, originY } = this.viewport;
+    let worldSpacing = 32;
+    while (worldSpacing * zoom < 14) worldSpacing *= 4;
+    while (worldSpacing * zoom > 56) worldSpacing /= 4;
+    this.grid.tileScale.set((worldSpacing * zoom) / DOT_TILE);
+    this.grid.tilePosition.set(-originX * zoom, -originY * zoom);
+  }
+
+  private scheduleTextures(now: number): void {
+    const view = this.viewport.visibleWorldRect();
+    const preload = expandRect(view, 0.25);
+    const centerX = view.x + view.width / 2;
+    const centerY = view.y + view.height / 2;
+    const pixelScale = this.viewport.zoom * this.app.renderer.resolution;
+
+    // 同一个版本被多张卡片引用时，取需要最清晰的那张
+    const wanted = new Map<string, { level: TextureLevel; priority: number }>();
+    for (const card of this.doc.get().cards) {
+      const distance = Math.hypot(card.x + card.width / 2 - centerX, card.y + card.height / 2 - centerY);
+      let level: TextureLevel = 0;
+      let priority = 1e6 + distance;
+      if (intersects(card, preload)) {
+        const screenPx = Math.max(card.width, card.height) * pixelScale;
+        level = screenPx > 1024 * LEVEL_HYSTERESIS ? 2 : screenPx > 256 * LEVEL_HYSTERESIS ? 1 : 0;
+        priority = distance;
+      }
+      const previous = wanted.get(card.currentVersionId);
+      if (!previous || level > previous.level || (level === previous.level && priority < previous.priority)) {
+        wanted.set(card.currentVersionId, { level, priority });
+      }
+    }
+    for (const [key, { level, priority }] of wanted) this.textures.setWanted(key, level, priority, now);
+    this.textures.schedule();
+  }
+
+  // ───────────────────────── 场景同步 ─────────────────────────
+
+  private onDocChange(state: DocState, change: DocChange): void {
+    this.syncFromDoc(state, change === 'reset');
+    if (change !== 'transient') {
+      this.selection.prune(new Set(state.cards.map((card) => card.id)));
+      this.drawRegions();
+    }
+    if (change !== 'transient') this.emitStatus();
+  }
+
+  /** 只更新和上一次快照相比变了的卡片 */
+  private syncFromDoc(state: DocState, full: boolean): void {
+    const next = new Map(state.cards.map((card) => [card.id, card]));
+    for (const id of [...this.rendered.keys()]) if (!next.has(id)) this.removeNode(id);
+
+    for (const card of state.cards) {
+      const previous = this.rendered.get(card.id);
+      if (!full && previous === card) continue;
+      let node = this.nodes.get(card.id);
+      if (!node) {
+        node = new Container();
+        this.nodes.set(card.id, node);
+      }
+      if (previous?.currentVersionId !== card.currentVersionId) {
+        if (previous) this.unbindTexture(card.id, previous.currentVersionId);
+        this.bindTexture(card);
+      }
+      node.position.set(card.x, card.y);
+      this.rendered.set(card.id, card);
+      this.refreshNodeTexture(card.id);
+    }
+
+    if (full || !sameOrder(this.renderedOrder, state.cards)) {
+      this.world.removeChildren();
+      for (const card of state.cards) this.world.addChild(this.nodes.get(card.id)!);
+    }
+    this.renderedOrder = state.cards;
+    this.updateCulling();
+    this.applyFocus();
+    this.overlayDirty = true;
+    this.needsRender = true;
+  }
+
+  private bindTexture(card: ImageCard): void {
+    const version = currentVersion(card);
+    this.textures.register(texturedImage(this.assetHost, version.id, version.width, version.height));
+    let ids = this.keyToCards.get(version.id);
+    if (!ids) {
+      ids = new Set();
+      this.keyToCards.set(version.id, ids);
+    }
+    ids.add(card.id);
+  }
+
+  private unbindTexture(cardId: string, key: string): void {
+    this.textures.unregister(key);
+    const ids = this.keyToCards.get(key);
+    ids?.delete(cardId);
+    if (ids?.size === 0) this.keyToCards.delete(key);
+  }
+
+  /** 节点里放一个精灵（L0 / L1 / 占位）或多块 L2 tile 精灵，精灵按需复用 */
+  private refreshNodeTexture(id: string): void {
+    const card = this.rendered.get(id);
+    const node = this.nodes.get(id);
+    if (!card || !node) return;
+    const tileSet = this.textures.bestTiles(card.currentVersionId);
+    const count = tileSet ? tileSet.tiles.length : 1;
+
+    while (node.children.length > count) node.removeChildAt(node.children.length - 1).destroy();
+    while (node.children.length < count) node.addChild(new Sprite(Texture.WHITE));
+
+    if (!tileSet) {
+      const sprite = node.children[0] as Sprite;
+      sprite.texture = Texture.WHITE;
+      sprite.tint = this.isMissing(card) ? MISSING_TINT : PLACEHOLDER_TINT;
+      sprite.position.set(0, 0);
+      sprite.setSize(card.width, card.height);
+      return;
+    }
+    const scaleX = card.width / tileSet.imageWidth;
+    const scaleY = card.height / tileSet.imageHeight;
+    tileSet.tiles.forEach((tile, index) => {
+      const sprite = node.children[index] as Sprite;
+      sprite.texture = tile.texture;
+      sprite.tint = 0xffffff;
+      sprite.position.set(tile.x * scaleX, tile.y * scaleY);
+      sprite.setSize(tile.width * scaleX, tile.height * scaleY);
+    });
+  }
+
+  private removeNode(id: string): void {
+    const node = this.nodes.get(id);
+    const card = this.rendered.get(id);
+    if (card) this.unbindTexture(id, card.currentVersionId);
+    node?.destroy({ children: true });
+    this.nodes.delete(id);
+    this.rendered.delete(id);
+  }
+
+  private applyFocus(): void {
+    const state = this.doc.get();
+    for (const card of state.cards) {
+      const node = this.nodes.get(card.id);
+      if (!node) continue;
+      node.alpha = this.focusRegion && regionOf(state, card) !== this.focusRegion ? FOCUS_DIM_ALPHA : 1;
+    }
+  }
+
+  private drawRegions(): void {
+    const g = this.regionLayer;
+    g.clear();
+    const regions = this.doc.get().regions;
+    for (const region of regions) {
+      const dim = this.focusRegion !== null && region.id !== this.focusRegion;
+      g.rect(region.x, region.y, region.width, region.height)
+        .fill({ color: REGION_FILL, alpha: dim ? 0.35 : 1 })
+        .stroke({ color: REGION_STROKE, width: 1, pixelLine: true, alpha: dim ? 0.4 : 1 });
+    }
+
+    const alive = new Set(regions.map((r) => r.id));
+    for (const [id, label] of this.regionLabels) {
+      if (!alive.has(id)) {
+        label.destroy();
+        this.regionLabels.delete(id);
+      }
+    }
+    for (const region of regions) {
+      let label = this.regionLabels.get(region.id);
+      if (!label) {
+        label = new Text({
+          text: region.name,
+          style: { fontFamily: 'PingFang SC, -apple-system, sans-serif', fontSize: 13, fontWeight: '600', fill: 0x9a9aa8 },
+          resolution: window.devicePixelRatio * 2,
+        });
+        this.labels.addChild(label);
+        this.regionLabels.set(region.id, label);
+      }
+      label.text = region.name;
+      label.alpha = this.focusRegion !== null && region.id !== this.focusRegion ? 0.35 : 1;
+    }
+    this.positionRegionLabels();
+    this.needsRender = true;
+  }
+
+  /** 区域名称贴在区域左上角外侧，字号不随缩放变化 */
+  private positionRegionLabels(): void {
+    for (const region of this.doc.get().regions) {
+      const label = this.regionLabels.get(region.id);
+      if (!label) continue;
+      const corner = this.viewport.worldToScreen(region.x, region.y);
+      label.position.set(Math.round(corner.x), Math.round(corner.y - label.height - 6));
+    }
+  }
+
+  private drawOverlay(): void {
+    const g = this.overlay;
+    g.clear();
+    const selection = this.selection.get();
+    const view = this.viewport.visibleWorldRect();
+
+    for (const card of this.doc.get().cards) {
+      if (intersects(card, view) && this.isMissing(card)) this.strokeWorldRect(g, card, 1, 0.9, MISSING_OUTLINE);
+    }
+    if (this.hoverId && !selection.has(this.hoverId) && this.interaction.kind === 'none') {
+      const card = this.rendered.get(this.hoverId);
+      if (card) this.strokeWorldRect(g, card, 1, 0.7);
+    }
+    const selected = this.selectedCards();
+    for (const card of selected) this.strokeWorldRect(g, card, 1.5, 1);
+
+    const bounds = unionRects(selected);
+    if (bounds && this.interaction.kind !== 'marquee') {
+      if (selected.length > 1) this.strokeWorldRect(g, bounds, 1, 0.5);
+      for (const corner of this.cornerPoints(bounds)) {
+        g.rect(corner.x - HANDLE_SIZE / 2, corner.y - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE)
+          .fill({ color: 0xffffff })
+          .stroke({ color: ACCENT, width: 1.5 });
+      }
+    }
+    if (this.interaction.kind === 'marquee') {
+      const { rect } = this.interaction;
+      const a = this.viewport.worldToScreen(rect.x, rect.y);
+      g.rect(a.x, a.y, rect.width * this.viewport.zoom, rect.height * this.viewport.zoom)
+        .fill({ color: ACCENT, alpha: 0.1 })
+        .stroke({ color: ACCENT, width: 1, alpha: 0.9 });
+    }
+  }
+
+  private strokeWorldRect(g: Graphics, rect: Rect, width: number, alpha: number, color = ACCENT): void {
+    const a = this.viewport.worldToScreen(rect.x, rect.y);
+    g.rect(a.x, a.y, rect.width * this.viewport.zoom, rect.height * this.viewport.zoom).stroke({
+      color,
+      width,
+      alpha,
+      alignment: 1,
+    });
+  }
+
+  /** 选中范围四个角在屏幕上的位置 */
+  private cornerPoints(bounds: Rect): { corner: Corner; x: number; y: number }[] {
+    const a = this.viewport.worldToScreen(bounds.x, bounds.y);
+    const b = this.viewport.worldToScreen(bounds.x + bounds.width, bounds.y + bounds.height);
+    return [
+      { corner: 'nw', x: a.x, y: a.y },
+      { corner: 'ne', x: b.x, y: a.y },
+      { corner: 'sw', x: a.x, y: b.y },
+      { corner: 'se', x: b.x, y: b.y },
+    ];
+  }
+
+  private hitCorner(screenX: number, screenY: number): Corner | null {
+    const bounds = unionRects(this.selectedCards());
+    if (!bounds) return null;
+    for (const point of this.cornerPoints(bounds)) {
+      if (Math.abs(point.x - screenX) <= HANDLE_HIT && Math.abs(point.y - screenY) <= HANDLE_HIT) return point.corner;
+    }
+    return null;
+  }
+
+  private selectedCards(): ImageCard[] {
+    const selection = this.selection.get();
+    return this.doc.get().cards.filter((card) => selection.has(card.id));
+  }
+
+  private selectedOrigins(): Map<string, ImageCard> {
+    return new Map(this.selectedCards().map((card) => [card.id, card]));
+  }
+
+  private hitTest(worldX: number, worldY: number): ImageCard | undefined {
+    const cards = this.doc.get().cards;
+    for (let i = cards.length - 1; i >= 0; i--) {
+      const card = cards[i];
+      if (worldX >= card.x && worldX <= card.x + card.width && worldY >= card.y && worldY <= card.y + card.height) {
+        return card;
+      }
+    }
+    return undefined;
+  }
+
+  // ───────────────────────── 视口动画 ─────────────────────────
+
+  private animateToRect(rect: Rect, animate: boolean, fillRatio = 1): void {
+    const padding = 64;
+    const zoom = clamp(
+      Math.min(
+        (this.viewport.screenWidth - padding * 2) / rect.width,
+        (this.viewport.screenHeight - padding * 2) / rect.height,
+      ) * fillRatio,
+      MIN_ZOOM,
+      MAX_ZOOM,
+    );
+    const centerX = rect.x + rect.width / 2;
+    const centerY = rect.y + rect.height / 2;
+    if (!animate) {
+      this.viewport.zoom = zoom;
+      this.viewport.centerOn(centerX, centerY);
+      this.viewChanged = true;
+      return;
+    }
+    this.animateTo(centerX, centerY, zoom);
+  }
+
+  private animateTo(centerX: number, centerY: number, zoom: number): void {
+    const current = this.viewCenterWorld();
+    this.animation = {
+      from: { centerX: current.x, centerY: current.y, logZoom: Math.log(this.viewport.zoom) },
+      to: { centerX, centerY, logZoom: Math.log(zoom) },
+      startedAt: performance.now(),
+      duration: 220,
+    };
+  }
+
+  private stepAnimation(now: number): void {
+    const animation = this.animation;
+    if (!animation) return;
+    const t = clamp((now - animation.startedAt) / animation.duration, 0, 1);
+    const eased = 1 - Math.pow(1 - t, 3);
+    const lerp = (a: number, b: number): number => a + (b - a) * eased;
+    this.viewport.zoom = Math.exp(lerp(animation.from.logZoom, animation.to.logZoom));
+    this.viewport.centerOn(lerp(animation.from.centerX, animation.to.centerX), lerp(animation.from.centerY, animation.to.centerY));
+    this.viewChanged = true;
+    if (t >= 1) this.animation = null;
+  }
+
+  // ───────────────────────── 输入 ─────────────────────────
+
+  private bindEvents(canvas: HTMLCanvasElement): void {
+    const listen = <K extends keyof HTMLElementEventMap>(
+      target: HTMLElement | Window,
+      type: K,
+      handler: (event: HTMLElementEventMap[K]) => void,
+      options?: AddEventListenerOptions,
+    ): void => {
+      target.addEventListener(type, handler as EventListener, options);
+      this.cleanups.push(() => target.removeEventListener(type, handler as EventListener, options));
+    };
+
+    listen(canvas, 'wheel', (event) => this.onWheel(event), { passive: false });
+    listen(canvas, 'pointerdown', (event) => this.onPointerDown(event));
+    listen(canvas, 'pointermove', (event) => this.onPointerMove(event));
+    listen(canvas, 'pointerup', (event) => this.onPointerUp(event));
+    listen(canvas, 'pointercancel', (event) => this.onPointerUp(event));
+    listen(canvas, 'pointerleave', () => this.setHover(null, null));
+    listen(window, 'keydown', (event) => this.onKeyDown(event));
+    listen(window, 'keyup', (event) => this.onKeyUp(event));
+    listen(window, 'blur', () => {
+      this.spaceHeld = false;
+      this.updateCursor();
+    });
+  }
+
+  private onWheel(event: WheelEvent): void {
+    event.preventDefault();
+    this.animation = null;
+    const lineScale = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : 1;
+    const dx = event.deltaX * lineScale;
+    const dy = event.deltaY * lineScale;
+    const { x, y } = this.localPoint(event);
+
+    if (event.ctrlKey || event.metaKey) {
+      // 触控板双指捏合会带 ctrlKey；鼠标用 Cmd + 滚轮缩放
+      this.viewport.zoomAt(x, y, this.viewport.zoom * Math.exp(-dy * 0.01));
+    } else {
+      this.viewport.panByScreen(-dx, -dy);
+    }
+    this.viewChanged = true;
+  }
+
+  private onPointerDown(event: PointerEvent): void {
+    const canvas = this.app.canvas;
+    canvas.setPointerCapture(event.pointerId);
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    this.animation = null;
+    const { x, y } = this.localPoint(event);
+
+    if (event.button === 1 || this.tool === 'hand' || this.spaceHeld) {
+      this.interaction = { kind: 'pan', lastX: x, lastY: y };
+      this.updateCursor();
+      return;
+    }
+    if (event.button !== 0) return;
+
+    const corner = this.hitCorner(x, y);
+    if (corner) {
+      const bounds = unionRects(this.selectedCards())!;
+      const opposite = { nw: 'se', ne: 'sw', sw: 'ne', se: 'nw' } as const;
+      const point = (c: Corner): { x: number; y: number } => ({
+        x: c === 'nw' || c === 'sw' ? bounds.x : bounds.x + bounds.width,
+        y: c === 'nw' || c === 'ne' ? bounds.y : bounds.y + bounds.height,
+      });
+      const anchor = point(opposite[corner]);
+      const cornerPoint = point(corner);
+      this.doc.beginGesture('缩放');
+      this.interaction = {
+        kind: 'resize',
+        corner,
+        anchorX: anchor.x,
+        anchorY: anchor.y,
+        cornerX: cornerPoint.x,
+        cornerY: cornerPoint.y,
+        origins: this.selectedOrigins(),
+      };
+      return;
+    }
+
+    const world = this.viewport.screenToWorld(x, y);
+    const hit = this.hitTest(world.x, world.y);
+
+    if (!hit) {
+      const base = event.shiftKey ? new Set(this.selection.get()) : new Set<string>();
+      if (!event.shiftKey) this.selection.set([]);
+      this.interaction = {
+        kind: 'marquee',
+        startWorldX: world.x,
+        startWorldY: world.y,
+        base,
+        rect: { x: world.x, y: world.y, width: 0, height: 0 },
+      };
+      return;
+    }
+
+    let toggleOnClickId: string | null = null;
+    if (event.shiftKey) {
+      if (this.selection.has(hit.id)) toggleOnClickId = hit.id;
+      else this.selection.toggle(hit.id);
+    } else if (!this.selection.has(hit.id)) {
+      this.selection.set([hit.id]);
+    }
+
+    this.interaction = {
+      kind: 'drag',
+      startScreenX: x,
+      startScreenY: y,
+      startWorldX: world.x,
+      startWorldY: world.y,
+      origins: this.selectedOrigins(),
+      moved: false,
+      toggleOnClickId,
+    };
+  }
+
+  private onPointerMove(event: PointerEvent): void {
+    const { x, y } = this.localPoint(event);
+    const interaction = this.interaction;
+
+    switch (interaction.kind) {
+      case 'none': {
+        const corner = this.hitCorner(x, y);
+        const world = this.viewport.screenToWorld(x, y);
+        this.setHover(corner ? null : (this.hitTest(world.x, world.y)?.id ?? null), corner);
+        return;
+      }
+      case 'pan':
+        this.viewport.panByScreen(x - interaction.lastX, y - interaction.lastY);
+        interaction.lastX = x;
+        interaction.lastY = y;
+        this.viewChanged = true;
+        return;
+      case 'drag': {
+        if (!interaction.moved) {
+          if (Math.hypot(x - interaction.startScreenX, y - interaction.startScreenY) < DRAG_THRESHOLD_PX) return;
+          interaction.moved = true;
+          this.doc.beginGesture('移动');
+        }
+        const world = this.viewport.screenToWorld(x, y);
+        this.doc.updateGesture(
+          moveCards(this.doc.get(), interaction.origins, world.x - interaction.startWorldX, world.y - interaction.startWorldY),
+        );
+        return;
+      }
+      case 'marquee': {
+        const world = this.viewport.screenToWorld(x, y);
+        interaction.rect = rectFromPoints(interaction.startWorldX, interaction.startWorldY, world.x, world.y);
+        const ids = new Set(interaction.base);
+        for (const card of this.doc.get().cards) if (intersects(card, interaction.rect)) ids.add(card.id);
+        this.selection.set(ids);
+        this.overlayDirty = true;
+        return;
+      }
+      case 'resize': {
+        const world = this.viewport.screenToWorld(x, y);
+        const sx = (world.x - interaction.anchorX) / (interaction.cornerX - interaction.anchorX);
+        const sy = (world.y - interaction.anchorY) / (interaction.cornerY - interaction.anchorY);
+        this.doc.updateGesture(
+          scaleCards(this.doc.get(), interaction.origins, interaction.anchorX, interaction.anchorY, Math.max(sx, sy)),
+        );
+        return;
+      }
+    }
+  }
+
+  private onPointerUp(event: PointerEvent): void {
+    const canvas = this.app.canvas;
+    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    const interaction = this.interaction;
+    if (interaction.kind === 'drag') {
+      if (interaction.moved) this.doc.commitGesture();
+      else if (interaction.toggleOnClickId) this.selection.toggle(interaction.toggleOnClickId);
+    }
+    if (interaction.kind === 'resize') this.doc.commitGesture();
+    this.interaction = { kind: 'none' };
+    this.overlayDirty = true;
+    this.updateCursor();
+  }
+
+  private onKeyDown(event: KeyboardEvent): void {
+    if (isTyping(event.target)) return;
+    const mod = event.metaKey || event.ctrlKey;
+
+    if (event.code === 'Space') {
+      event.preventDefault();
+      if (!this.spaceHeld) {
+        this.spaceHeld = true;
+        this.updateCursor();
+      }
+      return;
+    }
+    if (event.key === 'Escape' && this.doc.isGestureActive()) {
+      this.doc.cancelGesture();
+      this.interaction = { kind: 'none' };
+      this.overlayDirty = true;
+      return;
+    }
+    if (mod) return;
+
+    const arrows: Record<string, [number, number]> = {
+      ArrowLeft: [-1, 0],
+      ArrowRight: [1, 0],
+      ArrowUp: [0, -1],
+      ArrowDown: [0, 1],
+    };
+    if (arrows[event.key]) {
+      event.preventDefault();
+      const step = event.shiftKey ? NUDGE_LARGE : NUDGE_SMALL;
+      const [dx, dy] = arrows[event.key];
+      this.nudgeSelection(dx * step, dy * step);
+    } else if (event.shiftKey && event.code === 'Digit1') {
+      this.fitAll();
+    } else if (event.shiftKey && event.code === 'Digit2') {
+      this.zoomToSelection();
+    } else if (event.shiftKey && event.code === 'Digit0') {
+      this.setZoom(1);
+    } else if (event.key.toLowerCase() === 'v') {
+      this.setTool('select');
+    } else if (event.key.toLowerCase() === 'h') {
+      this.setTool('hand');
+    } else if (event.key === 'Backspace' || event.key === 'Delete') {
+      this.deleteSelection();
+    } else if (event.key === 'Escape') {
+      this.selection.set([]);
+    }
+  }
+
+  private onKeyUp(event: KeyboardEvent): void {
+    if (event.code === 'Space') {
+      this.spaceHeld = false;
+      this.updateCursor();
+    }
+  }
+
+  private setHover(id: string | null, corner: Corner | null): void {
+    if (this.hoverId === id && this.hoverCorner === corner) return;
+    this.hoverId = id;
+    this.hoverCorner = corner;
+    this.overlayDirty = true;
+    this.updateCursor();
+  }
+
+  private updateCursor(): void {
+    const canvas = this.app.canvas;
+    if (!canvas) return;
+    if (this.interaction.kind === 'pan') canvas.style.cursor = 'grabbing';
+    else if (this.tool === 'hand' || this.spaceHeld) canvas.style.cursor = 'grab';
+    else if (this.hoverCorner === 'nw' || this.hoverCorner === 'se') canvas.style.cursor = 'nwse-resize';
+    else if (this.hoverCorner === 'ne' || this.hoverCorner === 'sw') canvas.style.cursor = 'nesw-resize';
+    else canvas.style.cursor = 'default';
+  }
+
+  private localPoint(event: MouseEvent): { x: number; y: number } {
+    const bounds = this.app.canvas.getBoundingClientRect();
+    return { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+  }
+
+  // ───────────────────────── 其它 ─────────────────────────
+
+  private handleResize(): void {
+    if (!this.host || !this.app.renderer) return;
+    const { width, height } = this.host.getBoundingClientRect();
+    this.app.renderer.resize(Math.max(1, width), Math.max(1, height), window.devicePixelRatio);
+    this.viewport.resize(width, height);
+    if (this.grid) this.grid.setSize(width, height);
+    this.viewChanged = true;
+  }
+
+  private status(): EngineStatus {
+    return {
+      tool: this.tool,
+      zoom: this.viewport.zoom,
+      itemCount: this.doc.get().cards.length,
+      selectionCount: this.selection.size,
+      focusRegion: this.focusRegion,
+      perf: this.perf.recent(),
+      idle: this.perf.isIdle(performance.now()),
+      textures: this.textures.stats(),
+      refreshRateHz: this.refreshRateHz,
+    };
+  }
+
+  private emitStatus(): void {
+    if (this.statusListeners.size === 0) return;
+    const status = this.status();
+    for (const listener of this.statusListeners) listener(status);
+  }
+
+  /** 第一次画精灵批次和线框时才编译着色器（实测 13ms），启动时先在屏幕外画一次 */
+  private warmUpShaders(): void {
+    const warm = new Container();
+    const sprite = new Sprite(Texture.WHITE);
+    const outline = new Graphics().rect(0, 0, 4, 4).stroke({ color: ACCENT, width: 1 });
+    warm.addChild(sprite, outline);
+    warm.position.set(-100, -100);
+    this.app.stage.addChild(warm);
+    this.app.render();
+    warm.destroy({ children: true });
+  }
+
+  /** 连续采样 rAF 间隔估算显示器刷新率 */
+  private async measureRefreshRate(): Promise<void> {
+    const samples: number[] = [];
+    let last = 0;
+    await new Promise<void>((resolve) => {
+      const tick = (now: number): void => {
+        if (last > 0) samples.push(now - last);
+        last = now;
+        if (samples.length >= 40 || this.destroyed) resolve();
+        else requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+    samples.sort((a, b) => a - b);
+    const median = samples[Math.floor(samples.length / 2)] ?? 16.67;
+    this.refreshRateHz = Math.round(1000 / median);
+  }
+}
+
+export function isTyping(target: EventTarget | null): boolean {
+  const element = target as HTMLElement | null;
+  return !!element && (element.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName));
+}
+
+function sameOrder(a: readonly ImageCard[], b: readonly ImageCard[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i].id !== b[i].id) return false;
+  return true;
+}
+
+const DOT_TILE = 32;
+
+function createDotTexture(): Texture {
+  const canvas = document.createElement('canvas');
+  canvas.width = DOT_TILE;
+  canvas.height = DOT_TILE;
+  const context = canvas.getContext('2d')!;
+  context.fillStyle = 'rgba(255,255,255,0.16)';
+  context.beginPath();
+  context.arc(1.5, 1.5, 1.25, 0, Math.PI * 2);
+  context.fill();
+  return Texture.from(canvas);
+}
