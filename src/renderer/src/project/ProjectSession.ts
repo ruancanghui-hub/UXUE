@@ -32,7 +32,11 @@ export class ProjectSession {
     this.name = opened.name;
     this.missingVersionIds = new Set(opened.missingVersionIds);
     this.viewport = opened.file.viewport;
-    this.doc = new DocumentStore({ cards: opened.file.cards, regions: opened.file.regions });
+    this.doc = new DocumentStore({
+      cards: opened.file.cards,
+      regions: opened.file.regions,
+      activeThemeCardId: opened.file.activeThemeCardId,
+    });
     this.unsubscribe = this.doc.subscribe((_state, change) => {
       if (change !== 'transient' && change !== 'reset') this.scheduleSave(SAVE_AFTER_EDIT_MS);
     });
@@ -68,6 +72,7 @@ export class ProjectSession {
       schemaVersion: PROJECT_SCHEMA_VERSION,
       regions: [...state.regions],
       cards: [...state.cards],
+      activeThemeCardId: state.activeThemeCardId,
       viewport: this.viewport,
     };
   }

@@ -6,9 +6,18 @@ import {
   type JobUpdate,
   type PromptSettings,
 } from '../../../shared/generation';
-import { currentVersion, isImageCard, isPromptCard, type ImageCard, type Version } from '../../../shared/project';
+import {
+  currentVersion,
+  isImageCard,
+  isPromptCard,
+  isThemeCard,
+  themeSuffix,
+  type ImageCard,
+  type ThemeCard,
+  type Version,
+} from '../../../shared/project';
 import type { PromptJobView } from '../canvas/PromptNode';
-import { applyGenerationResult, outputPlacement, setCurrentVersion } from '../document/operations';
+import { applyGenerationResult, outputPlacement, setCurrentVersion, type DocState } from '../document/operations';
 import type { ProjectSession } from './ProjectSession';
 
 export interface TrackedJob {
@@ -19,6 +28,8 @@ export interface TrackedJob {
   promptName: string;
   prompt: string;
   inputVersionIds: string[];
+  /** 附加了规则的生效主题卡 */
+  themeCardId: string | null;
   settings: PromptSettings;
   size: { width: number; height: number };
   submittedAt: number;
@@ -88,7 +99,8 @@ export class GenerationTracker {
       this.reservedOutputs.set(promptCardId, outputCardId);
     }
 
-    const rendered = renderPrompt(prompt.text).text;
+    const theme = prompt.settings.useTheme ? activeTheme(state) : null;
+    const rendered = renderPrompt(prompt.text).text + (theme ? `\n\n${themeSuffix(theme)}` : '');
     const size = resolveSize(prompt.settings.size, inputs[0] ?? null);
     const request: GenerationRequest = {
       jobId: crypto.randomUUID(),
@@ -108,6 +120,7 @@ export class GenerationTracker {
       promptName: prompt.name,
       prompt: rendered,
       inputVersionIds: inputs.map((version) => version.id),
+      themeCardId: theme?.id ?? null,
       settings: request.settings,
       size,
       submittedAt: Date.now(),
@@ -202,6 +215,7 @@ export class GenerationTracker {
         size: `${job.size.width}x${job.size.height}`,
         costUsd: share,
         jobId: job.update.jobId,
+        themeCardId: job.themeCardId,
       },
     }));
 
@@ -233,4 +247,10 @@ export class GenerationTracker {
   private emit(): void {
     for (const listener of this.listeners) listener();
   }
+}
+
+/** 当前生效的主题卡 */
+export function activeTheme(state: DocState): ThemeCard | null {
+  const card = state.cards.find((c) => c.id === state.activeThemeCardId);
+  return card && isThemeCard(card) ? card : null;
 }

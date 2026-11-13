@@ -68,6 +68,8 @@ export function buildMenu(recent: RecentProject[], send: (command: MenuCommand) 
       submenu: [
         canvasKey('新建提示词卡', 'newPrompt', 'P'),
         item('生成', 'generate', 'CmdOrCtrl+Enter'),
+        { type: 'separator' },
+        item('助手', 'toggleAssistant', 'CmdOrCtrl+J'),
       ],
     },
     {

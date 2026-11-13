@@ -3,7 +3,9 @@ import { join } from 'node:path';
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import type { CheckPhase, ImportSource, LaunchFlags, MenuCommand, StartupInfo } from '../shared/api';
 import { BENCH_HOST, PROJECT_HOST, type BenchManifest, type BenchReport } from '../shared/bench';
+import type { AssistantRequest } from '../shared/assistant';
 import type { GenerationRequest, ProviderId } from '../shared/generation';
+import { MockAssistant, OpenAIAssistant } from './assistant/providers';
 import { GenerationQueue } from './generation/GenerationQueue';
 import { MockProvider, OpenAIProvider } from './generation/providers';
 import { GenerationSettingsStore } from './generation/settingsStore';
@@ -26,9 +28,10 @@ const flags: LaunchFlags = {
   autoBench: hasFlag('--auto-bench', 'ANYE_AUTO_BENCH'),
   m1Check: checkPhase('m1-check'),
   m2Check: checkPhase('m2-check'),
+  m3Check: checkPhase('m3-check'),
 };
-const checkName = flags.m1Check ? 'm1' : flags.m2Check ? 'm2' : null;
-const checkPhaseValue = flags.m1Check ?? flags.m2Check;
+const checkName = flags.m1Check ? 'm1' : flags.m2Check ? 'm2' : flags.m3Check ? 'm3' : null;
+const checkPhaseValue = flags.m1Check ?? flags.m2Check ?? flags.m3Check;
 const selfTestMode = hasFlag('--self-test', 'ANYE_SELF_TEST');
 /** 开发用：窗口加载完 1.5 秒后把界面截图存到这个路径并退出 */
 const capturePath = process.argv.find((arg) => arg.startsWith('--capture='))?.slice('--capture='.length) ?? null;
@@ -60,6 +63,7 @@ const generationQueue = new GenerationQueue(
   (update) => mainWindow?.webContents.send('gen:update', update),
   checkName ? 'mock' : null,
 );
+const assistants = { openai: new OpenAIAssistant(worker, () => generationSettings.getApiKey()), mock: new MockAssistant() };
 
 const projects = new ProjectService(
   worker,
@@ -172,7 +176,7 @@ function registerIpc(): void {
   }));
 
   ipcMain.handle('gen:config', () => generationSettings.config());
-  ipcMain.handle('gen:update-config', (_event, patch: { provider?: ProviderId; model?: string }) =>
+  ipcMain.handle('gen:update-config', (_event, patch: { provider?: ProviderId; model?: string; assistantModel?: string }) =>
     generationSettings.update(patch),
   );
   ipcMain.handle('gen:set-key', (_event, key: string | null) => generationSettings.setApiKey(key));
@@ -186,6 +190,13 @@ function registerIpc(): void {
   });
   ipcMain.on('gen:cancel', (_event, jobId: string) => generationQueue.cancel(jobId));
   ipcMain.on('gen:cancel-all', () => generationQueue.cancelAll());
+  ipcMain.handle('assistant:ask', (_event, request: AssistantRequest) => {
+    if (request.projectDir !== projects.currentDir()) throw new Error('只能为当前打开的项目提问');
+    if (request.images.some((image) => image.file.includes('..') || image.file.startsWith('/'))) throw new Error('图片路径不合法');
+    const config = generationSettings.config();
+    const provider = checkName ? 'mock' : config.provider;
+    return assistants[provider].ask(request, config.assistantModel, new AbortController().signal);
+  });
 
   ipcMain.handle('project:choose-new', async () => {
     const result = await dialog.showOpenDialog({

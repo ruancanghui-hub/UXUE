@@ -46,7 +46,15 @@ export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, 
             {group.cards.map((card) => {
               if (!isImageCard(card)) {
                 return (
-                  <LayerRow key={card.id} card={card} selected={selectedIds.has(card.id)} kind="prompt" onSelect={onSelect} onFocusCard={onFocusCard} />
+                  <LayerRow
+                    key={card.id}
+                    card={card}
+                    selected={selectedIds.has(card.id)}
+                    kind={card.kind}
+                    badge={card.id === state.activeThemeCardId ? '生效' : undefined}
+                    onSelect={onSelect}
+                    onFocusCard={onFocusCard}
+                  />
                 );
               }
               const version = currentVersion(card);
@@ -73,9 +81,9 @@ export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, 
 interface LayerRowProps {
   card: CanvasCard;
   selected: boolean;
-  kind: 'image' | 'missing' | 'prompt';
+  kind: 'image' | 'missing' | 'prompt' | 'theme';
   thumbnail?: string;
-  badge?: number;
+  badge?: number | string;
   onSelect(id: string, additive: boolean): void;
   onFocusCard(id: string): void;
 }
@@ -89,6 +97,7 @@ const LayerRow = memo(function LayerRow({ card, selected, kind, thumbnail, badge
       title="单击选中，双击定位到画布"
     >
       {kind === 'prompt' && <span className="layer-thumb prompt">✎</span>}
+      {kind === 'theme' && <span className="layer-thumb theme">◆</span>}
       {kind === 'missing' && <span className="layer-thumb missing">缺失</span>}
       {kind === 'image' && <img className="layer-thumb" src={thumbnail} alt="" loading="lazy" />}
       <span className="layer-name">{card.name}</span>

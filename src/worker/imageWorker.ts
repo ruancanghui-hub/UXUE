@@ -51,7 +51,7 @@ async function handle(request: WorkerRequest): Promise<void> {
         data = await ensureCache(request.dir, request.key, request.file);
         break;
       case 'prepareInput':
-        data = await prepareInput(request.path);
+        data = await prepareInput(request.path, request.maxEdge);
         break;
       case 'mockGenerate':
         data = await mockGenerate(request);
@@ -159,10 +159,10 @@ async function exists(path: string): Promise<boolean> {
 
 const INPUT_MAX_EDGE = 2048;
 
-async function prepareInput(path: string): Promise<PreparedInput> {
+async function prepareInput(path: string, maxEdge = INPUT_MAX_EDGE): Promise<PreparedInput> {
   const buffer = await sharp(path)
     .rotate()
-    .resize(INPUT_MAX_EDGE, INPUT_MAX_EDGE, { fit: 'inside', withoutEnlargement: true })
+    .resize(maxEdge, maxEdge, { fit: 'inside', withoutEnlargement: true })
     .png()
     .toBuffer();
   return { base64: buffer.toString('base64'), mime: 'image/png' };

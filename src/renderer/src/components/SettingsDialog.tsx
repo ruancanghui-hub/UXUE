@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { ASSISTANT_MODELS } from '../../../shared/assistant';
 import { OPENAI_MODELS, type GenerationConfig, type ProviderId } from '../../../shared/generation';
 
 interface SettingsDialogProps {
@@ -89,7 +90,21 @@ export function SettingsDialog({ config, onChange, onClose }: SettingsDialogProp
         </section>
 
         <section className="dialog-section">
-          <div className="section-title">模型</div>
+          <div className="section-title">助手模型</div>
+          <select
+            value={config.assistantModel}
+            onChange={(event) => void run(() => window.anye.updateGenerationConfig({ assistantModel: event.target.value }))}
+          >
+            {ASSISTANT_MODELS.map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.label} · 输入 ${model.input} / 输出 ${model.output} 每百万 token
+              </option>
+            ))}
+          </select>
+        </section>
+
+        <section className="dialog-section">
+          <div className="section-title">生图模型</div>
           <select
             value={config.model}
             onChange={(event) => void run(() => window.anye.updateGenerationConfig({ model: event.target.value }))}

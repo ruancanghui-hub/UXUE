@@ -34,9 +34,11 @@ export interface PromptSettings {
   count: number;
   size: SizeOption;
   quality: Quality;
+  /** 生成时是否附加生效主题卡的规则 */
+  useTheme: boolean;
 }
 
-export const DEFAULT_PROMPT_SETTINGS: PromptSettings = { count: 2, size: 'match', quality: 'medium' };
+export const DEFAULT_PROMPT_SETTINGS: PromptSettings = { count: 2, size: 'match', quality: 'medium', useTheme: true };
 
 /** OpenAI 图像接口对自定义尺寸的限制 */
 const SIZE_STEP = 16;
@@ -196,6 +198,8 @@ export interface JobUpdate {
 export interface GenerationConfig {
   provider: ProviderId;
   model: string;
+  /** 助手用的文本 / 看图模型 */
+  assistantModel: string;
   hasApiKey: boolean;
   /** 显示用的 Key 末四位 */
   apiKeyHint: string | null;

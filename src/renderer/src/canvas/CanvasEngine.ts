@@ -6,10 +6,12 @@ import {
   defaultRegions,
   isImageCard,
   isPromptCard,
+  isThemeCard,
   type CanvasCard,
   type ImageCard,
   type PromptCard,
   type RegionId,
+  type ThemeCard,
   type ViewportState,
 } from '../../../shared/project';
 import { texturedImage } from '../../../shared/textures';
@@ -30,6 +32,7 @@ import { Selection } from '../document/Selection';
 import { expandRect, intersects, rectFromPoints, unionRects, type Rect } from './geometry';
 import { PerfMonitor } from './PerfMonitor';
 import { PromptNode, type PromptJobView } from './PromptNode';
+import { ThemeNode } from './ThemeNode';
 import { TextureManager, type TextureStats } from './TextureManager';
 import { clamp, MAX_ZOOM, MIN_ZOOM, Viewport } from './Viewport';
 
@@ -137,7 +140,7 @@ export class CanvasEngine {
   private host: HTMLElement | null = null;
   private resizeObserver: ResizeObserver | null = null;
 
-  private doc: DocumentStore = new DocumentStore({ cards: [], regions: defaultRegions() });
+  private doc: DocumentStore = new DocumentStore({ cards: [], regions: defaultRegions(), activeThemeCardId: null });
   private selection = new Selection();
   private assetHost = BENCH_HOST;
   private missingVersionIds: ReadonlySet<string> = new Set();
@@ -148,6 +151,8 @@ export class CanvasEngine {
   private renderedOrder: readonly CanvasCard[] = [];
   private readonly nodes = new Map<string, Container>();
   private readonly promptNodes = new Map<string, PromptNode>();
+  private readonly themeNodes = new Map<string, ThemeNode>();
+  private renderedActiveTheme: string | null = null;
   private readonly keyToCards = new Map<string, Set<string>>();
   private regionLabels = new Map<RegionId, Text>();
   private readonly slotLabels: Text[] = [];
@@ -316,7 +321,7 @@ export class CanvasEngine {
     });
     const bounds = unionRects(cards) ?? { x: 0, y: 0, width: 1, height: 1 };
     const region = { id: 'assets' as const, name: '性能测试', ...expandRect(bounds, 0.02) };
-    this.attach(new DocumentStore({ cards, regions: [region] }), new Selection(), { assetHost: BENCH_HOST });
+    this.attach(new DocumentStore({ cards, regions: [region], activeThemeCardId: null }), new Selection(), { assetHost: BENCH_HOST });
     return this.whenAllL0Settled();
   }
 
@@ -598,6 +603,7 @@ export class CanvasEngine {
     if (Math.abs(resolution - this.textResolution) < 0.05) return;
     this.textResolution = resolution;
     for (const node of this.promptNodes.values()) node.setTextResolution(resolution);
+    for (const node of this.themeNodes.values()) node.setTextResolution(resolution);
     this.needsRender = true;
   }
 
@@ -670,7 +676,8 @@ export class CanvasEngine {
       const previous = this.rendered.get(card.id);
       if (!full && previous === card) continue;
       if (isImageCard(card)) this.syncImageCard(card, previous as ImageCard | undefined);
-      else this.syncPromptCard(card);
+      else if (isPromptCard(card)) this.syncPromptCard(card);
+      else this.syncThemeCard(card);
       this.nodes.get(card.id)!.position.set(card.x, card.y);
     }
 
@@ -679,8 +686,12 @@ export class CanvasEngine {
       for (const card of state.cards) this.world.addChild(this.nodes.get(card.id)!);
     }
     this.renderedOrder = state.cards;
-    // 输入数量会影响提示词卡底部的说明
+    // 输入数量会影响提示词卡底部的说明；生效主题卡变了要更新标记
     for (const id of this.promptNodes.keys()) this.refreshPromptNode(id);
+    if (full || this.renderedActiveTheme !== state.activeThemeCardId) {
+      this.renderedActiveTheme = state.activeThemeCardId;
+      for (const id of this.themeNodes.keys()) this.refreshThemeNode(id);
+    }
     this.updateCulling();
     this.applyFocus();
     this.overlayDirty = true;
@@ -706,6 +717,25 @@ export class CanvasEngine {
       this.nodes.set(card.id, node.container);
     }
     this.rendered.set(card.id, card);
+  }
+
+  private syncThemeCard(card: ThemeCard): void {
+    let node = this.themeNodes.get(card.id);
+    if (!node) {
+      node = new ThemeNode();
+      if (this.textResolution > 0) node.setTextResolution(this.textResolution);
+      this.themeNodes.set(card.id, node);
+      this.nodes.set(card.id, node.container);
+    }
+    this.rendered.set(card.id, card);
+    this.refreshThemeNode(card.id);
+  }
+
+  private refreshThemeNode(id: string): void {
+    const card = this.rendered.get(id);
+    const node = this.themeNodes.get(id);
+    if (!card || !node || !isThemeCard(card)) return;
+    node.update(card, this.doc.get().activeThemeCardId === id);
   }
 
   private refreshPromptNode(id: string): void {
@@ -768,9 +798,13 @@ export class CanvasEngine {
     const card = this.rendered.get(id);
     if (card && isImageCard(card)) this.unbindTexture(id, card.currentVersionId);
     const prompt = this.promptNodes.get(id);
+    const theme = this.themeNodes.get(id);
     if (prompt) {
       prompt.destroy();
       this.promptNodes.delete(id);
+    } else if (theme) {
+      theme.destroy();
+      this.themeNodes.delete(id);
     } else {
       this.nodes.get(id)?.destroy({ children: true });
     }

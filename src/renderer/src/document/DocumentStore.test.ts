@@ -28,7 +28,7 @@ function img(state: DocState, index: number): ImageCard {
 }
 
 function emptyState(): DocState {
-  return { cards: [], regions: defaultRegions() };
+  return { cards: [], regions: defaultRegions(), activeThemeCardId: null };
 }
 
 function stateWith(count: number): DocState {

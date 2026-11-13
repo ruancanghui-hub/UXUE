@@ -1,12 +1,15 @@
+import type { PromptDraft, ThemeDraft } from '../../../shared/assistant';
 import { DEFAULT_PROMPT_SETTINGS, type PromptSettings } from '../../../shared/generation';
 import {
   isImageCard,
   isPromptCard,
+  isThemeCard,
   type CanvasCard,
   type ImageCard,
   type PromptCard,
   type Region,
   type RegionId,
+  type ThemeCard,
   type Version,
 } from '../../../shared/project';
 import { unionRects, type Rect } from '../canvas/geometry';
@@ -15,6 +18,8 @@ import { unionRects, type Rect } from '../canvas/geometry';
 export interface DocState {
   readonly cards: readonly CanvasCard[];
   readonly regions: readonly Region[];
+  /** 生效主题卡；它的规则会附加到每一次生成 */
+  readonly activeThemeCardId: string | null;
 }
 
 const NEW_CARD_GAP = 40;
@@ -90,8 +95,9 @@ export function addCards(state: DocState, cards: CanvasCard[]): DocState {
   return { ...state, cards: [...state.cards, ...cards] };
 }
 
-/** 删除卡片时一并去掉提示词卡对它们的引用，撤销时整体恢复 */
+/** 删除卡片时一并去掉提示词卡对它们的引用和生效主题卡，撤销时整体恢复 */
 export function removeCards(state: DocState, ids: ReadonlySet<string>): DocState {
+  const activeThemeCardId = state.activeThemeCardId && ids.has(state.activeThemeCardId) ? null : state.activeThemeCardId;
   const cards = state.cards
     .filter((card) => !ids.has(card.id))
     .map((card) => {
@@ -100,7 +106,7 @@ export function removeCards(state: DocState, ids: ReadonlySet<string>): DocState
       const outputCardId = card.outputCardId && ids.has(card.outputCardId) ? null : card.outputCardId;
       return inputs.length === card.inputs.length && outputCardId === card.outputCardId ? card : { ...card, inputs, outputCardId };
     });
-  return { ...state, cards };
+  return { ...state, cards, activeThemeCardId };
 }
 
 /** origins 是手势开始时的卡片，按绝对偏移计算，避免拖动过程中累积误差 */
@@ -306,6 +312,98 @@ export function outputPlacement(state: DocState, prompt: PromptCard, aspect: num
   const width = firstInput ? Math.min(800, Math.max(240, firstInput.width)) : 400;
   const height = width / aspect;
   return { x: prompt.x + prompt.width + CHAIN_GAP, y: prompt.y + prompt.height / 2 - height / 2, width, height };
+}
+
+// ───────────────────────── 主题卡 ─────────────────────────
+
+export const THEME_CARD_WIDTH = 420;
+export const THEME_CARD_HEIGHT = 500;
+const THEME_GAP = 60;
+
+/** 新主题卡放进视觉主题区，排在已有主题卡的右边 */
+function themePlacement(state: DocState): Rect {
+  const region = state.regions.find((r) => r.id === 'theme') ?? state.regions[0];
+  const themes = state.cards.filter(isThemeCard);
+  const right = themes.reduce((max, card) => Math.max(max, card.x + card.width), region ? region.x + THEME_GAP - THEME_GAP : 0);
+  const x = themes.length ? right + THEME_GAP : (region?.x ?? 0) + THEME_GAP * 2;
+  const y = themes.length ? themes[0].y : (region?.y ?? 0) + THEME_GAP * 2;
+  return { x, y, width: THEME_CARD_WIDTH, height: THEME_CARD_HEIGHT };
+}
+
+export function themeFromDraft(state: DocState, draft: ThemeDraft, id: string): ThemeCard {
+  return { kind: 'theme', id, ...themePlacement(state), ...draft };
+}
+
+export function setActiveTheme(state: DocState, id: string | null): DocState {
+  if (state.activeThemeCardId === id) return state;
+  if (id !== null && !state.cards.some((card) => card.id === id && isThemeCard(card))) return state;
+  return { ...state, activeThemeCardId: id };
+}
+
+export function updateTheme(state: DocState, id: string, patch: Partial<Omit<ThemeCard, 'kind' | 'id'>>): DocState {
+  return mapCards(state, (card) => (card.id === id && isThemeCard(card) ? { ...card, ...patch } : card));
+}
+
+export interface AppliedDrafts {
+  state: DocState;
+  themeId: string | null;
+  promptIds: string[];
+}
+
+const DRAFT_COLUMN_GAP = 40;
+
+/**
+ * 把助手的草稿一次性放上画布（一条撤销记录）：
+ * 主题卡进视觉主题区，还没有生效主题卡时自动设为生效；
+ * 绑定了图的提示词卡在这些图右侧排成一列，没绑定的放在 fallback 附近。
+ */
+export function applyAssistantDrafts(
+  state: DocState,
+  drafts: { theme: ThemeDraft | null; prompts: PromptDraft[] },
+  contextImageIds: string[],
+  fallbackCenter: { x: number; y: number },
+  makeId: () => string,
+): AppliedDrafts {
+  let next = state;
+  let themeId: string | null = null;
+  if (drafts.theme) {
+    themeId = makeId();
+    next = addCards(next, [themeFromDraft(next, drafts.theme, themeId)]);
+    if (!next.activeThemeCardId) next = { ...next, activeThemeCardId: themeId };
+  }
+
+  const images = new Map(
+    next.cards.filter((card): card is ImageCard => isImageCard(card) && contextImageIds.includes(card.id)).map((card) => [card.id, card]),
+  );
+  const bound = drafts.prompts
+    .map((draft) => ({ draft, image: draft.inputIndex ? images.get(contextImageIds[draft.inputIndex - 1]) : undefined }))
+    .sort((a, b) => (a.image && b.image ? a.image.y - b.image.y || a.image.x - b.image.x : 0));
+  const anchor = unionRects([...images.values()]);
+  const columnHeight = bound.length * PROMPT_CARD_HEIGHT + Math.max(0, bound.length - 1) * DRAFT_COLUMN_GAP;
+  const columnX = anchor ? anchor.x + anchor.width + CHAIN_GAP : fallbackCenter.x - PROMPT_CARD_WIDTH / 2;
+  let y = (anchor ? anchor.y + anchor.height / 2 : fallbackCenter.y) - columnHeight / 2;
+
+  const promptIds: string[] = [];
+  const cards: PromptCard[] = bound.map(({ draft, image }) => {
+    const card: PromptCard = {
+      kind: 'prompt',
+      id: makeId(),
+      name: draft.name,
+      x: columnX,
+      y,
+      width: PROMPT_CARD_WIDTH,
+      height: PROMPT_CARD_HEIGHT,
+      text: draft.text,
+      inputs: image ? [image.id] : [],
+      outputCardId: null,
+      settings: { ...DEFAULT_PROMPT_SETTINGS },
+    };
+    y += PROMPT_CARD_HEIGHT + DRAFT_COLUMN_GAP;
+    promptIds.push(card.id);
+    return card;
+  });
+  if (cards.length) next = addCards(next, cards);
+  return { state: next, themeId, promptIds };
 }
 
 export function regionOf(state: DocState, card: Rect): RegionId | null {

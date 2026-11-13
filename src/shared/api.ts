@@ -1,3 +1,4 @@
+import type { AssistantRequest, AssistantResponse } from './assistant';
 import type { BenchManifest, BenchProgress, BenchReport } from './bench';
 import type { GenerationConfig, GenerationRequest, JobUpdate, ProviderId } from './generation';
 import type { ProjectFile, Version } from './project';
@@ -13,6 +14,8 @@ export interface LaunchFlags {
   m1Check: CheckPhase | null;
   /** M2 验收自检：用本地模拟跑"照片 → 简笔画 → 3D"两步链路 */
   m2Check: CheckPhase | null;
+  /** M3 验收自检：用本地模拟助手生成主题卡、为四个金刚位写提示词卡 */
+  m3Check: CheckPhase | null;
 }
 
 export interface RecentProject {
@@ -68,6 +71,7 @@ export type MenuCommand =
   | 'newPrompt'
   | 'generate'
   | 'openSettings'
+  | 'toggleAssistant'
   | `openRecent:${string}`;
 
 export interface AnyeApi {
@@ -90,13 +94,14 @@ export interface AnyeApi {
   readCheckFile(name: string): Promise<string | null>;
 
   getGenerationConfig(): Promise<GenerationConfig>;
-  updateGenerationConfig(patch: { provider?: ProviderId; model?: string }): Promise<GenerationConfig>;
+  updateGenerationConfig(patch: { provider?: ProviderId; model?: string; assistantModel?: string }): Promise<GenerationConfig>;
   setApiKey(key: string | null): Promise<GenerationConfig>;
   testConnection(): Promise<string>;
   submitGeneration(request: GenerationRequest): Promise<JobUpdate>;
   cancelGeneration(jobId: string): void;
   cancelAllGenerations(): void;
   onGenerationUpdate(listener: (update: JobUpdate) => void): () => void;
+  askAssistant(request: AssistantRequest): Promise<AssistantResponse>;
 
   prepareBench(count: number): Promise<BenchManifest>;
   onBenchProgress(listener: (progress: BenchProgress) => void): () => void;

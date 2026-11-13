@@ -16,7 +16,8 @@
     "check:m1": "electron-vite build && electron . --m1-check=write && electron . --m1-check=verify; node scripts/print-check.mjs m1",
     "test": "vitest run",
     "pack": "electron-vite build && electron-builder --mac --dir",
-    "check:m2": "electron-vite build && electron . --m2-check=write && electron . --m2-check=verify; node scripts/print-check.mjs m2"
+    "check:m2": "electron-vite build && electron . --m2-check=write && electron . --m2-check=verify; node scripts/print-check.mjs m2",
+    "check:m3": "electron-vite build && electron . --m3-check=write && electron . --m3-check=verify; node scripts/print-check.mjs m3"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

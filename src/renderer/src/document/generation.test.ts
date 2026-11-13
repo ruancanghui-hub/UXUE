@@ -24,7 +24,7 @@ function version(id: string, width = 1000, height = 1000): Version {
 
 function withPhoto(): { state: DocState; photo: ImageCard } {
   const [photo] = layoutNewCards([version('photo')], 0, 0, makeId);
-  return { state: addCards({ cards: [], regions: defaultRegions() }, [photo]), photo };
+  return { state: addCards({ cards: [], regions: defaultRegions(), activeThemeCardId: null }, [photo]), photo };
 }
 
 function prompt(state: DocState, id: string): PromptCard {

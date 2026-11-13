@@ -27,7 +27,7 @@ export type WorkerRequest =
     }
   | { requestId: number; type: 'ensureCache'; dir: string; key: string; file: string }
   /** 把输入图缩到长边 ≤ 2048 的 PNG，减小上传体积和图像输入 token */
-  | { requestId: number; type: 'prepareInput'; path: string }
+  | { requestId: number; type: 'prepareInput'; path: string; maxEdge?: number }
   /** 本地模拟生成：基于输入图做明显可辨的变换，不联网 */
   | {
       requestId: number;

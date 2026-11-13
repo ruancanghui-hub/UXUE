@@ -1,9 +1,10 @@
-import { forwardRef, memo, useCallback, useEffect, useRef, useState, type DragEvent } from 'react';
+import { forwardRef, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 import type { ImportSource, MenuCommand, StartupInfo } from '../../shared/api';
 import { PROJECT_HOST } from '../../shared/bench';
 import type { GenerationConfig, PromptSettings } from '../../shared/generation';
 import type { RegionId } from '../../shared/project';
 import { isTyping, type CanvasEngine, type EngineStatus } from './canvas/CanvasEngine';
+import { AssistantPanel } from './components/AssistantPanel';
 import { CanvasView } from './components/CanvasView';
 import { Inspector, type InspectorHandle } from './components/Inspector';
 import { LayersPanel } from './components/LayersPanel';
@@ -19,14 +20,18 @@ import {
   movePromptInput,
   removePromptInput,
   renameCard,
+  setActiveTheme,
   setCurrentVersion,
   updatePrompt,
+  updateTheme,
 } from './document/operations';
+import { AssistantSession } from './project/AssistantSession';
 import { GenerationTracker, type TrackedJob } from './project/GenerationTracker';
 import { useCommittedDoc, useSelectionIds } from './project/hooks';
 import { describeImportErrors, pickImageSources, sourcesFromFiles } from './project/importing';
 import { runM1Check } from './project/m1Check';
 import { runM2Check } from './project/m2Check';
+import { runM3Check } from './project/m3Check';
 import { ProjectSession, type SaveState } from './project/ProjectSession';
 
 interface Toast {
@@ -52,6 +57,7 @@ export function ProjectApp() {
   const [cacheBust, setCacheBust] = useState<ReadonlyMap<string, number>>(new Map());
   const [dropActive, setDropActive] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [rightTab, setRightTab] = useState<RightTab>('inspector');
   const sessionRef = useRef<ProjectSession | null>(null);
   const engineRef = useRef<CanvasEngine | null>(null);
   const inspectorRef = useRef<InspectorHandle>(null);
@@ -59,6 +65,7 @@ export function ProjectApp() {
   const [tracker] = useState(() => new GenerationTracker(() => sessionRef.current));
   sessionRef.current = session;
   engineRef.current = engine;
+  const assistant = useMemo(() => (session && engine ? new AssistantSession(session, engine) : null), [session, engine]);
 
   const handleEngine = useCallback((next: CanvasEngine | null) => setEngine(next), []);
 
@@ -118,7 +125,10 @@ export function ProjectApp() {
     engine.setJobViews(tracker.views());
     const offViewport = engine.onViewportChange((viewport) => session.updateViewport(viewport));
     const offSave = session.onSaveState((state, error) => setSaveState({ state, error }));
-    const offEdit = engine.onEditRequest(() => requestAnimationFrame(() => inspectorRef.current?.focusPrompt()));
+    const offEdit = engine.onEditRequest(() => {
+      setRightTab('inspector');
+      requestAnimationFrame(() => requestAnimationFrame(() => inspectorRef.current?.focusPrompt()));
+    });
     return () => {
       offViewport();
       offSave();
@@ -243,6 +253,8 @@ export function ProjectApp() {
       const current = sessionRef.current;
       const canvas = engineRef.current;
       const typing = isTyping(document.activeElement);
+      // ⌘↩ 在助手输入框里不触发生成
+      if (command === 'generate' && document.activeElement?.classList.contains('assistant-input')) return;
 
       if (command === 'newProject' || command === 'openProject') {
         const dir = command === 'newProject' ? await window.anye.chooseNewProjectDir() : await window.anye.chooseProjectDir();
@@ -259,6 +271,10 @@ export function ProjectApp() {
       }
       if (command === 'openSettings') {
         setShowSettings(true);
+        return;
+      }
+      if (command === 'toggleAssistant') {
+        setRightTab((tab) => (tab === 'assistant' ? 'inspector' : 'assistant'));
         return;
       }
       if (!current || !canvas) return;
@@ -332,16 +348,18 @@ export function ProjectApp() {
   // ───────────── 验收自检 ─────────────
 
   useEffect(() => {
-    const { m1Check, m2Check } = window.anye.flags;
-    if ((!m1Check && !m2Check) || !engine || !session || checkStarted.current) return;
+    const { m1Check, m2Check, m3Check } = window.anye.flags;
+    if ((!m1Check && !m2Check && !m3Check) || !engine || !session || !assistant || checkStarted.current) return;
     checkStarted.current = true;
     const run = m1Check
       ? runM1Check(m1Check, { engine, session, importInto })
-      : runM2Check(m2Check!, { engine, session, importInto, tracker });
+      : m2Check
+        ? runM2Check(m2Check, { engine, session, importInto, tracker })
+        : runM3Check(m3Check!, { engine, session, importInto, tracker, assistant, setRightTab });
     void run
       .catch((error: unknown) => console.error(`[check] 异常 ${error instanceof Error ? error.stack : String(error)}`))
       .finally(() => window.anye.quit());
-  }, [engine, session, importInto, tracker]);
+  }, [engine, session, importInto, tracker, assistant]);
 
   const providerLabel = !config ? '' : config.provider === 'mock' ? '本地模拟' : config.hasApiKey ? 'OpenAI' : 'OpenAI · 未设置 Key';
 
@@ -409,9 +427,13 @@ export function ProjectApp() {
           </div>
         </main>
 
-        {session && engine && (
+        {session && engine && assistant && (
           <RightPanel
             ref={inspectorRef}
+            tab={rightTab}
+            onTab={setRightTab}
+            assistant={assistant}
+            providerLabel={providerLabel}
             session={session}
             engine={engine}
             cacheBust={cacheBust}
@@ -473,7 +495,13 @@ const LeftPanel = memo(function LeftPanel({ session, engine, cacheBust }: PanelP
   );
 });
 
+export type RightTab = 'inspector' | 'assistant';
+
 interface RightPanelProps extends PanelProps {
+  tab: RightTab;
+  onTab(tab: RightTab): void;
+  assistant: AssistantSession;
+  providerLabel: string;
   config: GenerationConfig | null;
   jobs: TrackedJob[];
   onImportVersion(cardId: string): void;
@@ -481,14 +509,40 @@ interface RightPanelProps extends PanelProps {
 }
 
 const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function RightPanel(
-  { session, engine, cacheBust, config, jobs, onImportVersion, onGenerate },
+  { tab, onTab, assistant, providerLabel, session, engine, cacheBust, config, jobs, onImportVersion, onGenerate },
   ref,
 ) {
   const state = useCommittedDoc(session.doc);
   const selectedIds = useSelectionIds(session.selection);
   const doc = session.doc;
+  const tabs = (
+    <div className="panel-tabs">
+      <button className={tab === 'inspector' ? 'active' : ''} onClick={() => onTab('inspector')}>
+        属性
+      </button>
+      <button className={tab === 'assistant' ? 'active' : ''} onClick={() => onTab('assistant')} title="助手（⌘J）">
+        助手
+      </button>
+    </div>
+  );
+  if (tab === 'assistant') {
+    return (
+      <aside className="side-panel inspector assistant-side">
+        {tabs}
+        <AssistantPanel
+          assistant={assistant}
+          state={state}
+          selectedIds={selectedIds}
+          projectName={session.name}
+          providerLabel={providerLabel}
+          onSelectCards={(ids) => session.selection.set(ids)}
+        />
+      </aside>
+    );
+  }
   return (
     <Inspector
+      tabs={tabs}
       ref={ref}
       state={state}
       doc={doc}
@@ -515,6 +569,8 @@ const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function Ri
         engine.zoomToCard(id);
       }}
       onNewPrompt={() => engine.createPromptFromSelection()}
+      onUpdateTheme={(id, patch) => doc.apply('编辑主题卡', updateTheme(doc.get(), id, patch))}
+      onSetActiveTheme={(id) => doc.apply(id ? '设为生效主题卡' : '取消生效主题卡', setActiveTheme(doc.get(), id))}
     />
   );
 }));

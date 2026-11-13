@@ -29,6 +29,8 @@ export interface GenerationRecord {
   /** 这一张分摊到的实际花费（美元） */
   costUsd: number;
   jobId: string;
+  /** 生成时附加了规则的生效主题卡；没有附加时为 null */
+  themeCardId: string | null;
 }
 
 /** 一次导入或生成得到的一张图片 */
@@ -76,7 +78,40 @@ export interface PromptCard {
   settings: PromptSettings;
 }
 
-export type CanvasCard = ImageCard | PromptCard;
+export interface ThemeColor {
+  /** 在配色里的角色，比如主色、邻近辅助色、深色、暖白 */
+  role: string;
+  name: string;
+  hex: string;
+  /** 这个颜色用在哪里 */
+  note: string;
+}
+
+export interface ThemeRules {
+  shape: string;
+  material: string;
+  lighting: string;
+  color: string;
+}
+
+/** 承载一套视觉主题的卡片；同一项目可以有多张候选，同一时刻只有一张生效 */
+export interface ThemeCard {
+  kind: 'theme';
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** 产品主题，比如"日式寿司点餐" */
+  topic: string;
+  keywords: string[];
+  cues: string[];
+  palette: ThemeColor[];
+  rules: ThemeRules;
+}
+
+export type CanvasCard = ImageCard | PromptCard | ThemeCard;
 
 export function isImageCard(card: CanvasCard): card is ImageCard {
   return card.kind === 'image';
@@ -84,6 +119,41 @@ export function isImageCard(card: CanvasCard): card is ImageCard {
 
 export function isPromptCard(card: CanvasCard): card is PromptCard {
   return card.kind === 'prompt';
+}
+
+export function isThemeCard(card: CanvasCard): card is ThemeCard {
+  return card.kind === 'theme';
+}
+
+export const RULE_LABELS: Record<keyof ThemeRules, string> = {
+  shape: '造型',
+  material: '材质',
+  lighting: '光影',
+  color: '色彩协调',
+};
+
+/** 生效主题卡附加到提示词末尾的那一段；版本记录里保存的提示词全文包含它 */
+export function themeSuffix(theme: ThemeCard): string {
+  const lines = [`【视觉主题：${theme.topic || theme.name}】`];
+  if (theme.keywords.length) lines.push(`视觉关键词：${theme.keywords.join('、')}`);
+  if (theme.cues.length) lines.push(`视觉线索：${theme.cues.join('、')}`);
+  if (theme.palette.length) {
+    lines.push(`配色：${theme.palette.map((c) => `${c.role}${c.name ? ` ${c.name}` : ''} ${c.hex}${c.note ? `（${c.note}）` : ''}`).join('；')}`);
+  }
+  const rules = (Object.keys(RULE_LABELS) as (keyof ThemeRules)[])
+    .filter((key) => theme.rules[key].trim())
+    .map((key) => `${RULE_LABELS[key]}：${theme.rules[key].trim()}`);
+  if (rules.length) lines.push(`统一规则：${rules.join('；')}`);
+  return lines.join('\n');
+}
+
+const HEX = /^#[0-9a-f]{6}$/i;
+
+export function normalizeHex(value: string): string | null {
+  const trimmed = value.trim();
+  if (HEX.test(trimmed)) return trimmed.toUpperCase();
+  if (/^[0-9a-f]{6}$/i.test(trimmed)) return `#${trimmed.toUpperCase()}`;
+  return null;
 }
 
 export interface ViewportState {
@@ -97,6 +167,7 @@ export interface ProjectFile {
   regions: Region[];
   /** 数组顺序即绘制顺序，越靠后越在上层 */
   cards: CanvasCard[];
+  activeThemeCardId: string | null;
   viewport: ViewportState | null;
 }
 
@@ -121,7 +192,7 @@ export function defaultRegions(): Region[] {
 }
 
 export function emptyProject(): ProjectFile {
-  return { schemaVersion: PROJECT_SCHEMA_VERSION, regions: defaultRegions(), cards: [], viewport: null };
+  return { schemaVersion: PROJECT_SCHEMA_VERSION, regions: defaultRegions(), cards: [], activeThemeCardId: null, viewport: null };
 }
 
 export function currentVersion(card: ImageCard): Version {
@@ -154,7 +225,13 @@ export function parseProject(raw: unknown): ParseResult {
   const cards: CanvasCard[] = [];
   const seen = new Set<string>();
   for (const [index, value] of (Array.isArray(raw.cards) ? raw.cards : []).entries()) {
-    const card = isObject(value) && value.kind === 'prompt' ? parsePromptCard(value) : parseCard(value);
+    const card = !isObject(value)
+      ? null
+      : value.kind === 'prompt'
+        ? parsePromptCard(value)
+        : value.kind === 'theme'
+          ? parseThemeCard(value)
+          : parseCard(value);
     if (!card) {
       warnings.push(`第 ${index + 1} 个对象结构不完整，已跳过`);
       continue;
@@ -183,7 +260,41 @@ export function parseProject(raw: unknown): ParseResult {
     ? { originX: raw.viewport.originX, originY: raw.viewport.originY, zoom: raw.viewport.zoom }
     : null;
 
-  return { project: { schemaVersion: PROJECT_SCHEMA_VERSION, regions, cards, viewport }, warnings };
+  const activeThemeCardId =
+    typeof raw.activeThemeCardId === 'string' && cards.some((card) => card.id === raw.activeThemeCardId && isThemeCard(card))
+      ? raw.activeThemeCardId
+      : null;
+
+  return { project: { schemaVersion: PROJECT_SCHEMA_VERSION, regions, cards, activeThemeCardId, viewport }, warnings };
+}
+
+function parseThemeCard(value: Record<string, unknown>): ThemeCard | null {
+  if (typeof value.id !== 'string' || !isRect(value) || value.width <= 0 || value.height <= 0) return null;
+  const strings = (input: unknown): string[] =>
+    Array.isArray(input) ? input.filter((item): item is string => typeof item === 'string') : [];
+  const text = (input: unknown): string => (typeof input === 'string' ? input : '');
+  const rules = isObject(value.rules) ? value.rules : {};
+  const palette = Array.isArray(value.palette)
+    ? value.palette.flatMap((item): ThemeColor[] => {
+        if (!isObject(item)) return [];
+        const hex = normalizeHex(text(item.hex));
+        return hex ? [{ role: text(item.role), name: text(item.name), hex, note: text(item.note) }] : [];
+      })
+    : [];
+  return {
+    kind: 'theme',
+    id: value.id,
+    name: text(value.name) || '视觉主题',
+    x: value.x,
+    y: value.y,
+    width: value.width,
+    height: value.height,
+    topic: text(value.topic),
+    keywords: strings(value.keywords),
+    cues: strings(value.cues),
+    palette,
+    rules: { shape: text(rules.shape), material: text(rules.material), lighting: text(rules.lighting), color: text(rules.color) },
+  };
 }
 
 function parseCard(value: unknown): ImageCard | null {
@@ -228,6 +339,7 @@ function parsePromptCard(value: Record<string, unknown>): PromptCard | null {
       quality: QUALITIES.some((q) => q.id === settings.quality)
         ? (settings.quality as PromptSettings['quality'])
         : DEFAULT_PROMPT_SETTINGS.quality,
+      useTheme: typeof settings.useTheme === 'boolean' ? settings.useTheme : DEFAULT_PROMPT_SETTINGS.useTheme,
     },
   };
 }
@@ -264,6 +376,7 @@ function parseGeneration(value: unknown): GenerationRecord | null {
     size: text('size'),
     costUsd: isFiniteNumber(value.costUsd) ? value.costUsd : 0,
     jobId: text('jobId'),
+    themeCardId: typeof value.themeCardId === 'string' ? value.themeCardId : null,
   };
 }
 

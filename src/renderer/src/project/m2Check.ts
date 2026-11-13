@@ -171,7 +171,7 @@ function startPanning(engine: CanvasEngine): () => void {
   });
 }
 
-async function waitForJobs(tracker: GenerationTracker, jobIds: string[], timeoutMs = 60_000): Promise<void> {
+export async function waitForJobs(tracker: GenerationTracker, jobIds: string[], timeoutMs = 60_000): Promise<void> {
   const deadline = performance.now() + timeoutMs;
   while (performance.now() < deadline) {
     const pending = tracker.list().filter((job) => jobIds.includes(job.update.jobId) && (job.update.status === 'queued' || job.update.status === 'running'));
@@ -200,7 +200,7 @@ function snapshot(state: DocState): string {
   return stableStringify({ cards: state.cards, regions: state.regions });
 }
 
-function stableStringify(value: unknown): string {
+export function stableStringify(value: unknown): string {
   return JSON.stringify(value, (_key, item: unknown) => {
     if (item && typeof item === 'object' && !Array.isArray(item)) {
       return Object.fromEntries(Object.entries(item as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)));
@@ -209,4 +209,4 @@ function stableStringify(value: unknown): string {
   });
 }
 
-const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+export const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));

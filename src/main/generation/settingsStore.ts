@@ -1,15 +1,22 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { safeStorage } from 'electron';
+import { ASSISTANT_MODELS, DEFAULT_ASSISTANT_MODEL } from '../../shared/assistant';
 import { DEFAULT_OPENAI_MODEL, OPENAI_MODELS, type GenerationConfig, type ProviderId } from '../../shared/generation';
 
 interface StoredSettings {
   provider: ProviderId;
   model: string;
+  assistantModel: string;
   calibration: Record<string, number>;
 }
 
-const DEFAULTS: StoredSettings = { provider: 'openai', model: DEFAULT_OPENAI_MODEL, calibration: {} };
+const DEFAULTS: StoredSettings = {
+  provider: 'openai',
+  model: DEFAULT_OPENAI_MODEL,
+  assistantModel: DEFAULT_ASSISTANT_MODEL,
+  calibration: {},
+};
 /** 校准系数取指数滑动平均，单次异常不会让估算大幅跳动 */
 const CALIBRATION_WEIGHT = 0.3;
 
@@ -32,6 +39,9 @@ export class GenerationSettingsStore {
       this.settings = {
         provider: raw.provider === 'mock' ? 'mock' : 'openai',
         model: OPENAI_MODELS.some((m) => m.id === raw.model) ? (raw.model as string) : DEFAULT_OPENAI_MODEL,
+        assistantModel: ASSISTANT_MODELS.some((m) => m.id === raw.assistantModel)
+          ? (raw.assistantModel as string)
+          : DEFAULT_ASSISTANT_MODEL,
         calibration: raw.calibration && typeof raw.calibration === 'object' ? raw.calibration : {},
       };
     } catch {
@@ -49,6 +59,7 @@ export class GenerationSettingsStore {
     return {
       provider: this.settings.provider,
       model: this.settings.model,
+      assistantModel: this.settings.assistantModel,
       hasApiKey: !!this.apiKey,
       apiKeyHint: this.apiKey ? this.apiKey.slice(-4) : null,
       calibration: { ...this.settings.calibration },
@@ -59,9 +70,12 @@ export class GenerationSettingsStore {
     return this.apiKey;
   }
 
-  async update(patch: Partial<Pick<StoredSettings, 'provider' | 'model'>>): Promise<GenerationConfig> {
+  async update(patch: Partial<Pick<StoredSettings, 'provider' | 'model' | 'assistantModel'>>): Promise<GenerationConfig> {
     if (patch.provider === 'openai' || patch.provider === 'mock') this.settings.provider = patch.provider;
     if (patch.model && OPENAI_MODELS.some((m) => m.id === patch.model)) this.settings.model = patch.model;
+    if (patch.assistantModel && ASSISTANT_MODELS.some((m) => m.id === patch.assistantModel)) {
+      this.settings.assistantModel = patch.assistantModel;
+    }
     await this.persist();
     return this.config();
   }

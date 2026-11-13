@@ -55,7 +55,7 @@ describe('parseProject', () => {
       settings: { count: 9, size: 'match', quality: 'high' },
     };
     const { project } = parseProject({ ...emptyProject(), cards: [validCard, prompt] });
-    expect(project.cards[1]).toEqual({ ...prompt, inputs: ['c1'], outputCardId: null, settings: { count: 4, size: 'match', quality: 'high' } });
+    expect(project.cards[1]).toEqual({ ...prompt, inputs: ['c1'], outputCardId: null, settings: { count: 4, size: 'match', quality: 'high', useTheme: true } });
   });
 
   it('生成得到的版本保留来源记录', () => {
@@ -72,6 +72,7 @@ describe('parseProject', () => {
         size: '1536x1024',
         costUsd: 0.04,
         jobId: 'j1',
+        themeCardId: null,
       },
     };
     const card = { ...validCard, versions: [validCard.versions[0], generated] };
@@ -82,6 +83,30 @@ describe('parseProject', () => {
   it('拒绝指向项目目录以外的文件路径', () => {
     const escaping = { ...validCard, versions: [{ ...validCard.versions[0], file: '../../etc/passwd' }], currentVersionId: 'v1' };
     expect(parseProject({ ...emptyProject(), cards: [escaping] }).project.cards).toEqual([]);
+  });
+
+  it('主题卡读回来完整；颜色不合法的跳过；生效主题卡 id 无效时清空', () => {
+    const theme = {
+      kind: 'theme',
+      id: 't1',
+      name: '寿司',
+      x: 0,
+      y: 0,
+      width: 420,
+      height: 500,
+      topic: '日式寿司点餐',
+      keywords: ['新鲜', '热闹'],
+      cues: ['寿司'],
+      palette: [
+        { role: '主色', name: '红', hex: '#E8473C', note: '按钮' },
+        { role: '坏的', name: '', hex: 'red', note: '' },
+      ],
+      rules: { shape: '圆润', material: '哑光', lighting: '柔光', color: '偏暖' },
+    };
+    const { project } = parseProject({ ...emptyProject(), cards: [theme], activeThemeCardId: 't1' });
+    expect(project.cards[0]).toEqual({ ...theme, palette: [theme.palette[0]] });
+    expect(project.activeThemeCardId).toBe('t1');
+    expect(parseProject({ ...emptyProject(), cards: [theme], activeThemeCardId: 'nope' }).project.activeThemeCardId).toBeNull();
   });
 
   it('版本号不对时直接报错，不去猜结构', () => {

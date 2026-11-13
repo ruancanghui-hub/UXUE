@@ -12,9 +12,23 @@ import {
   type GenerationConfig,
   type PromptSettings,
 } from '../../../shared/generation';
-import { currentVersion, isImageCard, isPromptCard, type ImageCard, type PromptCard } from '../../../shared/project';
+import {
+  currentVersion,
+  isImageCard,
+  isPromptCard,
+  isThemeCard,
+  normalizeHex,
+  RULE_LABELS,
+  themeSuffix,
+  type ImageCard,
+  type PromptCard,
+  type ThemeCard,
+  type ThemeColor,
+  type ThemeRules,
+} from '../../../shared/project';
 import type { DocumentStore } from '../document/DocumentStore';
 import { updatePrompt, type DocState } from '../document/operations';
+import { activeTheme } from '../project/GenerationTracker';
 import type { TrackedJob } from '../project/GenerationTracker';
 import { thumbnailUrl } from '../project/thumbnails';
 
@@ -23,6 +37,8 @@ export interface InspectorHandle {
 }
 
 interface InspectorProps {
+  /** 面板顶部的「属性 / 助手」切换 */
+  tabs: React.ReactNode;
   state: DocState;
   doc: DocumentStore;
   selectedIds: ReadonlySet<string>;
@@ -45,6 +61,8 @@ interface InspectorProps {
   onSettings(promptId: string, settings: Partial<PromptSettings>): void;
   onSelectCard(id: string): void;
   onNewPrompt(): void;
+  onUpdateTheme(id: string, patch: Partial<Omit<ThemeCard, 'kind' | 'id'>>): void;
+  onSetActiveTheme(id: string | null): void;
 }
 
 export const Inspector = forwardRef<InspectorHandle, InspectorProps>(function Inspector(props, ref) {
@@ -62,9 +80,11 @@ export const Inspector = forwardRef<InspectorHandle, InspectorProps>(function In
   const only = selected.length === 1 ? selected[0] : null;
   return (
     <aside className="side-panel inspector">
+      {props.tabs}
       {selected.length === 0 && <ProjectInfo {...props} />}
       {only && isImageCard(only) && <ImageInfo card={only} {...props} />}
       {only && isPromptCard(only) && <PromptInfo card={only} textareaRef={promptRef} {...props} />}
+      {only && isThemeCard(only) && <ThemeInfo card={only} {...props} />}
       {selected.length > 1 && (
         <section className="inspector-section">
           <div className="panel-title">已选 {selected.length} 个对象</div>
@@ -298,6 +318,7 @@ function PromptInfo(props: InspectorProps & { card: PromptCard; textareaRef: Rea
           </select>
         </div>
         <Field label="实际尺寸" value={`${size.width} × ${size.height}`} />
+        <ThemeToggle card={card} state={state} onSettings={props.onSettings} />
         <Field
           label="费用估算"
           value={isMock ? '本地模拟 · 免费' : `≈ ${formatUsd(estimate)}${calibration ? '（已按实际校准）' : '（粗估）'}`}
@@ -317,6 +338,145 @@ function PromptInfo(props: InspectorProps & { card: PromptCard; textareaRef: Rea
         <CardActions {...props} />
       </section>
     </>
+  );
+}
+
+function ThemeToggle({ card, state, onSettings }: { card: PromptCard; state: DocState; onSettings: InspectorProps['onSettings'] }) {
+  const theme = activeTheme(state);
+  if (!theme) return <p className="hint">还没有生效主题卡；在视觉主题区设一张生效后，它的规则会自动附加到生成里。</p>;
+  return (
+    <div className="theme-toggle">
+      <label className="radio-row">
+        <input type="checkbox" checked={card.settings.useTheme} onChange={(e) => onSettings(card.id, { useTheme: e.target.checked })} />
+        <span>附加生效主题卡「{theme.name}」的规则</span>
+      </label>
+      {card.settings.useTheme && (
+        <details className="theme-preview">
+          <summary>查看会附加的内容</summary>
+          <pre>{themeSuffix(theme)}</pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function ThemeInfo(props: InspectorProps & { card: ThemeCard }) {
+  const { card, state, onUpdateTheme } = props;
+  const active = state.activeThemeCardId === card.id;
+  const update = (patch: Partial<Omit<ThemeCard, 'kind' | 'id'>>): void => onUpdateTheme(card.id, patch);
+  const splitList = (value: string): string[] => value.split(/[、,，;；\n]+/).map((item) => item.trim()).filter(Boolean);
+  const setColor = (index: number, patch: Partial<ThemeColor>): void =>
+    update({ palette: card.palette.map((color, i) => (i === index ? { ...color, ...patch } : color)) });
+
+  return (
+    <>
+      <section className="inspector-section">
+        <div className="panel-title">主题卡 {active && <span className="active-badge">生效中</span>}</div>
+        <NameInput id={card.id} name={card.name} onRename={props.onRename} label="主题卡名称" />
+        <button className={active ? '' : 'primary'} onClick={() => props.onSetActiveTheme(active ? null : card.id)}>
+          {active ? '取消生效' : '设为生效主题卡'}
+        </button>
+        <p className="hint">生效主题卡的规则会附加到每次生成的提示词后面；每张提示词卡可以单独关掉。</p>
+      </section>
+
+      <section className="inspector-section">
+        <div className="panel-title">视觉主题</div>
+        <BlurField label="产品主题" value={card.topic} onCommit={(topic) => update({ topic })} />
+        <BlurField label="视觉关键词（用、分隔）" value={card.keywords.join('、')} onCommit={(v) => update({ keywords: splitList(v) })} />
+        <BlurField label="视觉线索（用、分隔）" value={card.cues.join('、')} onCommit={(v) => update({ cues: splitList(v) })} />
+      </section>
+
+      <section className="inspector-section">
+        <div className="panel-title">
+          配色 <span className="dim">{card.palette.length}</span>
+        </div>
+        {card.palette.map((color, index) => (
+          <div key={index} className="palette-row">
+            <ColorInput value={color.hex} onCommit={(hex) => setColor(index, { hex })} />
+            <div className="palette-fields">
+              <div className="palette-line">
+                <BlurInput className="grow" value={color.role} placeholder="角色" onCommit={(role) => setColor(index, { role })} />
+                <BlurInput className="grow" value={color.name} placeholder="名字" onCommit={(name) => setColor(index, { name })} />
+                <button className="icon" onClick={() => update({ palette: card.palette.filter((_, i) => i !== index) })} title="删除">
+                  ✕
+                </button>
+              </div>
+              <BlurInput value={color.note} placeholder="用在哪里" onCommit={(note) => setColor(index, { note })} />
+            </div>
+          </div>
+        ))}
+        <button onClick={() => update({ palette: [...card.palette, { role: '', name: '', hex: '#888888', note: '' }] })}>添加颜色</button>
+      </section>
+
+      <section className="inspector-section">
+        <div className="panel-title">统一规则</div>
+        {(Object.keys(RULE_LABELS) as (keyof ThemeRules)[]).map((key) => (
+          <BlurField key={key} label={RULE_LABELS[key]} multiline value={card.rules[key]} onCommit={(value) => update({ rules: { ...card.rules, [key]: value } })} />
+        ))}
+      </section>
+
+      <section className="inspector-section">
+        <CardActions {...props} />
+      </section>
+    </>
+  );
+}
+
+/** 失焦时才提交，打字过程不产生撤销记录 */
+function BlurField({ label, value, onCommit, multiline }: { label: string; value: string; onCommit(value: string): void; multiline?: boolean }) {
+  return (
+    <label className="blur-field">
+      <span className="field-label">{label}</span>
+      <BlurInput value={value} onCommit={onCommit} multiline={multiline} />
+    </label>
+  );
+}
+
+function BlurInput({ value, onCommit, multiline, placeholder, className }: { value: string; onCommit(value: string): void; multiline?: boolean; placeholder?: string; className?: string }) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+  const commit = (): void => {
+    if (draft !== value) onCommit(draft.trim());
+  };
+  const common = {
+    className: `name-input ${className ?? ''}`,
+    value: draft,
+    placeholder,
+    onBlur: commit,
+  };
+  return multiline ? (
+    <textarea {...common} rows={2} onChange={(event) => setDraft(event.target.value)} />
+  ) : (
+    <input {...common} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && event.currentTarget.blur()} />
+  );
+}
+
+/** 拖动取色时只预览；原生 change 事件（选定颜色）才提交，避免一次取色产生几十条撤销记录 */
+function ColorInput({ value, onCommit }: { value: string; onCommit(hex: string): void }) {
+  const [draft, setDraft] = useState(value);
+  const ref = useRef<HTMLInputElement>(null);
+  const latest = useRef({ value, onCommit });
+  latest.current = { value, onCommit };
+  useEffect(() => setDraft(value), [value]);
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    const onChange = (): void => {
+      const hex = normalizeHex(element.value);
+      if (hex && hex !== latest.current.value) latest.current.onCommit(hex);
+    };
+    element.addEventListener('change', onChange);
+    return () => element.removeEventListener('change', onChange);
+  }, []);
+  return (
+    <input
+      ref={ref}
+      type="color"
+      className="color-input"
+      value={draft.toLowerCase()}
+      onChange={(event) => setDraft(event.target.value)}
+      title={value}
+    />
   );
 }
 
