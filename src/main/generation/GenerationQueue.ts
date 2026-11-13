@@ -1,0 +1,124 @@
+import { randomUUID } from 'node:crypto';
+import {
+  calibrationKey,
+  estimateCostUsd,
+  type GeneratedVersionInfo,
+  type GenerationRequest,
+  type JobUpdate,
+  type ProviderId,
+} from '../../shared/generation';
+import type { ImportedImage } from '../../shared/workerProtocol';
+import type { ImageWorkerClient } from '../imageWorkerClient';
+import type { ImageProvider } from './providers';
+import type { GenerationSettingsStore } from './settingsStore';
+
+const CONCURRENCY = 2;
+
+interface Job {
+  request: GenerationRequest;
+  provider: ImageProvider;
+  model: string;
+  /** 未校准的粗估，用来和实际花费对比、更新校准系数 */
+  rawEstimateUsd: number;
+  update: JobUpdate;
+  controller: AbortController;
+}
+
+/** 生成队列在主进程里：渲染进程关掉面板、切走区域都不影响任务；最多同时跑两个 */
+export class GenerationQueue {
+  private readonly jobs = new Map<string, Job>();
+  private readonly waiting: string[] = [];
+  private running = 0;
+
+  constructor(
+    private readonly worker: ImageWorkerClient,
+    private readonly settings: GenerationSettingsStore,
+    private readonly providers: Record<ProviderId, ImageProvider>,
+    private readonly emit: (update: JobUpdate) => void,
+    /** 自检时强制用本地模拟，不读也不改用户设置 */
+    private readonly forcedProvider: ProviderId | null,
+  ) {}
+
+  submit(request: GenerationRequest): JobUpdate {
+    const config = this.settings.config();
+    const providerId = this.forcedProvider ?? config.provider;
+    const provider = this.providers[providerId];
+    const model = providerId === 'mock' ? 'local-mock' : config.model;
+    const rawEstimateUsd = providerId === 'mock' ? 0 : estimateCostUsd(request.settings, request.size);
+    const calibration = config.calibration[calibrationKey(model, request.settings.quality)] ?? 1;
+    const update: JobUpdate = {
+      jobId: request.jobId,
+      status: 'queued',
+      provider: providerId,
+      model,
+      estimateUsd: rawEstimateUsd * calibration,
+    };
+    this.jobs.set(request.jobId, { request, provider, model, rawEstimateUsd, update, controller: new AbortController() });
+    this.waiting.push(request.jobId);
+    this.emit(update);
+    this.pump();
+    return update;
+  }
+
+  cancel(jobId: string): void {
+    const job = this.jobs.get(jobId);
+    if (!job || job.update.status === 'succeeded' || job.update.status === 'failed' || job.update.status === 'canceled') return;
+    job.controller.abort();
+    const index = this.waiting.indexOf(jobId);
+    if (index >= 0) {
+      this.waiting.splice(index, 1);
+      this.finish(job, { status: 'canceled' });
+    }
+  }
+
+  cancelAll(): void {
+    for (const jobId of [...this.jobs.keys()]) this.cancel(jobId);
+  }
+
+  private pump(): void {
+    while (this.running < CONCURRENCY && this.waiting.length > 0) {
+      const job = this.jobs.get(this.waiting.shift()!);
+      if (job) void this.run(job);
+    }
+  }
+
+  private async run(job: Job): Promise<void> {
+    this.running++;
+    this.update(job, { status: 'running', startedAt: Date.now() });
+    try {
+      const result = await job.provider.generate(job.request, job.model, job.controller.signal);
+      const costUsd = result.costUsd ?? job.update.estimateUsd;
+      const versions: GeneratedVersionInfo[] = [];
+      for (const bytes of result.images) {
+        const id = randomUUID();
+        const imported = await this.worker.request<ImportedImage>({
+          type: 'importImage',
+          dir: job.request.projectDir,
+          key: id,
+          source: { kind: 'bytes', name: `${id}.png`, bytes },
+        });
+        versions.push({ id, file: imported.file, width: imported.width, height: imported.height });
+      }
+      if (result.costUsd !== null && job.rawEstimateUsd > 0) {
+        await this.settings.recordCalibration(calibrationKey(job.model, job.request.settings.quality), result.costUsd / job.rawEstimateUsd);
+      }
+      this.finish(job, { status: 'succeeded', versions, costUsd });
+    } catch (error) {
+      if (job.controller.signal.aborted) this.finish(job, { status: 'canceled' });
+      else this.finish(job, { status: 'failed', error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      this.running--;
+      this.pump();
+    }
+  }
+
+  private finish(job: Job, patch: Partial<JobUpdate>): void {
+    this.update(job, { ...patch, finishedAt: Date.now() });
+    this.jobs.delete(job.request.jobId);
+  }
+
+  private update(job: Job, patch: Partial<JobUpdate>): void {
+    job.update = { ...job.update, ...patch };
+    this.emit(job.update);
+  }
+}

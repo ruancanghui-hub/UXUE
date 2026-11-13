@@ -25,7 +25,29 @@ export type WorkerRequest =
       key: string;
       source: { kind: 'path'; path: string } | { kind: 'bytes'; name: string; bytes: Uint8Array };
     }
-  | { requestId: number; type: 'ensureCache'; dir: string; key: string; file: string };
+  | { requestId: number; type: 'ensureCache'; dir: string; key: string; file: string }
+  /** 把输入图缩到长边 ≤ 2048 的 PNG，减小上传体积和图像输入 token */
+  | { requestId: number; type: 'prepareInput'; path: string }
+  /** 本地模拟生成：基于输入图做明显可辨的变换，不联网 */
+  | {
+      requestId: number;
+      type: 'mockGenerate';
+      inputs: string[];
+      prompt: string;
+      width: number;
+      height: number;
+      count: number;
+      seed: number;
+    };
+
+export interface PreparedInput {
+  base64: string;
+  mime: 'image/png';
+}
+
+export interface MockGenerateResult {
+  images: Uint8Array[];
+}
 
 export type WorkerMessage =
   | { requestId: number; type: 'progress'; progress: BenchProgress }

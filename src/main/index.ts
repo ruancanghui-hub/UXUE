@@ -1,8 +1,12 @@
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
-import type { ImportSource, LaunchFlags, MenuCommand, StartupInfo } from '../shared/api';
+import type { CheckPhase, ImportSource, LaunchFlags, MenuCommand, StartupInfo } from '../shared/api';
 import { BENCH_HOST, PROJECT_HOST, type BenchManifest, type BenchReport } from '../shared/bench';
+import type { GenerationRequest, ProviderId } from '../shared/generation';
+import { GenerationQueue } from './generation/GenerationQueue';
+import { MockProvider, OpenAIProvider } from './generation/providers';
+import { GenerationSettingsStore } from './generation/settingsStore';
 import type { ProjectFile } from '../shared/project';
 import type { PrepareBenchResult, SelfTestResult } from '../shared/workerProtocol';
 import { handleAssetProtocol, registerAssetScheme } from './assetProtocol';
@@ -13,16 +17,22 @@ import { ProjectService } from './projectService';
 const hasFlag = (flag: string, env: string): boolean =>
   process.argv.includes(flag) || process.env[env] === '1';
 
-const m1CheckArg = process.argv.find((arg) => arg.startsWith('--m1-check='))?.split('=')[1] ?? process.env['ANYE_M1_CHECK'];
+const checkPhase = (name: string): CheckPhase | null => {
+  const value = process.argv.find((arg) => arg.startsWith(`--${name}=`))?.split('=')[1];
+  return value === 'write' || value === 'verify' ? value : null;
+};
 const flags: LaunchFlags = {
   uncapped: hasFlag('--uncapped', 'ANYE_UNCAPPED'),
   autoBench: hasFlag('--auto-bench', 'ANYE_AUTO_BENCH'),
-  m1Check: m1CheckArg === 'write' || m1CheckArg === 'verify' ? m1CheckArg : null,
+  m1Check: checkPhase('m1-check'),
+  m2Check: checkPhase('m2-check'),
 };
+const checkName = flags.m1Check ? 'm1' : flags.m2Check ? 'm2' : null;
+const checkPhaseValue = flags.m1Check ?? flags.m2Check;
 const selfTestMode = hasFlag('--self-test', 'ANYE_SELF_TEST');
 /** 开发用：窗口加载完 1.5 秒后把界面截图存到这个路径并退出 */
 const capturePath = process.argv.find((arg) => arg.startsWith('--capture='))?.slice('--capture='.length) ?? null;
-const automated = flags.autoBench || flags.m1Check !== null || capturePath !== null;
+const automated = flags.autoBench || checkName !== null || capturePath !== null;
 
 if (flags.uncapped) {
   app.commandLine.appendSwitch('disable-frame-rate-limit');
@@ -34,12 +44,22 @@ registerAssetScheme();
 const worker = new ImageWorkerClient();
 const assetRoots = new Map<string, string>();
 const benchDir = (): string => join(app.getPath('userData'), 'bench-project');
-const checkRoot = (): string => join(app.getPath('temp'), 'anye-m1-check');
+const checkRoot = (): string => join(app.getPath('temp'), `anye-${checkName ?? 'm1'}-check`);
 let mainWindow: BrowserWindow | null = null;
 
 const sendMenuCommand = (command: MenuCommand): void => {
   mainWindow?.webContents.send('menu:command', command);
 };
+
+const generationSettings = new GenerationSettingsStore(app.getPath('userData'));
+const openai = new OpenAIProvider(worker, () => generationSettings.getApiKey());
+const generationQueue = new GenerationQueue(
+  worker,
+  generationSettings,
+  { openai, mock: new MockProvider(worker) },
+  (update) => mainWindow?.webContents.send('gen:update', update),
+  checkName ? 'mock' : null,
+);
 
 const projects = new ProjectService(
   worker,
@@ -59,9 +79,10 @@ app.whenReady().then(async () => {
   }
 
   await mkdir(benchDir(), { recursive: true });
+  await generationSettings.load();
   assetRoots.set(BENCH_HOST, benchDir());
-  if (flags.m1Check === 'write') await rm(checkRoot(), { recursive: true, force: true });
-  if (flags.m1Check) await mkdir(join(checkRoot(), '项目'), { recursive: true });
+  if (checkPhaseValue === 'write') await rm(checkRoot(), { recursive: true, force: true });
+  if (checkName) await mkdir(join(checkRoot(), '项目'), { recursive: true });
 
   handleAssetProtocol(assetRoots);
   buildMenu(await projects.readRecent(), sendMenuCommand);
@@ -146,9 +167,25 @@ function guardCloseUntilFlushed(window: BrowserWindow): void {
 function registerIpc(): void {
   ipcMain.handle('app:startup', async (): Promise<StartupInfo> => ({
     recent: await projects.readRecent(),
-    reopen: flags.m1Check || flags.autoBench ? null : await projects.findReopen(),
-    checkDir: flags.m1Check ? join(checkRoot(), '项目') : null,
+    reopen: automated ? null : await projects.findReopen(),
+    checkDir: checkName ? join(checkRoot(), '项目') : null,
   }));
+
+  ipcMain.handle('gen:config', () => generationSettings.config());
+  ipcMain.handle('gen:update-config', (_event, patch: { provider?: ProviderId; model?: string }) =>
+    generationSettings.update(patch),
+  );
+  ipcMain.handle('gen:set-key', (_event, key: string | null) => generationSettings.setApiKey(key));
+  ipcMain.handle('gen:test', () => openai.testConnection(generationSettings.config().model));
+  ipcMain.handle('gen:submit', (_event, request: GenerationRequest) => {
+    if (request.projectDir !== projects.currentDir()) throw new Error('只能为当前打开的项目生成');
+    if (request.inputs.some((input) => input.file.includes('..') || input.file.startsWith('/'))) {
+      throw new Error('输入图路径不合法');
+    }
+    return generationQueue.submit(request);
+  });
+  ipcMain.on('gen:cancel', (_event, jobId: string) => generationQueue.cancel(jobId));
+  ipcMain.on('gen:cancel-all', () => generationQueue.cancelAll());
 
   ipcMain.handle('project:choose-new', async () => {
     const result = await dialog.showOpenDialog({
@@ -222,7 +259,9 @@ function registerIpc(): void {
   ipcMain.on('app:quit', async (event) => {
     if (automated) {
       const image = await event.sender.capturePage();
-      const target = flags.m1Check ? join(checkRoot(), `screenshot-${flags.m1Check}.png`) : join(benchDir(), 'bench-screenshot.png');
+      const target = checkName
+        ? join(checkRoot(), `screenshot-${checkPhaseValue}.png`)
+        : join(benchDir(), 'bench-screenshot.png');
       await writeFile(target, image.toPNG());
     }
     app.quit();

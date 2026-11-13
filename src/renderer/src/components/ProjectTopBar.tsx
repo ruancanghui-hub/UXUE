@@ -27,6 +27,8 @@ interface ProjectTopBarProps {
   onTool(tool: Tool): void;
   onFit(): void;
   onImport(): void;
+  providerLabel: string;
+  onSettings(): void;
 }
 
 export function ProjectTopBar(props: ProjectTopBarProps) {
@@ -70,6 +72,9 @@ export function ProjectTopBar(props: ProjectTopBarProps) {
       </div>
 
       <div className="top-bar-actions">
+        <button className="ghost" onClick={props.onSettings} title="设置（⌘,）">
+          {props.providerLabel}
+        </button>
         <button className="ghost" onClick={props.onFit} title="缩放到全部（⇧1）">
           {Math.round(zoom * 100)}%
         </button>

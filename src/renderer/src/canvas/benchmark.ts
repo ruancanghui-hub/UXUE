@@ -1,5 +1,5 @@
 import type { BenchPhaseReport, BenchReport, FrameSummary } from '../../../shared/bench';
-import type { ImageCard } from '../../../shared/project';
+import type { CanvasCard } from '../../../shared/project';
 import { moveCards } from '../document/operations';
 import type { CanvasEngine } from './CanvasEngine';
 import { unionRects, type Rect } from './geometry';
@@ -20,7 +20,7 @@ function fitZoom(engine: CanvasEngine, bounds: Rect): number {
 }
 
 function createPhases(): Phase[] {
-  let dragOrigins = new Map<string, ImageCard>();
+  let dragOrigins = new Map<string, CanvasCard>();
 
   return [
     {

@@ -1,11 +1,12 @@
 import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'electron';
 import type { AnyeApi, LaunchFlags, MenuCommand } from '../shared/api';
 import type { BenchProgress } from '../shared/bench';
+import type { JobUpdate } from '../shared/generation';
 
 const flagArg = process.argv.find((arg) => arg.startsWith('--anye-flags='));
 const flags: LaunchFlags = flagArg
   ? (JSON.parse(flagArg.slice('--anye-flags='.length)) as LaunchFlags)
-  : { uncapped: false, autoBench: false, m1Check: null };
+  : { uncapped: false, autoBench: false, m1Check: null, m2Check: null };
 
 function subscribe<T>(channel: string, listener: (value: T) => void): () => void {
   const handler = (_event: IpcRendererEvent, value: T): void => listener(value);
@@ -33,6 +34,15 @@ const api: AnyeApi = {
     }),
   writeCheckFile: (name, content) => ipcRenderer.invoke('check:write', name, content),
   readCheckFile: (name) => ipcRenderer.invoke('check:read', name),
+
+  getGenerationConfig: () => ipcRenderer.invoke('gen:config'),
+  updateGenerationConfig: (patch) => ipcRenderer.invoke('gen:update-config', patch),
+  setApiKey: (key) => ipcRenderer.invoke('gen:set-key', key),
+  testConnection: () => ipcRenderer.invoke('gen:test'),
+  submitGeneration: (request) => ipcRenderer.invoke('gen:submit', request),
+  cancelGeneration: (jobId) => ipcRenderer.send('gen:cancel', jobId),
+  cancelAllGenerations: () => ipcRenderer.send('gen:cancel-all'),
+  onGenerationUpdate: (listener) => subscribe<JobUpdate>('gen:update', listener),
 
   prepareBench: (count) => ipcRenderer.invoke('bench:prepare', count),
   onBenchProgress: (listener) => subscribe<BenchProgress>('bench:progress', listener),

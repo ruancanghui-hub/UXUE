@@ -37,7 +37,46 @@ describe('parseProject', () => {
 
   it('当前版本 id 无效时退回最后一个版本', () => {
     const { project } = parseProject({ ...emptyProject(), cards: [{ ...validCard, currentVersionId: 'nope' }] });
-    expect(project.cards[0].currentVersionId).toBe('v2');
+    expect(project.cards[0]).toMatchObject({ currentVersionId: 'v2' });
+  });
+
+  it('提示词卡读回来完整，引用到不存在的图像卡时去掉引用', () => {
+    const prompt = {
+      kind: 'prompt',
+      id: 'p1',
+      name: '转 3D',
+      x: 500,
+      y: 0,
+      width: 360,
+      height: 220,
+      text: '把 {{Image 1}} 转为 3D',
+      inputs: ['c1', 'gone'],
+      outputCardId: 'gone-too',
+      settings: { count: 9, size: 'match', quality: 'high' },
+    };
+    const { project } = parseProject({ ...emptyProject(), cards: [validCard, prompt] });
+    expect(project.cards[1]).toEqual({ ...prompt, inputs: ['c1'], outputCardId: null, settings: { count: 4, size: 'match', quality: 'high' } });
+  });
+
+  it('生成得到的版本保留来源记录', () => {
+    const generated = {
+      ...validCard.versions[1],
+      origin: 'generate',
+      generation: {
+        promptCardId: 'p1',
+        prompt: '把 Image 1 转为 3D',
+        inputVersionIds: ['v1'],
+        provider: 'openai',
+        model: 'gpt-image-2.6-flare',
+        quality: 'medium',
+        size: '1536x1024',
+        costUsd: 0.04,
+        jobId: 'j1',
+      },
+    };
+    const card = { ...validCard, versions: [validCard.versions[0], generated] };
+    const { project } = parseProject(JSON.parse(JSON.stringify({ ...emptyProject(), cards: [card] })));
+    expect(project.cards[0]).toEqual(card);
   });
 
   it('拒绝指向项目目录以外的文件路径', () => {

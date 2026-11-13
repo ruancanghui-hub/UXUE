@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { ImportResult, ImportSource, OpenedProject, RecentProject } from '../shared/api';
-import { emptyProject, parseProject, PROJECT_FILE, type ProjectFile, type Version } from '../shared/project';
+import { emptyProject, isImageCard, parseProject, PROJECT_FILE, type ProjectFile, type Version } from '../shared/project';
 import type { EnsureCacheResult, ImportedImage } from '../shared/workerProtocol';
 import type { ImageWorkerClient } from './imageWorkerClient';
 
@@ -64,7 +64,7 @@ export class ProjectService {
     this.onRootChanged(dir);
     if (this.trackRecent) await this.touchRecent(dir);
 
-    const versions = project.cards.flatMap((card) => card.versions);
+    const versions = project.cards.filter(isImageCard).flatMap((card) => card.versions);
     const missing = await Promise.all(
       versions.map(async (version) => ((await exists(join(dir, version.file))) ? null : version.id)),
     );

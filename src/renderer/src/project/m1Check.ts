@@ -1,5 +1,5 @@
 import type { ImportSource } from '../../../shared/api';
-import type { RegionId } from '../../../shared/project';
+import { isImageCard, type RegionId } from '../../../shared/project';
 import type { CanvasEngine } from '../canvas/CanvasEngine';
 import { unionRects } from '../canvas/geometry';
 import {
@@ -109,7 +109,7 @@ async function writePhase(
     step('重命名', () => doc.apply('重命名', renameCard(doc.get(), ids[40], '金刚位 · 热门寿司'))),
     step('导入为新版本', () => doc.apply('导入新版本', addVersions(doc.get(), ids[50], extra.versions))),
     step('切换当前版本', () => {
-      const card = doc.get().cards.find((c) => c.id === ids[50])!;
+      const card = doc.get().cards.filter(isImageCard).find((c) => c.id === ids[50])!;
       doc.apply('切换当前版本', setCurrentVersion(doc.get(), card.id, card.versions[1].id));
     }),
     step('移到最前', () => doc.apply('移到最前', reorderCards(doc.get(), pick(60, 63), 'front'))),
@@ -179,7 +179,7 @@ async function verifyPhase(
   timings.allL0SettledMs = await engine.whenAllL0Settled();
   check('全部缩略图可用', engine.textures.failedCount() === 0, `失败 ${engine.textures.failedCount()} 张，用时 ${timings.allL0SettledMs}ms`);
 
-  const multiVersion = session.doc.get().cards.find((card) => card.versions.length > 1);
+  const multiVersion = session.doc.get().cards.filter(isImageCard).find((card) => card.versions.length > 1);
   check('版本栈保留下来了', multiVersion?.versions.length === 3, `版本数 ${multiVersion?.versions.length ?? 0}`);
   if (multiVersion) session.selection.set([multiVersion.id]);
   engine.fitAll(false);

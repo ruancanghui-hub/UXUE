@@ -1,15 +1,29 @@
-import type { ImageCard, Region, RegionId, Version } from '../../../shared/project';
-import type { Rect } from '../canvas/geometry';
+import { DEFAULT_PROMPT_SETTINGS, type PromptSettings } from '../../../shared/generation';
+import {
+  isImageCard,
+  isPromptCard,
+  type CanvasCard,
+  type ImageCard,
+  type PromptCard,
+  type Region,
+  type RegionId,
+  type Version,
+} from '../../../shared/project';
+import { unionRects, type Rect } from '../canvas/geometry';
 
 /** 画布文档的一个不可变快照；撤销栈只需要保存快照引用 */
 export interface DocState {
-  readonly cards: readonly ImageCard[];
+  readonly cards: readonly CanvasCard[];
   readonly regions: readonly Region[];
 }
 
 const NEW_CARD_GAP = 40;
 export const MIN_CARD_EDGE = 16;
 export const DUPLICATE_OFFSET = 40;
+export const PROMPT_CARD_WIDTH = 360;
+export const PROMPT_CARD_HEIGHT = 220;
+/** 提示词卡与输入图、输出图之间的水平间距 */
+export const CHAIN_GAP = 120;
 
 /** 新导入的图长边最大显示尺寸（画布单位）：一次导入越多，单张越小，整批大致能放进一个区域 */
 export function newCardMaxEdge(count: number): number {
@@ -72,16 +86,25 @@ function displayName(version: Version): string {
   return name || '图片';
 }
 
-export function addCards(state: DocState, cards: ImageCard[]): DocState {
+export function addCards(state: DocState, cards: CanvasCard[]): DocState {
   return { ...state, cards: [...state.cards, ...cards] };
 }
 
+/** 删除卡片时一并去掉提示词卡对它们的引用，撤销时整体恢复 */
 export function removeCards(state: DocState, ids: ReadonlySet<string>): DocState {
-  return { ...state, cards: state.cards.filter((card) => !ids.has(card.id)) };
+  const cards = state.cards
+    .filter((card) => !ids.has(card.id))
+    .map((card) => {
+      if (!isPromptCard(card)) return card;
+      const inputs = card.inputs.filter((id) => !ids.has(id));
+      const outputCardId = card.outputCardId && ids.has(card.outputCardId) ? null : card.outputCardId;
+      return inputs.length === card.inputs.length && outputCardId === card.outputCardId ? card : { ...card, inputs, outputCardId };
+    });
+  return { ...state, cards };
 }
 
 /** origins 是手势开始时的卡片，按绝对偏移计算，避免拖动过程中累积误差 */
-export function moveCards(state: DocState, origins: ReadonlyMap<string, ImageCard>, dx: number, dy: number): DocState {
+export function moveCards(state: DocState, origins: ReadonlyMap<string, CanvasCard>, dx: number, dy: number): DocState {
   return mapCards(state, (card) => {
     const origin = origins.get(card.id);
     return origin ? { ...card, x: origin.x + dx, y: origin.y + dy } : card;
@@ -91,7 +114,7 @@ export function moveCards(state: DocState, origins: ReadonlyMap<string, ImageCar
 /** 以 anchor 为不动点等比缩放；scale 太小时按最小边长截住 */
 export function scaleCards(
   state: DocState,
-  origins: ReadonlyMap<string, ImageCard>,
+  origins: ReadonlyMap<string, CanvasCard>,
   anchorX: number,
   anchorY: number,
   scale: number,
@@ -112,10 +135,14 @@ export function scaleCards(
   });
 }
 
+/** 副本不带生成关系：提示词卡副本不继承输出图，避免两张提示词卡往同一张图里追加版本 */
 export function duplicateCards(state: DocState, ids: ReadonlySet<string>, makeId: () => string): { state: DocState; newIds: string[] } {
   const copies = state.cards
     .filter((card) => ids.has(card.id))
-    .map((card) => ({ ...card, id: makeId(), x: card.x + DUPLICATE_OFFSET, y: card.y + DUPLICATE_OFFSET }));
+    .map((card): CanvasCard => {
+      const moved = { ...card, id: makeId(), x: card.x + DUPLICATE_OFFSET, y: card.y + DUPLICATE_OFFSET };
+      return isPromptCard(moved) ? { ...moved, outputCardId: null } : moved;
+    });
   return { state: { ...state, cards: [...state.cards, ...copies] }, newIds: copies.map((card) => card.id) };
 }
 
@@ -132,7 +159,7 @@ export function renameCard(state: DocState, id: string, name: string): DocState 
 /** 切换当前版本：保持宽度和左上角不变，高度跟着新版本的比例走 */
 export function setCurrentVersion(state: DocState, id: string, versionId: string): DocState {
   return mapCards(state, (card) => {
-    if (card.id !== id || card.currentVersionId === versionId) return card;
+    if (card.id !== id || !isImageCard(card) || card.currentVersionId === versionId) return card;
     const version = card.versions.find((v) => v.id === versionId);
     if (!version) return card;
     return { ...card, currentVersionId: versionId, height: card.width * (version.height / version.width) };
@@ -142,8 +169,143 @@ export function setCurrentVersion(state: DocState, id: string, versionId: string
 /** 给图像卡追加版本，并把最后一个设为当前版本 */
 export function addVersions(state: DocState, id: string, versions: Version[]): DocState {
   if (versions.length === 0) return state;
-  const withVersions = mapCards(state, (card) => (card.id === id ? { ...card, versions: [...card.versions, ...versions] } : card));
+  const withVersions = mapCards(state, (card) =>
+    card.id === id && isImageCard(card) ? { ...card, versions: [...card.versions, ...versions] } : card,
+  );
   return setCurrentVersion(withVersions, id, versions[versions.length - 1].id);
+}
+
+// ───────────────────────── 提示词卡 ─────────────────────────
+
+/** 新建提示词卡：有输入图时放在它们右侧，并按从上到下、从左到右的顺序绑定 */
+export function createPromptCard(
+  state: DocState,
+  inputIds: string[],
+  fallbackCenter: { x: number; y: number },
+  makeId: () => string,
+): { state: DocState; card: PromptCard } {
+  const inputs = state.cards
+    .filter((card): card is ImageCard => isImageCard(card) && inputIds.includes(card.id))
+    .sort((a, b) => a.y - b.y || a.x - b.x);
+  const bounds = unionRects(inputs);
+  const x = bounds ? bounds.x + bounds.width + CHAIN_GAP : fallbackCenter.x - PROMPT_CARD_WIDTH / 2;
+  const y = bounds ? bounds.y + bounds.height / 2 - PROMPT_CARD_HEIGHT / 2 : fallbackCenter.y - PROMPT_CARD_HEIGHT / 2;
+  const card: PromptCard = {
+    kind: 'prompt',
+    id: makeId(),
+    name: '提示词',
+    x,
+    y,
+    width: PROMPT_CARD_WIDTH,
+    height: PROMPT_CARD_HEIGHT,
+    text: inputs.length > 0 ? inputs.map((_, i) => `{{Image ${i + 1}}}`).join(' ') + ' ' : '',
+    inputs: inputs.map((input) => input.id),
+    outputCardId: null,
+    settings: { ...DEFAULT_PROMPT_SETTINGS },
+  };
+  return { state: addCards(state, [card]), card };
+}
+
+export function updatePrompt(state: DocState, id: string, patch: Partial<Pick<PromptCard, 'text' | 'name'>> & { settings?: Partial<PromptSettings> }): DocState {
+  return mapCards(state, (card) => {
+    if (card.id !== id || !isPromptCard(card)) return card;
+    const next = { ...card, ...patch, settings: { ...card.settings, ...patch.settings } };
+    const unchanged =
+      next.text === card.text &&
+      next.name === card.name &&
+      next.settings.count === card.settings.count &&
+      next.settings.size === card.settings.size &&
+      next.settings.quality === card.settings.quality;
+    return unchanged ? card : next;
+  });
+}
+
+/** 绑定输入图：已经绑定过的不重复；提示词卡自己的输出图不能再作为它的输入 */
+export function addPromptInput(state: DocState, promptId: string, imageId: string): DocState {
+  return mapCards(state, (card) => {
+    if (card.id !== promptId || !isPromptCard(card)) return card;
+    if (card.inputs.includes(imageId) || card.outputCardId === imageId) return card;
+    return { ...card, inputs: [...card.inputs, imageId] };
+  });
+}
+
+export function removePromptInput(state: DocState, promptId: string, index: number): DocState {
+  return mapCards(state, (card) =>
+    card.id === promptId && isPromptCard(card) && index >= 0 && index < card.inputs.length
+      ? { ...card, inputs: card.inputs.filter((_, i) => i !== index) }
+      : card,
+  );
+}
+
+export function movePromptInput(state: DocState, promptId: string, index: number, delta: -1 | 1): DocState {
+  return mapCards(state, (card) => {
+    if (card.id !== promptId || !isPromptCard(card)) return card;
+    const target = index + delta;
+    if (target < 0 || target >= card.inputs.length) return card;
+    const inputs = [...card.inputs];
+    [inputs[index], inputs[target]] = [inputs[target], inputs[index]];
+    return { ...card, inputs };
+  });
+}
+
+export interface GenerationResult {
+  promptCardId: string;
+  outputCardId: string;
+  versions: Version[];
+  /** 第一次生成时新建输出图像卡用的位置（按完成时提示词卡的位置算好） */
+  placement: Rect;
+}
+
+/**
+ * 生成结果是"永久"改动：已经花钱得到的版本不能因为撤销而消失。
+ * 这个函数只做追加（输出卡不存在就建、版本没有就加），可以安全地套用到撤销栈里的每一个快照上。
+ */
+export function applyGenerationResult(state: DocState, result: GenerationResult): DocState {
+  if (result.versions.length === 0) return state;
+  const existing = state.cards.find((card) => card.id === result.outputCardId);
+  let cards: CanvasCard[];
+  if (existing && isImageCard(existing)) {
+    const known = new Set(existing.versions.map((v) => v.id));
+    const fresh = result.versions.filter((v) => !known.has(v.id));
+    if (fresh.length === 0 && !needsOutputLink(state, result)) return state;
+    cards = state.cards.map((card) =>
+      card.id === existing.id && fresh.length > 0 ? { ...existing, versions: [...existing.versions, ...fresh] } : card,
+    );
+  } else {
+    const first = result.versions[0];
+    const prompt = state.cards.find((card) => card.id === result.promptCardId);
+    const output: ImageCard = {
+      kind: 'image',
+      id: result.outputCardId,
+      name: prompt ? `${prompt.name} · 结果` : '生成结果',
+      x: result.placement.x,
+      y: result.placement.y,
+      width: result.placement.width,
+      height: result.placement.width * (first.height / first.width),
+      versions: result.versions,
+      currentVersionId: first.id,
+    };
+    cards = [...state.cards, output];
+  }
+  cards = cards.map((card) =>
+    card.id === result.promptCardId && isPromptCard(card) && card.outputCardId !== result.outputCardId
+      ? { ...card, outputCardId: result.outputCardId }
+      : card,
+  );
+  return { ...state, cards };
+}
+
+function needsOutputLink(state: DocState, result: GenerationResult): boolean {
+  const prompt = state.cards.find((card) => card.id === result.promptCardId);
+  return !!prompt && isPromptCard(prompt) && prompt.outputCardId !== result.outputCardId;
+}
+
+/** 第一次生成时输出图像卡的位置：提示词卡右侧，竖直居中；宽度跟随第一张输入图 */
+export function outputPlacement(state: DocState, prompt: PromptCard, aspect: number): Rect {
+  const firstInput = state.cards.find((card) => card.id === prompt.inputs[0]);
+  const width = firstInput ? Math.min(800, Math.max(240, firstInput.width)) : 400;
+  const height = width / aspect;
+  return { x: prompt.x + prompt.width + CHAIN_GAP, y: prompt.y + prompt.height / 2 - height / 2, width, height };
 }
 
 export function regionOf(state: DocState, card: Rect): RegionId | null {
@@ -153,7 +315,7 @@ export function regionOf(state: DocState, card: Rect): RegionId | null {
   return region?.id ?? null;
 }
 
-function mapCards(state: DocState, fn: (card: ImageCard) => ImageCard): DocState {
+function mapCards(state: DocState, fn: (card: CanvasCard) => CanvasCard): DocState {
   let changed = false;
   const cards = state.cards.map((card) => {
     const next = fn(card);

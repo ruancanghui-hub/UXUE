@@ -6,6 +6,8 @@ import type {
   EnsureCacheResult,
   GeneratedImage,
   ImportedImage,
+  MockGenerateResult,
+  PreparedInput,
   PrepareBenchResult,
   SelfTestResult,
   WorkerMessage,
@@ -47,6 +49,12 @@ async function handle(request: WorkerRequest): Promise<void> {
         break;
       case 'ensureCache':
         data = await ensureCache(request.dir, request.key, request.file);
+        break;
+      case 'prepareInput':
+        data = await prepareInput(request.path);
+        break;
+      case 'mockGenerate':
+        data = await mockGenerate(request);
         break;
     }
     parentPort.postMessage({ requestId: request.requestId, type: 'result', ok: true, data });
@@ -145,6 +153,58 @@ async function exists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+// ───────────────────────── 生成 ─────────────────────────
+
+const INPUT_MAX_EDGE = 2048;
+
+async function prepareInput(path: string): Promise<PreparedInput> {
+  const buffer = await sharp(path)
+    .rotate()
+    .resize(INPUT_MAX_EDGE, INPUT_MAX_EDGE, { fit: 'inside', withoutEnlargement: true })
+    .png()
+    .toBuffer();
+  return { base64: buffer.toString('base64'), mime: 'image/png' };
+}
+
+/** 模拟结果要一眼能看出"变了"：每张换一个色相、做海报化，并在角上标出提示词开头 */
+async function mockGenerate(request: Extract<WorkerRequest, { type: 'mockGenerate' }>): Promise<MockGenerateResult> {
+  const { width, height, count, seed, prompt, inputs } = request;
+  const label = escapeXml(prompt.replace(/\s+/g, ' ').slice(0, 24));
+  const images: Uint8Array[] = [];
+  for (let i = 0; i < count; i++) {
+    const hue = Math.round(((seed * 97 + i * 137) % 360) + 360) % 360;
+    const base = inputs[0]
+      ? sharp(inputs[0]).rotate().resize(width, height, { fit: 'cover' })
+      : sharp(Buffer.from(gradientSvg(width, height, hue)));
+    const tinted = await base
+      .modulate({ hue, saturation: 1.35, brightness: 1.05 })
+      .png({ colors: 24 })
+      .toBuffer();
+    const badge = Buffer.from(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
+        <rect x="24" y="${height - 84}" rx="14" width="${Math.min(width - 48, 40 + label.length * 26)}" height="60" fill="rgba(10,10,20,0.72)"/>
+        <text x="44" y="${height - 44}" font-family="PingFang SC, Helvetica, sans-serif" font-size="26" fill="#ffffff">模拟 ${i + 1} · ${label}</text>
+      </svg>`,
+    );
+    const png = await sharp(tinted).composite([{ input: badge }]).png().toBuffer();
+    images.push(new Uint8Array(png));
+  }
+  return { images };
+}
+
+function gradientSvg(width: number, height: number, hue: number): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
+    <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="hsl(${hue} 70% 30%)"/><stop offset="1" stop-color="hsl(${(hue + 60) % 360} 80% 60%)"/>
+    </linearGradient></defs>
+    <rect width="100%" height="100%" fill="url(#g)"/>
+  </svg>`;
+}
+
+function escapeXml(text: string): string {
+  return text.replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' })[c]!);
 }
 
 // ───────────────────────── 性能测试图 ─────────────────────────

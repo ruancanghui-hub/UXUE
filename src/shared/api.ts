@@ -1,5 +1,8 @@
 import type { BenchManifest, BenchProgress, BenchReport } from './bench';
+import type { GenerationConfig, GenerationRequest, JobUpdate, ProviderId } from './generation';
 import type { ProjectFile, Version } from './project';
+
+export type CheckPhase = 'write' | 'verify';
 
 export interface LaunchFlags {
   /** 解除 vsync 与帧率上限，用于在 60Hz 屏幕上测出真实余量 */
@@ -7,7 +10,9 @@ export interface LaunchFlags {
   /** 启动后自动载入测试图、跑性能测试、写报告并退出 */
   autoBench: boolean;
   /** M1 验收自检：'write' 导入并操作后退出，'verify' 重新打开并核对 */
-  m1Check: 'write' | 'verify' | null;
+  m1Check: CheckPhase | null;
+  /** M2 验收自检：用本地模拟跑"照片 → 简笔画 → 3D"两步链路 */
+  m2Check: CheckPhase | null;
 }
 
 export interface RecentProject {
@@ -60,6 +65,9 @@ export type MenuCommand =
   | 'region:pages'
   | 'toggleFocus'
   | 'togglePerf'
+  | 'newPrompt'
+  | 'generate'
+  | 'openSettings'
   | `openRecent:${string}`;
 
 export interface AnyeApi {
@@ -80,6 +88,15 @@ export interface AnyeApi {
   onFlushRequest(handler: () => Promise<void>): () => void;
   writeCheckFile(name: string, content: string): Promise<string>;
   readCheckFile(name: string): Promise<string | null>;
+
+  getGenerationConfig(): Promise<GenerationConfig>;
+  updateGenerationConfig(patch: { provider?: ProviderId; model?: string }): Promise<GenerationConfig>;
+  setApiKey(key: string | null): Promise<GenerationConfig>;
+  testConnection(): Promise<string>;
+  submitGeneration(request: GenerationRequest): Promise<JobUpdate>;
+  cancelGeneration(jobId: string): void;
+  cancelAllGenerations(): void;
+  onGenerationUpdate(listener: (update: JobUpdate) => void): () => void;
 
   prepareBench(count: number): Promise<BenchManifest>;
   onBenchProgress(listener: (progress: BenchProgress) => void): () => void;

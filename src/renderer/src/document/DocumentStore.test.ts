@@ -23,6 +23,10 @@ function version(id: string, width = 2000, height = 1000): Version {
   return { id, file: `assets/${id}.png`, width, height, createdAt: '2026-01-01T00:00:00.000Z', origin: 'import', sourceName: `${id}.png` };
 }
 
+function img(state: DocState, index: number): ImageCard {
+  return state.cards[index] as ImageCard;
+}
+
 function emptyState(): DocState {
   return { cards: [], regions: defaultRegions() };
 }
@@ -85,7 +89,7 @@ describe('图像卡操作', () => {
     let state = stateWith(1);
     const id = state.cards[0].id;
     state = addVersions(state, id, [version('square', 500, 500)]);
-    expect(state.cards[0].currentVersionId).toBe('square');
+    expect(img(state, 0).currentVersionId).toBe('square');
     expect(state.cards[0].height).toBe(state.cards[0].width);
     state = setCurrentVersion(state, id, 'v0');
     expect(state.cards[0].height).toBe(state.cards[0].width / 2);
@@ -93,7 +97,7 @@ describe('图像卡操作', () => {
 
   it('无变化的操作返回同一个快照，不会产生空的历史记录', () => {
     const state = stateWith(1);
-    expect(setCurrentVersion(state, state.cards[0].id, state.cards[0].currentVersionId)).toBe(state);
+    expect(setCurrentVersion(state, state.cards[0].id, img(state, 0).currentVersionId)).toBe(state);
     expect(moveCards(state, new Map(), 10, 10)).toBe(state);
   });
 
@@ -103,7 +107,7 @@ describe('图像卡操作', () => {
     expect(next.cards).toHaveLength(3);
     const copy = next.cards[2] as ImageCard;
     expect(newIds).toEqual([copy.id]);
-    expect(copy.versions).toBe(state.cards[0].versions);
+    expect(copy.versions).toBe(img(state, 0).versions);
     expect(copy.x).toBe(state.cards[0].x + 40);
   });
 

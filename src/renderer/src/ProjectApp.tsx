@@ -1,18 +1,32 @@
-import { useCallback, useEffect, useRef, useState, type DragEvent } from 'react';
+import { forwardRef, memo, useCallback, useEffect, useRef, useState, type DragEvent } from 'react';
 import type { ImportSource, MenuCommand, StartupInfo } from '../../shared/api';
 import { PROJECT_HOST } from '../../shared/bench';
+import type { GenerationConfig, PromptSettings } from '../../shared/generation';
 import type { RegionId } from '../../shared/project';
 import { isTyping, type CanvasEngine, type EngineStatus } from './canvas/CanvasEngine';
 import { CanvasView } from './components/CanvasView';
-import { Inspector } from './components/Inspector';
+import { Inspector, type InspectorHandle } from './components/Inspector';
 import { LayersPanel } from './components/LayersPanel';
 import { PerfPanel } from './components/PerfPanel';
 import { ProjectTopBar } from './components/ProjectTopBar';
+import { QueuePanel } from './components/QueuePanel';
+import { SettingsDialog } from './components/SettingsDialog';
 import { Welcome } from './components/Welcome';
-import { addCards, addVersions, layoutNewCards, renameCard, setCurrentVersion } from './document/operations';
+import {
+  addCards,
+  addVersions,
+  layoutNewCards,
+  movePromptInput,
+  removePromptInput,
+  renameCard,
+  setCurrentVersion,
+  updatePrompt,
+} from './document/operations';
+import { GenerationTracker, type TrackedJob } from './project/GenerationTracker';
 import { useCommittedDoc, useSelectionIds } from './project/hooks';
 import { describeImportErrors, pickImageSources, sourcesFromFiles } from './project/importing';
 import { runM1Check } from './project/m1Check';
+import { runM2Check } from './project/m2Check';
 import { ProjectSession, type SaveState } from './project/ProjectSession';
 
 interface Toast {
@@ -31,13 +45,18 @@ export function ProjectApp() {
   const [importing, setImporting] = useState(0);
   const [status, setStatus] = useState<EngineStatus | null>(null);
   const [showPerf, setShowPerf] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [config, setConfig] = useState<GenerationConfig | null>(null);
+  const [jobs, setJobs] = useState<TrackedJob[]>([]);
   const [saveState, setSaveState] = useState<{ state: SaveState; error: string | null }>({ state: 'saved', error: null });
   const [cacheBust, setCacheBust] = useState<ReadonlyMap<string, number>>(new Map());
   const [dropActive, setDropActive] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const sessionRef = useRef<ProjectSession | null>(null);
   const engineRef = useRef<CanvasEngine | null>(null);
+  const inspectorRef = useRef<InspectorHandle>(null);
   const checkStarted = useRef(false);
+  const [tracker] = useState(() => new GenerationTracker(() => sessionRef.current));
   sessionRef.current = session;
   engineRef.current = engine;
 
@@ -56,6 +75,10 @@ export function ProjectApp() {
       setOpening(true);
       try {
         await sessionRef.current?.flush();
+        if (tracker.hasActive()) {
+          tracker.cancelAll();
+          toast('切换项目，已取消还没完成的生成任务');
+        }
         const opened = await window.anye.openProject(dir);
         const next = new ProjectSession(opened);
         sessionRef.current?.dispose();
@@ -73,7 +96,7 @@ export function ProjectApp() {
         setOpening(false);
       }
     },
-    [toast],
+    [toast, tracker],
   );
 
   useEffect(() => {
@@ -82,6 +105,7 @@ export function ProjectApp() {
       const target = info.checkDir ?? info.reopen;
       if (target) void openDir(target);
     });
+    void window.anye.getGenerationConfig().then(setConfig);
   }, [openDir]);
 
   useEffect(() => {
@@ -91,15 +115,34 @@ export function ProjectApp() {
       missingVersionIds: session.missingVersionIds,
       viewport: session.initialViewport(),
     });
+    engine.setJobViews(tracker.views());
     const offViewport = engine.onViewportChange((viewport) => session.updateViewport(viewport));
     const offSave = session.onSaveState((state, error) => setSaveState({ state, error }));
+    const offEdit = engine.onEditRequest(() => requestAnimationFrame(() => inspectorRef.current?.focusPrompt()));
     return () => {
       offViewport();
       offSave();
+      offEdit();
     };
-  }, [engine, session]);
+  }, [engine, session, tracker]);
 
   useEffect(() => engine?.onStatus(setStatus), [engine]);
+
+  useEffect(() => {
+    const sync = (): void => {
+      setJobs(tracker.list());
+      engineRef.current?.setJobViews(tracker.views());
+    };
+    const offJobs = tracker.subscribe(sync);
+    const offFailure = tracker.onFailure((job) => toast(`「${job.promptName}」生成失败：${job.update.error}`, 'error'));
+    // 失败状态过一段时间后从提示词卡上消失
+    const timer = setInterval(() => engineRef.current?.setJobViews(tracker.views()), 5000);
+    return () => {
+      offJobs();
+      offFailure();
+      clearInterval(timer);
+    };
+  }, [tracker, toast]);
 
   useEffect(() => window.anye.onFlushRequest(async () => sessionRef.current?.flush()), []);
 
@@ -177,6 +220,22 @@ export function ProjectApp() {
     void sourcesFromFiles(event.dataTransfer.files).then((sources) => importInto(sources, at));
   };
 
+  // ───────────── 生成 ─────────────
+
+  const generate = useCallback(
+    async (promptId: string) => {
+      const current = sessionRef.current;
+      if (!current) return;
+      if (current.doc.isGestureActive()) current.doc.commitGesture();
+      try {
+        await tracker.submit(current, promptId);
+      } catch (error) {
+        toast(error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : String(error), 'error');
+      }
+    },
+    [toast, tracker],
+  );
+
   // ───────────── 菜单命令 ─────────────
 
   const handleCommand = useCallback(
@@ -196,6 +255,10 @@ export function ProjectApp() {
       }
       if (command === 'togglePerf') {
         setShowPerf((value) => !value);
+        return;
+      }
+      if (command === 'openSettings') {
+        setShowSettings(true);
         return;
       }
       if (!current || !canvas) return;
@@ -250,23 +313,37 @@ export function ProjectApp() {
         case 'toggleFocus':
           canvas.setFocusRegion(canvas.getFocusRegion() ? null : canvas.regionAtViewCenter());
           break;
+        case 'newPrompt':
+          if (!typing) canvas.createPromptFromSelection();
+          break;
+        case 'generate': {
+          const prompts = current.doc.get().cards.filter((card) => card.kind === 'prompt' && current.selection.has(card.id));
+          if (prompts.length === 0) toast('先选中一张提示词卡');
+          for (const prompt of prompts) await generate(prompt.id);
+          break;
+        }
       }
     },
-    [importInto, openDir, toast],
+    [generate, importInto, openDir, toast],
   );
 
   useEffect(() => window.anye.onMenuCommand((command) => void handleCommand(command)), [handleCommand]);
 
-  // ───────────── M1 自检 ─────────────
+  // ───────────── 验收自检 ─────────────
 
   useEffect(() => {
-    const phase = window.anye.flags.m1Check;
-    if (!phase || !engine || !session || checkStarted.current) return;
+    const { m1Check, m2Check } = window.anye.flags;
+    if ((!m1Check && !m2Check) || !engine || !session || checkStarted.current) return;
     checkStarted.current = true;
-    void runM1Check(phase, { engine, session, importInto })
-      .catch((error: unknown) => console.error(`[m1-check] 异常 ${error instanceof Error ? error.stack : String(error)}`))
+    const run = m1Check
+      ? runM1Check(m1Check, { engine, session, importInto })
+      : runM2Check(m2Check!, { engine, session, importInto, tracker });
+    void run
+      .catch((error: unknown) => console.error(`[check] 异常 ${error instanceof Error ? error.stack : String(error)}`))
       .finally(() => window.anye.quit());
-  }, [engine, session, importInto]);
+  }, [engine, session, importInto, tracker]);
+
+  const providerLabel = !config ? '' : config.provider === 'mock' ? '本地模拟' : config.hasApiKey ? 'OpenAI' : 'OpenAI · 未设置 Key';
 
   return (
     <div className="app">
@@ -283,15 +360,15 @@ export function ProjectApp() {
           onTool={(tool) => engine?.setTool(tool)}
           onFit={() => engine?.fitAll()}
           onImport={() => void handleCommand('importImages')}
+          providerLabel={providerLabel}
+          onSettings={() => setShowSettings(true)}
         />
       ) : (
         <div className="top-bar top-bar-empty" />
       )}
 
       <div className="workspace-row">
-        {session && engine && (
-          <ProjectPanels session={session} side="left" engine={engine} cacheBust={cacheBust} onImportVersion={importAsVersion} />
-        )}
+        {session && engine && <LeftPanel session={session} engine={engine} cacheBust={cacheBust} />}
 
         <main
           className={`workspace ${dropActive ? 'drop-active' : ''}`}
@@ -312,6 +389,17 @@ export function ProjectApp() {
             </div>
           )}
           {importing > 0 && <div className="status-pill">正在导入 {importing} 张图片…</div>}
+          {session && (
+            <QueuePanel
+              jobs={jobs}
+              onCancel={(jobId) => tracker.cancel(jobId)}
+              onDismiss={(jobId) => tracker.dismiss(jobId)}
+              onSelectPrompt={(id) => {
+                session.selection.set([id]);
+                engine?.zoomToCard(id);
+              }}
+            />
+          )}
           <div className="toasts">
             {toasts.map((item) => (
               <div key={item.id} className={`toast ${item.tone}`}>
@@ -322,7 +410,16 @@ export function ProjectApp() {
         </main>
 
         {session && engine && (
-          <ProjectPanels session={session} side="right" engine={engine} cacheBust={cacheBust} onImportVersion={importAsVersion} />
+          <RightPanel
+            ref={inspectorRef}
+            session={session}
+            engine={engine}
+            cacheBust={cacheBust}
+            config={config}
+            jobs={jobs}
+            onImportVersion={importAsVersion}
+            onGenerate={generate}
+          />
         )}
       </div>
 
@@ -335,55 +432,89 @@ export function ProjectApp() {
           onOpenRecent={(dir) => void openDir(dir)}
         />
       )}
+      {showSettings && config && <SettingsDialog config={config} onChange={setConfig} onClose={() => setShowSettings(false)} />}
     </div>
   );
 }
 
-interface ProjectPanelsProps {
+interface PanelProps {
   session: ProjectSession;
   engine: CanvasEngine;
-  side: 'left' | 'right';
   cacheBust: ReadonlyMap<string, number>;
-  onImportVersion(cardId: string): void;
 }
 
-/** 面板只订阅提交后的文档，拖动过程中不会重渲染 */
-function ProjectPanels({ session, engine, side, cacheBust, onImportVersion }: ProjectPanelsProps) {
+/**
+ * 面板只订阅提交后的文档，拖动过程中不会重渲染；
+ * 用 memo 隔开 ProjectApp 每秒 4 次的状态刷新，否则图层列表会跟着整体重渲染、挤占画布的帧。
+ */
+const LeftPanel = memo(function LeftPanel({ session, engine, cacheBust }: PanelProps) {
   const state = useCommittedDoc(session.doc);
   const selectedIds = useSelectionIds(session.selection);
+  const onSelect = useCallback(
+    (id: string, additive: boolean) => (additive ? session.selection.toggle(id) : session.selection.set([id])),
+    [session],
+  );
+  const onFocusCard = useCallback(
+    (id: string) => {
+      session.selection.set([id]);
+      engine.zoomToCard(id);
+    },
+    [session, engine],
+  );
+  return (
+    <LayersPanel
+      state={state}
+      selectedIds={selectedIds}
+      missingVersionIds={session.missingVersionIds}
+      cacheBust={cacheBust}
+      onSelect={onSelect}
+      onFocusCard={onFocusCard}
+    />
+  );
+});
 
-  if (side === 'left') {
-    return (
-      <LayersPanel
-        state={state}
-        selectedIds={selectedIds}
-        missingVersionIds={session.missingVersionIds}
-        cacheBust={cacheBust}
-        onSelect={(id, additive) => (additive ? session.selection.toggle(id) : session.selection.set([id]))}
-        onFocusCard={(id) => {
-          session.selection.set([id]);
-          engine.zoomToCard(id);
-        }}
-      />
-    );
-  }
+interface RightPanelProps extends PanelProps {
+  config: GenerationConfig | null;
+  jobs: TrackedJob[];
+  onImportVersion(cardId: string): void;
+  onGenerate(promptId: string): void;
+}
+
+const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function RightPanel(
+  { session, engine, cacheBust, config, jobs, onImportVersion, onGenerate },
+  ref,
+) {
+  const state = useCommittedDoc(session.doc);
+  const selectedIds = useSelectionIds(session.selection);
+  const doc = session.doc;
   return (
     <Inspector
+      ref={ref}
       state={state}
+      doc={doc}
       selectedIds={selectedIds}
       projectName={session.name}
       projectDir={session.dir}
       missingVersionIds={session.missingVersionIds}
       cacheBust={cacheBust}
-      onRename={(id, name) => session.doc.apply('重命名', renameCard(session.doc.get(), id, name))}
-      onSetCurrentVersion={(id, versionId) =>
-        session.doc.apply('切换当前版本', setCurrentVersion(session.doc.get(), id, versionId))
-      }
+      config={config}
+      jobs={jobs}
+      onRename={(id, name) => doc.apply('重命名', renameCard(doc.get(), id, name))}
+      onSetCurrentVersion={(id, versionId) => doc.apply('切换当前版本', setCurrentVersion(doc.get(), id, versionId))}
       onImportVersion={onImportVersion}
       onDuplicate={() => engine.duplicateSelection()}
       onDelete={() => engine.deleteSelection()}
       onBringToFront={() => engine.reorderSelection('front')}
       onReveal={(path) => window.anye.revealInFinder(path)}
+      onGenerate={onGenerate}
+      onRemoveInput={(id, index) => doc.apply('解除绑定', removePromptInput(doc.get(), id, index))}
+      onMoveInput={(id, index, delta) => doc.apply('调整输入顺序', movePromptInput(doc.get(), id, index, delta))}
+      onSettings={(id, settings: Partial<PromptSettings>) => doc.apply('修改生成参数', updatePrompt(doc.get(), id, { settings }))}
+      onSelectCard={(id) => {
+        session.selection.set([id]);
+        engine.zoomToCard(id);
+      }}
+      onNewPrompt={() => engine.createPromptFromSelection()}
     />
   );
-}
+}));

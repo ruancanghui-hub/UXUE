@@ -23,6 +23,8 @@ export function buildMenu(recent: RecentProject[], send: (command: MenuCommand) 
       submenu: [
         { role: 'about', label: '关于暗夜精灵' },
         { type: 'separator' },
+        item('设置…', 'openSettings', 'CmdOrCtrl+,'),
+        { type: 'separator' },
         { role: 'hide', label: '隐藏暗夜精灵' },
         { role: 'hideOthers', label: '隐藏其他' },
         { type: 'separator' },
@@ -59,6 +61,13 @@ export function buildMenu(recent: RecentProject[], send: (command: MenuCommand) 
         item('创建副本', 'duplicate', 'CmdOrCtrl+D'),
         item('移到最前', 'bringToFront', 'CmdOrCtrl+Shift+]'),
         item('移到最后', 'sendToBack', 'CmdOrCtrl+Shift+['),
+      ],
+    },
+    {
+      label: '生成',
+      submenu: [
+        canvasKey('新建提示词卡', 'newPrompt', 'P'),
+        item('生成', 'generate', 'CmdOrCtrl+Enter'),
       ],
     },
     {

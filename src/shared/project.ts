@@ -1,3 +1,5 @@
+import { DEFAULT_PROMPT_SETTINGS, MAX_COUNT, MIN_COUNT, QUALITIES, SIZE_OPTIONS, type PromptSettings } from './generation';
+
 export const PROJECT_FILE = 'project.json';
 export const PROJECT_SCHEMA_VERSION = 1;
 
@@ -13,6 +15,22 @@ export interface Region {
   height: number;
 }
 
+/** 生成得到的版本记下的来源，方便以后复现和判断是否已过期 */
+export interface GenerationRecord {
+  promptCardId: string;
+  /** 实际发送给模型的提示词全文 */
+  prompt: string;
+  /** 生成时各输入图像卡的当前版本，按 Image 1、Image 2… 的顺序 */
+  inputVersionIds: string[];
+  provider: string;
+  model: string;
+  quality: string;
+  size: string;
+  /** 这一张分摊到的实际花费（美元） */
+  costUsd: number;
+  jobId: string;
+}
+
 /** 一次导入或生成得到的一张图片 */
 export interface Version {
   id: string;
@@ -22,9 +40,10 @@ export interface Version {
   width: number;
   height: number;
   createdAt: string;
-  origin: 'import';
+  origin: 'import' | 'generate';
   /** 导入时的原文件名 */
   sourceName?: string;
+  generation?: GenerationRecord;
 }
 
 /** 画布上带版本栈的图片对象 */
@@ -40,6 +59,33 @@ export interface ImageCard {
   currentVersionId: string;
 }
 
+/** 画布上的一段结构化提示词；inputs 依次对应 {{Image 1}}、{{Image 2}}… */
+export interface PromptCard {
+  kind: 'prompt';
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  text: string;
+  /** 输入图像卡 id */
+  inputs: string[];
+  /** 生成结果所在的图像卡；第一次生成前为 null */
+  outputCardId: string | null;
+  settings: PromptSettings;
+}
+
+export type CanvasCard = ImageCard | PromptCard;
+
+export function isImageCard(card: CanvasCard): card is ImageCard {
+  return card.kind === 'image';
+}
+
+export function isPromptCard(card: CanvasCard): card is PromptCard {
+  return card.kind === 'prompt';
+}
+
 export interface ViewportState {
   originX: number;
   originY: number;
@@ -50,7 +96,7 @@ export interface ProjectFile {
   schemaVersion: typeof PROJECT_SCHEMA_VERSION;
   regions: Region[];
   /** 数组顺序即绘制顺序，越靠后越在上层 */
-  cards: ImageCard[];
+  cards: CanvasCard[];
   viewport: ViewportState | null;
 }
 
@@ -105,20 +151,31 @@ export function parseProject(raw: unknown): ParseResult {
     return fallback;
   });
 
-  const cards: ImageCard[] = [];
+  const cards: CanvasCard[] = [];
   const seen = new Set<string>();
   for (const [index, value] of (Array.isArray(raw.cards) ? raw.cards : []).entries()) {
-    const card = parseCard(value);
+    const card = isObject(value) && value.kind === 'prompt' ? parsePromptCard(value) : parseCard(value);
     if (!card) {
-      warnings.push(`第 ${index + 1} 个图像卡结构不完整，已跳过`);
+      warnings.push(`第 ${index + 1} 个对象结构不完整，已跳过`);
       continue;
     }
     if (seen.has(card.id)) {
-      warnings.push(`图像卡 ${card.id} 重复，已跳过后一个`);
+      warnings.push(`对象 ${card.id} 重复，已跳过后一个`);
       continue;
     }
     seen.add(card.id);
     cards.push(card);
+  }
+
+  // 引用到已经不存在的图像卡时去掉引用，保证打开后的结构自洽
+  const imageIds = new Set(cards.filter(isImageCard).map((card) => card.id));
+  for (const [index, card] of cards.entries()) {
+    if (!isPromptCard(card)) continue;
+    const inputs = card.inputs.filter((id) => imageIds.has(id));
+    const outputCardId = card.outputCardId && imageIds.has(card.outputCardId) ? card.outputCardId : null;
+    if (inputs.length !== card.inputs.length || outputCardId !== card.outputCardId) {
+      cards[index] = { ...card, inputs, outputCardId };
+    }
   }
 
   const viewport = isObject(raw.viewport) && isFiniteNumber(raw.viewport.originX) && isFiniteNumber(raw.viewport.originY) &&
@@ -150,18 +207,63 @@ function parseCard(value: unknown): ImageCard | null {
   };
 }
 
+function parsePromptCard(value: Record<string, unknown>): PromptCard | null {
+  if (typeof value.id !== 'string' || !isRect(value) || value.width <= 0 || value.height <= 0) return null;
+  const settings = isObject(value.settings) ? value.settings : {};
+  const count = isFiniteNumber(settings.count) ? Math.round(settings.count) : DEFAULT_PROMPT_SETTINGS.count;
+  return {
+    kind: 'prompt',
+    id: value.id,
+    name: typeof value.name === 'string' ? value.name : '提示词',
+    x: value.x,
+    y: value.y,
+    width: value.width,
+    height: value.height,
+    text: typeof value.text === 'string' ? value.text : '',
+    inputs: Array.isArray(value.inputs) ? value.inputs.filter((id): id is string => typeof id === 'string') : [],
+    outputCardId: typeof value.outputCardId === 'string' ? value.outputCardId : null,
+    settings: {
+      count: Math.min(MAX_COUNT, Math.max(MIN_COUNT, count)),
+      size: SIZE_OPTIONS.some((o) => o.id === settings.size) ? (settings.size as PromptSettings['size']) : DEFAULT_PROMPT_SETTINGS.size,
+      quality: QUALITIES.some((q) => q.id === settings.quality)
+        ? (settings.quality as PromptSettings['quality'])
+        : DEFAULT_PROMPT_SETTINGS.quality,
+    },
+  };
+}
+
 function parseVersion(value: unknown): Version | null {
   if (!isObject(value) || typeof value.id !== 'string' || typeof value.file !== 'string') return null;
   if (!isFiniteNumber(value.width) || !isFiniteNumber(value.height) || value.width <= 0 || value.height <= 0) return null;
   if (value.file.includes('..') || value.file.startsWith('/')) return null;
+  const generation = parseGeneration(value.generation);
   return {
     id: value.id,
     file: value.file,
     width: value.width,
     height: value.height,
     createdAt: typeof value.createdAt === 'string' ? value.createdAt : new Date(0).toISOString(),
-    origin: 'import',
+    origin: value.origin === 'generate' && generation ? 'generate' : 'import',
     ...(typeof value.sourceName === 'string' ? { sourceName: value.sourceName } : {}),
+    ...(generation ? { generation } : {}),
+  };
+}
+
+function parseGeneration(value: unknown): GenerationRecord | null {
+  if (!isObject(value) || typeof value.promptCardId !== 'string' || typeof value.prompt !== 'string') return null;
+  const text = (key: string): string => (typeof value[key] === 'string' ? (value[key] as string) : '');
+  return {
+    promptCardId: value.promptCardId,
+    prompt: value.prompt,
+    inputVersionIds: Array.isArray(value.inputVersionIds)
+      ? value.inputVersionIds.filter((id): id is string => typeof id === 'string')
+      : [],
+    provider: text('provider'),
+    model: text('model'),
+    quality: text('quality'),
+    size: text('size'),
+    costUsd: isFiniteNumber(value.costUsd) ? value.costUsd : 0,
+    jobId: text('jobId'),
   };
 }
 

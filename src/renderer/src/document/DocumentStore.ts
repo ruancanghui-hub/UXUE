@@ -87,6 +87,25 @@ export class DocumentStore {
     return this.gesture !== null;
   }
 
+  /**
+   * 不进撤销栈、并且回溯写进所有历史快照的改动（生成结果）：
+   * additive 必须只做追加，套用到任何快照上都安全；presentOnly 只作用于当前状态，比如把当前版本切到新结果。
+   */
+  applyPermanent(additive: (state: DocState) => DocState, presentOnly: (state: DocState) => DocState = (s) => s): void {
+    // 当前状态就是撤销栈顶的结果时，栈顶也要带上 presentOnly，否则"撤销再重做"会回不到现在的样子
+    const top = this.undoStack[this.undoStack.length - 1];
+    const presentIsTop = !this.gesture && top?.after === this.state;
+    const rewrite = (entry: HistoryEntry): HistoryEntry => ({ ...entry, before: additive(entry.before), after: additive(entry.after) });
+    this.undoStack = this.undoStack.map(rewrite);
+    this.redoStack = this.redoStack.map(rewrite);
+    if (this.gesture) this.gesture = { ...this.gesture, before: additive(this.gesture.before) };
+    const next = presentOnly(additive(this.state));
+    if (presentIsTop) this.undoStack[this.undoStack.length - 1].after = next;
+    if (next === this.state) return;
+    this.state = next;
+    this.emit('commit');
+  }
+
   undo(): string | null {
     if (this.gesture) this.commitGesture();
     const entry = this.undoStack.pop();

@@ -1,12 +1,25 @@
 import 'pixi.js/unsafe-eval';
 import { Application, Container, Graphics, Sprite, Text, Texture, TilingSprite } from 'pixi.js';
 import { BENCH_HOST, type BenchImage, type FrameSummary, type TextureLevel } from '../../../shared/bench';
-import { currentVersion, defaultRegions, type ImageCard, type RegionId, type ViewportState } from '../../../shared/project';
+import {
+  currentVersion,
+  defaultRegions,
+  isImageCard,
+  isPromptCard,
+  type CanvasCard,
+  type ImageCard,
+  type PromptCard,
+  type RegionId,
+  type ViewportState,
+} from '../../../shared/project';
 import { texturedImage } from '../../../shared/textures';
 import { DocumentStore, type DocChange } from '../document/DocumentStore';
 import {
+  addPromptInput,
+  createPromptCard,
   duplicateCards,
   moveCards,
+  outputPlacement,
   regionOf,
   removeCards,
   reorderCards,
@@ -16,6 +29,7 @@ import {
 import { Selection } from '../document/Selection';
 import { expandRect, intersects, rectFromPoints, unionRects, type Rect } from './geometry';
 import { PerfMonitor } from './PerfMonitor';
+import { PromptNode, type PromptJobView } from './PromptNode';
 import { TextureManager, type TextureStats } from './TextureManager';
 import { clamp, MAX_ZOOM, MIN_ZOOM, Viewport } from './Viewport';
 
@@ -44,7 +58,7 @@ type Interaction =
       startScreenY: number;
       startWorldX: number;
       startWorldY: number;
-      origins: Map<string, ImageCard>;
+      origins: Map<string, CanvasCard>;
       moved: boolean;
       toggleOnClickId: string | null;
     }
@@ -56,8 +70,9 @@ type Interaction =
       anchorY: number;
       cornerX: number;
       cornerY: number;
-      origins: Map<string, ImageCard>;
-    };
+      origins: Map<string, CanvasCard>;
+    }
+  | { kind: 'link'; promptId: string; fromX: number; fromY: number; x: number; y: number; targetId: string | null };
 
 interface ViewAnimation {
   from: { centerX: number; centerY: number; logZoom: number };
@@ -79,16 +94,25 @@ const PLACEHOLDER_TINT = 0x26262c;
 const MISSING_TINT = 0x4a2028;
 const MISSING_OUTLINE = 0xff6b7a;
 const ACCENT = 0x7c8cff;
+const OUTPUT_LINK = 0x5ad19a;
 const REGION_FILL = 0x17171c;
 const REGION_STROKE = 0x2a2a33;
 const FOCUS_DIM_ALPHA = 0.16;
 const HANDLE_SIZE = 8;
 const HANDLE_HIT = 7;
+const PORT_RADIUS = 6;
+const PORT_HIT = 9;
+const SLOT_SPACING = 22;
+const SLOT_TOP = 44;
+/** 提示词卡在屏幕上小于这个高度时不画端口 */
+const MIN_PORT_CARD_PX = 70;
 const NUDGE_SMALL = 1;
 const NUDGE_LARGE = 10;
 const SCHEDULE_INTERVAL_MS = 100;
 const STATUS_INTERVAL_MS = 250;
+const TEXT_RESOLUTION_SETTLE_MS = 150;
 const DRAG_THRESHOLD_PX = 3;
+const DOUBLE_CLICK_MS = 350;
 /** 屏幕上的像素尺寸超过级别上限的 15% 才升级，避免在临界点来回切换 */
 const LEVEL_HYSTERESIS = 1.15;
 
@@ -105,6 +129,7 @@ export class CanvasEngine {
 
   private readonly app = new Application();
   private readonly regionLayer = new Graphics();
+  private readonly linkLayer = new Graphics();
   private readonly world = new Container();
   private readonly overlay = new Graphics();
   private readonly labels = new Container();
@@ -119,17 +144,23 @@ export class CanvasEngine {
   private detachDoc: (() => void) | null = null;
 
   /** 已经同步到 Pixi 的卡片快照，用于和新快照对比，只更新变化的部分 */
-  private rendered = new Map<string, ImageCard>();
-  private renderedOrder: readonly ImageCard[] = [];
+  private rendered = new Map<string, CanvasCard>();
+  private renderedOrder: readonly CanvasCard[] = [];
   private readonly nodes = new Map<string, Container>();
+  private readonly promptNodes = new Map<string, PromptNode>();
   private readonly keyToCards = new Map<string, Set<string>>();
   private regionLabels = new Map<RegionId, Text>();
+  private readonly slotLabels: Text[] = [];
+  private jobViews: ReadonlyMap<string, PromptJobView> = new Map();
+  private lastJobTick = 0;
 
   private tool: Tool = 'select';
   private spaceHeld = false;
   private interaction: Interaction = { kind: 'none' };
   private hoverId: string | null = null;
   private hoverCorner: Corner | null = null;
+  private hoverPortId: string | null = null;
+  private lastClick: { id: string; at: number } | null = null;
   private animation: ViewAnimation | null = null;
   private focusRegion: RegionId | null = null;
 
@@ -137,6 +168,8 @@ export class CanvasEngine {
   private renderedPreviousTick = false;
   private viewChanged = true;
   private overlayDirty = true;
+  private lastViewChangeAt = 0;
+  private textResolution = 0;
   private rafId = 0;
   private lastScheduleAt = 0;
   private lastStatusAt = 0;
@@ -144,6 +177,7 @@ export class CanvasEngine {
   private readonly frameHooks = new Set<(now: number) => void>();
   private readonly statusListeners = new Set<(status: EngineStatus) => void>();
   private readonly viewportListeners = new Set<(viewport: ViewportState) => void>();
+  private readonly editListeners = new Set<(cardId: string) => void>();
   private readonly cleanups: (() => void)[] = [];
   private destroyed = false;
 
@@ -179,7 +213,7 @@ export class CanvasEngine {
 
     this.grid = new TilingSprite({ texture: createDotTexture(), width, height });
     this.grid.alpha = 0.55;
-    this.app.stage.addChild(this.grid, this.regionLayer, this.world, this.overlay, this.labels);
+    this.app.stage.addChild(this.grid, this.regionLayer, this.linkLayer, this.world, this.overlay, this.labels);
     this.viewport.resize(width, height);
 
     this.bindEvents(canvas);
@@ -202,6 +236,7 @@ export class CanvasEngine {
     this.renderedOrder = [];
     this.interaction = { kind: 'none' };
     this.focusRegion = null;
+    this.jobViews = new Map();
 
     this.doc = doc;
     this.selection = selection;
@@ -239,6 +274,14 @@ export class CanvasEngine {
     return this.selection;
   }
 
+  /** 生成任务的状态，按提示词卡 id 索引 */
+  setJobViews(views: ReadonlyMap<string, PromptJobView>): void {
+    this.jobViews = views;
+    for (const id of this.promptNodes.keys()) this.refreshPromptNode(id);
+    this.overlayDirty = true;
+    this.needsRender = true;
+  }
+
   /** 缓存在后台重建好了，失败过的纹理重新加载 */
   retryTexture(versionId: string): void {
     this.textures.retry(versionId);
@@ -267,16 +310,7 @@ export class CanvasEngine {
         height,
         x: column * BENCH_CELL + (BENCH_ITEM_MAX - width) / 2,
         y: row * BENCH_CELL + (BENCH_ITEM_MAX - height) / 2,
-        versions: [
-          {
-            id: image.key,
-            file: '',
-            width: image.width,
-            height: image.height,
-            createdAt: '',
-            origin: 'import',
-          },
-        ],
+        versions: [{ id: image.key, file: '', width: image.width, height: image.height, createdAt: '', origin: 'import' }],
         currentVersionId: image.key,
       };
     });
@@ -322,12 +356,27 @@ export class CanvasEngine {
 
   nudgeSelection(dx: number, dy: number): void {
     if (this.selection.size === 0) return;
-    const origins = this.selectedOrigins();
-    this.doc.apply('微调位置', moveCards(this.doc.get(), origins, dx, dy));
+    this.doc.apply('微调位置', moveCards(this.doc.get(), this.selectedOrigins(), dx, dy));
   }
 
   selectAll(): void {
     this.selection.set(this.doc.get().cards.map((card) => card.id));
+  }
+
+  /** 用选中的图像卡新建一张提示词卡（没选图时放在视口中心），并请求开始编辑 */
+  createPromptFromSelection(): PromptCard {
+    const imageIds = this.selectedCards().filter(isImageCard).map((card) => card.id);
+    const { state, card } = createPromptCard(this.doc.get(), imageIds, this.viewCenterWorld(), () => crypto.randomUUID());
+    this.doc.apply('新建提示词卡', state);
+    this.selection.set([card.id]);
+    for (const listener of this.editListeners) listener(card.id);
+    return card;
+  }
+
+  /** 双击提示词卡、或新建提示词卡后通知面板开始编辑 */
+  onEditRequest(listener: (cardId: string) => void): () => void {
+    this.editListeners.add(listener);
+    return () => this.editListeners.delete(listener);
   }
 
   // ───────────────────────── 视口 ─────────────────────────
@@ -373,9 +422,8 @@ export class CanvasEngine {
   /** 当前视口中心所在的区域；不在任何区域里时返回最近的 */
   regionAtViewCenter(): RegionId | null {
     const center = this.viewCenterWorld();
-    const regions = this.doc.get().regions;
     let best: { id: RegionId; distance: number } | null = null;
-    for (const region of regions) {
+    for (const region of this.doc.get().regions) {
       const dx = Math.max(region.x - center.x, 0, center.x - (region.x + region.width));
       const dy = Math.max(region.y - center.y, 0, center.y - (region.y + region.height));
       const distance = Math.hypot(dx, dy);
@@ -443,6 +491,7 @@ export class CanvasEngine {
     this.frameHooks.clear();
     this.statusListeners.clear();
     this.viewportListeners.clear();
+    this.editListeners.clear();
     this.textures.destroy();
     if (this.app.renderer) this.app.destroy({ removeView: true }, { children: true });
   }
@@ -461,11 +510,15 @@ export class CanvasEngine {
     if (this.viewChanged) {
       this.applyViewport();
       this.viewChanged = false;
+      this.lastViewChangeAt = now;
       this.needsRender = true;
       this.overlayDirty = true;
       const snapshot = this.viewport.snapshot();
       for (const listener of this.viewportListeners) listener(snapshot);
+    } else if (now - this.lastViewChangeAt > TEXT_RESOLUTION_SETTLE_MS) {
+      this.updateTextResolution();
     }
+    this.tickJobs(now);
     const viewEnd = performance.now();
 
     if (now - this.lastScheduleAt >= SCHEDULE_INTERVAL_MS) {
@@ -487,7 +540,7 @@ export class CanvasEngine {
     const commitMs = performance.now() - commitStart;
 
     if (this.overlayDirty) {
-      this.drawOverlay();
+      this.drawOverlay(now);
       this.overlayDirty = false;
       this.needsRender = true;
     }
@@ -515,6 +568,19 @@ export class CanvasEngine {
     }
   };
 
+  /** 有任务在跑时：提示词卡上的计时每秒刷新，脉动边框每帧刷新 */
+  private tickJobs(now: number): void {
+    let active = false;
+    for (const view of this.jobViews.values()) if (view?.status === 'running' || view?.status === 'queued') active = true;
+    if (!active) return;
+    this.overlayDirty = true;
+    if (now - this.lastJobTick >= 1000) {
+      this.lastJobTick = now;
+      for (const id of this.promptNodes.keys()) this.refreshPromptNode(id);
+      this.needsRender = true;
+    }
+  }
+
   private applyViewport(): void {
     const { zoom, originX, originY } = this.viewport;
     this.world.scale.set(zoom);
@@ -524,6 +590,15 @@ export class CanvasEngine {
     this.updateGrid();
     this.updateCulling();
     this.positionRegionLabels();
+  }
+
+  /** 提示词卡的文字在缩放停下来后按新的缩放重新栅格化 */
+  private updateTextResolution(): void {
+    const resolution = clamp(window.devicePixelRatio * this.viewport.zoom, 0.5, 4);
+    if (Math.abs(resolution - this.textResolution) < 0.05) return;
+    this.textResolution = resolution;
+    for (const node of this.promptNodes.values()) node.setTextResolution(resolution);
+    this.needsRender = true;
   }
 
   private updateCulling(): void {
@@ -554,6 +629,7 @@ export class CanvasEngine {
     // 同一个版本被多张卡片引用时，取需要最清晰的那张
     const wanted = new Map<string, { level: TextureLevel; priority: number }>();
     for (const card of this.doc.get().cards) {
+      if (!isImageCard(card)) continue;
       const distance = Math.hypot(card.x + card.width / 2 - centerX, card.y + card.height / 2 - centerY);
       let level: TextureLevel = 0;
       let priority = 1e6 + distance;
@@ -578,30 +654,24 @@ export class CanvasEngine {
     if (change !== 'transient') {
       this.selection.prune(new Set(state.cards.map((card) => card.id)));
       this.drawRegions();
+      this.emitStatus();
     }
-    if (change !== 'transient') this.emitStatus();
   }
 
   /** 只更新和上一次快照相比变了的卡片 */
   private syncFromDoc(state: DocState, full: boolean): void {
     const next = new Map(state.cards.map((card) => [card.id, card]));
-    for (const id of [...this.rendered.keys()]) if (!next.has(id)) this.removeNode(id);
+    for (const id of [...this.rendered.keys()]) {
+      const card = next.get(id);
+      if (!card || card.kind !== this.rendered.get(id)!.kind) this.removeNode(id);
+    }
 
     for (const card of state.cards) {
       const previous = this.rendered.get(card.id);
       if (!full && previous === card) continue;
-      let node = this.nodes.get(card.id);
-      if (!node) {
-        node = new Container();
-        this.nodes.set(card.id, node);
-      }
-      if (previous?.currentVersionId !== card.currentVersionId) {
-        if (previous) this.unbindTexture(card.id, previous.currentVersionId);
-        this.bindTexture(card);
-      }
-      node.position.set(card.x, card.y);
-      this.rendered.set(card.id, card);
-      this.refreshNodeTexture(card.id);
+      if (isImageCard(card)) this.syncImageCard(card, previous as ImageCard | undefined);
+      else this.syncPromptCard(card);
+      this.nodes.get(card.id)!.position.set(card.x, card.y);
     }
 
     if (full || !sameOrder(this.renderedOrder, state.cards)) {
@@ -609,10 +679,41 @@ export class CanvasEngine {
       for (const card of state.cards) this.world.addChild(this.nodes.get(card.id)!);
     }
     this.renderedOrder = state.cards;
+    // 输入数量会影响提示词卡底部的说明
+    for (const id of this.promptNodes.keys()) this.refreshPromptNode(id);
     this.updateCulling();
     this.applyFocus();
     this.overlayDirty = true;
     this.needsRender = true;
+  }
+
+  private syncImageCard(card: ImageCard, previous: ImageCard | undefined): void {
+    if (!this.nodes.has(card.id)) this.nodes.set(card.id, new Container());
+    if (previous?.currentVersionId !== card.currentVersionId) {
+      if (previous) this.unbindTexture(card.id, previous.currentVersionId);
+      this.bindTexture(card);
+    }
+    this.rendered.set(card.id, card);
+    this.refreshNodeTexture(card.id);
+  }
+
+  private syncPromptCard(card: PromptCard): void {
+    let node = this.promptNodes.get(card.id);
+    if (!node) {
+      node = new PromptNode();
+      if (this.textResolution > 0) node.setTextResolution(this.textResolution);
+      this.promptNodes.set(card.id, node);
+      this.nodes.set(card.id, node.container);
+    }
+    this.rendered.set(card.id, card);
+  }
+
+  private refreshPromptNode(id: string): void {
+    const card = this.rendered.get(id);
+    const node = this.promptNodes.get(id);
+    if (!card || !node || !isPromptCard(card)) return;
+    const inputCount = card.inputs.filter((inputId) => this.rendered.has(inputId)).length;
+    node.update(card, inputCount, this.jobViews.get(id) ?? null, performance.now());
   }
 
   private bindTexture(card: ImageCard): void {
@@ -637,7 +738,7 @@ export class CanvasEngine {
   private refreshNodeTexture(id: string): void {
     const card = this.rendered.get(id);
     const node = this.nodes.get(id);
-    if (!card || !node) return;
+    if (!card || !node || !isImageCard(card)) return;
     const tileSet = this.textures.bestTiles(card.currentVersionId);
     const count = tileSet ? tileSet.tiles.length : 1;
 
@@ -664,10 +765,15 @@ export class CanvasEngine {
   }
 
   private removeNode(id: string): void {
-    const node = this.nodes.get(id);
     const card = this.rendered.get(id);
-    if (card) this.unbindTexture(id, card.currentVersionId);
-    node?.destroy({ children: true });
+    if (card && isImageCard(card)) this.unbindTexture(id, card.currentVersionId);
+    const prompt = this.promptNodes.get(id);
+    if (prompt) {
+      prompt.destroy();
+      this.promptNodes.delete(id);
+    } else {
+      this.nodes.get(id)?.destroy({ children: true });
+    }
     this.nodes.delete(id);
     this.rendered.delete(id);
   }
@@ -727,15 +833,24 @@ export class CanvasEngine {
     }
   }
 
-  private drawOverlay(): void {
+  // ───────────────────────── 覆盖层：选框、连线、端口、任务 ─────────────────────────
+
+  private drawOverlay(now: number): void {
     const g = this.overlay;
     g.clear();
+    const state = this.doc.get();
     const selection = this.selection.get();
     const view = this.viewport.visibleWorldRect();
 
-    for (const card of this.doc.get().cards) {
-      if (intersects(card, view) && this.isMissing(card)) this.strokeWorldRect(g, card, 1, 0.9, MISSING_OUTLINE);
+    this.drawLinks(state);
+
+    for (const card of state.cards) {
+      if (isImageCard(card) && intersects(card, view) && this.isMissing(card)) {
+        this.strokeWorldRect(g, card, 1, 0.9, MISSING_OUTLINE);
+      }
     }
+    this.drawJobs(g, state, now);
+
     if (this.hoverId && !selection.has(this.hoverId) && this.interaction.kind === 'none') {
       const card = this.rendered.get(this.hoverId);
       if (card) this.strokeWorldRect(g, card, 1, 0.7);
@@ -744,7 +859,7 @@ export class CanvasEngine {
     for (const card of selected) this.strokeWorldRect(g, card, 1.5, 1);
 
     const bounds = unionRects(selected);
-    if (bounds && this.interaction.kind !== 'marquee') {
+    if (bounds && this.interaction.kind !== 'marquee' && this.interaction.kind !== 'link') {
       if (selected.length > 1) this.strokeWorldRect(g, bounds, 1, 0.5);
       for (const corner of this.cornerPoints(bounds)) {
         g.rect(corner.x - HANDLE_SIZE / 2, corner.y - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE)
@@ -752,12 +867,122 @@ export class CanvasEngine {
           .stroke({ color: ACCENT, width: 1.5 });
       }
     }
+    this.drawPorts(g, state);
+
     if (this.interaction.kind === 'marquee') {
       const { rect } = this.interaction;
       const a = this.viewport.worldToScreen(rect.x, rect.y);
       g.rect(a.x, a.y, rect.width * this.viewport.zoom, rect.height * this.viewport.zoom)
         .fill({ color: ACCENT, alpha: 0.1 })
         .stroke({ color: ACCENT, width: 1, alpha: 0.9 });
+    }
+    if (this.interaction.kind === 'link') {
+      const { fromX, fromY, x, y, targetId } = this.interaction;
+      const target = targetId ? this.rendered.get(targetId) : undefined;
+      if (target) this.strokeWorldRect(g, target, 2, 1);
+      const end = target ? this.viewport.worldToScreen(target.x + target.width, target.y + target.height / 2) : { x, y };
+      curve(g, end.x, end.y, fromX, fromY);
+      g.stroke({ color: ACCENT, width: 2, alpha: 0.9 });
+    }
+  }
+
+  /** 来源连线：输入图 → 提示词卡左侧各自的槽位，提示词卡右侧 → 输出图 */
+  private drawLinks(state: DocState): void {
+    const g = this.linkLayer;
+    g.clear();
+    const byId = new Map(state.cards.map((card) => [card.id, card]));
+    let slotIndex = 0;
+    for (const card of state.cards) {
+      if (!isPromptCard(card)) continue;
+      const showSlots = card.height * this.viewport.zoom >= MIN_PORT_CARD_PX;
+      card.inputs.forEach((inputId, index) => {
+        const input = byId.get(inputId);
+        if (!input) return;
+        const from = this.viewport.worldToScreen(input.x + input.width, input.y + input.height / 2);
+        const to = this.slotPoint(card, index);
+        curve(g, from.x, from.y, to.x, to.y);
+        g.stroke({ color: ACCENT, width: 1.5, alpha: 0.6 });
+        if (showSlots) this.placeSlotLabel(slotIndex++, index + 1, to.x, to.y);
+      });
+      const output = card.outputCardId ? byId.get(card.outputCardId) : undefined;
+      if (output) {
+        const from = this.viewport.worldToScreen(card.x + card.width, card.y + card.height / 2);
+        const to = this.viewport.worldToScreen(output.x, output.y + output.height / 2);
+        curve(g, from.x, from.y, to.x, to.y);
+        g.stroke({ color: OUTPUT_LINK, width: 1.5, alpha: 0.7 });
+      }
+    }
+    for (let i = slotIndex; i < this.slotLabels.length; i++) this.slotLabels[i].visible = false;
+  }
+
+  private placeSlotLabel(poolIndex: number, slot: number, x: number, y: number): void {
+    let label = this.slotLabels[poolIndex];
+    if (!label) {
+      label = new Text({
+        text: '',
+        style: { fontFamily: '-apple-system, sans-serif', fontSize: 10, fontWeight: '700', fill: 0x0e0f1a },
+        resolution: window.devicePixelRatio * 2,
+      });
+      label.anchor.set(0.5);
+      this.labels.addChild(label);
+      this.slotLabels[poolIndex] = label;
+    }
+    label.text = String(slot);
+    label.position.set(x, y);
+    label.visible = true;
+  }
+
+  /** 第 index 个输入在提示词卡左边缘的位置（屏幕坐标） */
+  private slotPoint(card: PromptCard, index: number): { x: number; y: number } {
+    const topLeft = this.viewport.worldToScreen(card.x, card.y);
+    const heightPx = card.height * this.viewport.zoom;
+    if (heightPx < MIN_PORT_CARD_PX) return { x: topLeft.x, y: topLeft.y + heightPx / 2 };
+    return { x: topLeft.x, y: topLeft.y + Math.min(heightPx - 12, SLOT_TOP + index * SLOT_SPACING) };
+  }
+
+  /** "加输入"端口：在已有槽位的下面 */
+  private addPortPoint(card: PromptCard): { x: number; y: number } | null {
+    if (card.height * this.viewport.zoom < MIN_PORT_CARD_PX) return null;
+    return this.slotPoint(card, card.inputs.length);
+  }
+
+  private drawPorts(g: Graphics, state: DocState): void {
+    const selection = this.selection.get();
+    for (const card of state.cards) {
+      if (!isPromptCard(card)) continue;
+      const slots = card.inputs.length;
+      for (let i = 0; i < slots; i++) {
+        const point = this.slotPoint(card, i);
+        if (card.height * this.viewport.zoom >= MIN_PORT_CARD_PX) g.circle(point.x, point.y, PORT_RADIUS).fill({ color: ACCENT });
+      }
+      const showAdd = selection.has(card.id) || this.hoverId === card.id || this.hoverPortId === card.id;
+      const add = this.addPortPoint(card);
+      if (add && showAdd) {
+        const hot = this.hoverPortId === card.id;
+        g.circle(add.x, add.y, PORT_RADIUS)
+          .fill({ color: hot ? ACCENT : 0x1c1e29 })
+          .stroke({ color: ACCENT, width: 1.5 });
+        g.moveTo(add.x - 3, add.y).lineTo(add.x + 3, add.y).moveTo(add.x, add.y - 3).lineTo(add.x, add.y + 3);
+        g.stroke({ color: hot ? 0x0e0f1a : ACCENT, width: 1.5 });
+      }
+    }
+  }
+
+  /** 运行中的任务：提示词卡脉动描边；第一次生成时在输出位置画虚线占位 */
+  private drawJobs(g: Graphics, state: DocState, now: number): void {
+    const pulse = 0.45 + 0.45 * Math.sin(now / 260);
+    for (const [promptId, view] of this.jobViews) {
+      if (!view || view.status === 'failed') continue;
+      const prompt = state.cards.find((card) => card.id === promptId);
+      if (!prompt || !isPromptCard(prompt)) continue;
+      this.strokeWorldRect(g, prompt, 2, pulse);
+      const hasOutput = prompt.outputCardId && state.cards.some((card) => card.id === prompt.outputCardId);
+      if (!hasOutput) {
+        const ghost = outputPlacement(state, prompt, view.aspect);
+        const a = this.viewport.worldToScreen(ghost.x, ghost.y);
+        dashedRect(g, a.x, a.y, ghost.width * this.viewport.zoom, ghost.height * this.viewport.zoom);
+        g.stroke({ color: ACCENT, width: 1.5, alpha: pulse });
+      }
     }
   }
 
@@ -792,19 +1017,32 @@ export class CanvasEngine {
     return null;
   }
 
-  private selectedCards(): ImageCard[] {
+  /** 命中某张提示词卡的"加输入"端口（选中或悬停时才显示，也只在那时可点） */
+  private hitAddPort(screenX: number, screenY: number): PromptCard | null {
+    const selection = this.selection.get();
+    for (const card of this.doc.get().cards) {
+      if (!isPromptCard(card)) continue;
+      if (!selection.has(card.id) && this.hoverId !== card.id && this.hoverPortId !== card.id) continue;
+      const point = this.addPortPoint(card);
+      if (point && Math.hypot(point.x - screenX, point.y - screenY) <= PORT_HIT) return card;
+    }
+    return null;
+  }
+
+  private selectedCards(): CanvasCard[] {
     const selection = this.selection.get();
     return this.doc.get().cards.filter((card) => selection.has(card.id));
   }
 
-  private selectedOrigins(): Map<string, ImageCard> {
+  private selectedOrigins(): Map<string, CanvasCard> {
     return new Map(this.selectedCards().map((card) => [card.id, card]));
   }
 
-  private hitTest(worldX: number, worldY: number): ImageCard | undefined {
+  private hitTest(worldX: number, worldY: number, filter: (card: CanvasCard) => boolean = () => true): CanvasCard | undefined {
     const cards = this.doc.get().cards;
     for (let i = cards.length - 1; i >= 0; i--) {
       const card = cards[i];
+      if (!filter(card)) continue;
       if (worldX >= card.x && worldX <= card.x + card.width && worldY >= card.y && worldY <= card.y + card.height) {
         return card;
       }
@@ -875,7 +1113,7 @@ export class CanvasEngine {
     listen(canvas, 'pointermove', (event) => this.onPointerMove(event));
     listen(canvas, 'pointerup', (event) => this.onPointerUp(event));
     listen(canvas, 'pointercancel', (event) => this.onPointerUp(event));
-    listen(canvas, 'pointerleave', () => this.setHover(null, null));
+    listen(canvas, 'pointerleave', () => this.setHover(null, null, null));
     listen(window, 'keydown', (event) => this.onKeyDown(event));
     listen(window, 'keyup', (event) => this.onKeyUp(event));
     listen(window, 'blur', () => {
@@ -914,6 +1152,13 @@ export class CanvasEngine {
       return;
     }
     if (event.button !== 0) return;
+
+    const port = this.hitAddPort(x, y);
+    if (port) {
+      const from = this.addPortPoint(port)!;
+      this.interaction = { kind: 'link', promptId: port.id, fromX: from.x, fromY: from.y, x, y, targetId: null };
+      return;
+    }
 
     const corner = this.hitCorner(x, y);
     if (corner) {
@@ -954,6 +1199,14 @@ export class CanvasEngine {
       return;
     }
 
+    const isDoubleClick = this.lastClick?.id === hit.id && performance.now() - this.lastClick.at < DOUBLE_CLICK_MS;
+    this.lastClick = { id: hit.id, at: performance.now() };
+    if (isDoubleClick && isPromptCard(hit)) {
+      this.selection.set([hit.id]);
+      for (const listener of this.editListeners) listener(hit.id);
+      return;
+    }
+
     let toggleOnClickId: string | null = null;
     if (event.shiftKey) {
       if (this.selection.has(hit.id)) toggleOnClickId = hit.id;
@@ -980,9 +1233,11 @@ export class CanvasEngine {
 
     switch (interaction.kind) {
       case 'none': {
-        const corner = this.hitCorner(x, y);
+        const port = this.hitAddPort(x, y);
+        const corner = port ? null : this.hitCorner(x, y);
         const world = this.viewport.screenToWorld(x, y);
-        this.setHover(corner ? null : (this.hitTest(world.x, world.y)?.id ?? null), corner);
+        const hit = port || corner ? null : (this.hitTest(world.x, world.y)?.id ?? null);
+        this.setHover(hit ?? (port ? this.hoverId : null), corner, port?.id ?? null);
         return;
       }
       case 'pan':
@@ -1021,6 +1276,17 @@ export class CanvasEngine {
         );
         return;
       }
+      case 'link': {
+        const world = this.viewport.screenToWorld(x, y);
+        const prompt = this.rendered.get(interaction.promptId);
+        const outputId = prompt && isPromptCard(prompt) ? prompt.outputCardId : null;
+        const target = this.hitTest(world.x, world.y, (card) => isImageCard(card) && card.id !== outputId);
+        interaction.x = x;
+        interaction.y = y;
+        interaction.targetId = target?.id ?? null;
+        this.overlayDirty = true;
+        return;
+      }
     }
   }
 
@@ -1033,6 +1299,9 @@ export class CanvasEngine {
       else if (interaction.toggleOnClickId) this.selection.toggle(interaction.toggleOnClickId);
     }
     if (interaction.kind === 'resize') this.doc.commitGesture();
+    if (interaction.kind === 'link' && interaction.targetId) {
+      this.doc.apply('绑定输入图', addPromptInput(this.doc.get(), interaction.promptId, interaction.targetId));
+    }
     this.interaction = { kind: 'none' };
     this.overlayDirty = true;
     this.updateCursor();
@@ -1079,6 +1348,15 @@ export class CanvasEngine {
       this.setTool('select');
     } else if (event.key.toLowerCase() === 'h') {
       this.setTool('hand');
+    } else if (event.key.toLowerCase() === 'p') {
+      event.preventDefault();
+      this.createPromptFromSelection();
+    } else if (event.key === 'Enter') {
+      const [only] = this.selectedCards();
+      if (this.selection.size === 1 && only && isPromptCard(only)) {
+        event.preventDefault();
+        for (const listener of this.editListeners) listener(only.id);
+      }
     } else if (event.key === 'Backspace' || event.key === 'Delete') {
       this.deleteSelection();
     } else if (event.key === 'Escape') {
@@ -1093,10 +1371,11 @@ export class CanvasEngine {
     }
   }
 
-  private setHover(id: string | null, corner: Corner | null): void {
-    if (this.hoverId === id && this.hoverCorner === corner) return;
+  private setHover(id: string | null, corner: Corner | null, portId: string | null): void {
+    if (this.hoverId === id && this.hoverCorner === corner && this.hoverPortId === portId) return;
     this.hoverId = id;
     this.hoverCorner = corner;
+    this.hoverPortId = portId;
     this.overlayDirty = true;
     this.updateCursor();
   }
@@ -1105,6 +1384,7 @@ export class CanvasEngine {
     const canvas = this.app.canvas;
     if (!canvas) return;
     if (this.interaction.kind === 'pan') canvas.style.cursor = 'grabbing';
+    else if (this.interaction.kind === 'link' || this.hoverPortId) canvas.style.cursor = 'crosshair';
     else if (this.tool === 'hand' || this.spaceHeld) canvas.style.cursor = 'grab';
     else if (this.hoverCorner === 'nw' || this.hoverCorner === 'se') canvas.style.cursor = 'nwse-resize';
     else if (this.hoverCorner === 'ne' || this.hoverCorner === 'sw') canvas.style.cursor = 'nesw-resize';
@@ -1183,11 +1463,35 @@ export function isTyping(target: EventTarget | null): boolean {
   return !!element && (element.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName));
 }
 
-function sameOrder(a: readonly ImageCard[], b: readonly ImageCard[]): boolean {
+function sameOrder(a: readonly CanvasCard[], b: readonly CanvasCard[]): boolean {
   if (a === b) return true;
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i].id !== b[i].id) return false;
   return true;
+}
+
+/** 水平方向的三次贝塞尔曲线，两端水平进出 */
+function curve(g: Graphics, x1: number, y1: number, x2: number, y2: number): void {
+  const bend = Math.max(40, Math.abs(x2 - x1) / 2);
+  g.moveTo(x1, y1).bezierCurveTo(x1 + bend, y1, x2 - bend, y2, x2, y2);
+}
+
+function dashedRect(g: Graphics, x: number, y: number, width: number, height: number): void {
+  const dash = 8;
+  const gap = 6;
+  const edge = (x1: number, y1: number, x2: number, y2: number): void => {
+    const length = Math.hypot(x2 - x1, y2 - y1);
+    const ux = (x2 - x1) / length;
+    const uy = (y2 - y1) / length;
+    for (let d = 0; d < length; d += dash + gap) {
+      const end = Math.min(length, d + dash);
+      g.moveTo(x1 + ux * d, y1 + uy * d).lineTo(x1 + ux * end, y1 + uy * end);
+    }
+  };
+  edge(x, y, x + width, y);
+  edge(x + width, y, x + width, y + height);
+  edge(x + width, y + height, x, y + height);
+  edge(x, y + height, x, y);
 }
 
 const DOT_TILE = 32;

@@ -1,5 +1,5 @@
 import { memo, useMemo } from 'react';
-import { currentVersion, type ImageCard, type RegionId } from '../../../shared/project';
+import { currentVersion, isImageCard, type CanvasCard, type RegionId } from '../../../shared/project';
 import { regionOf, type DocState } from '../document/operations';
 import { thumbnailUrl } from '../project/thumbnails';
 
@@ -12,17 +12,17 @@ interface LayersPanelProps {
   onFocusCard(id: string): void;
 }
 
-/** 按区域分组列出图像卡，最上层的排在最前面 */
+/** 按区域分组列出画布对象，最上层的排在最前面 */
 export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, onSelect, onFocusCard }: LayersPanelProps) {
   const groups = useMemo(() => {
-    const byRegion = new Map<RegionId | null, ImageCard[]>();
+    const byRegion = new Map<RegionId | null, CanvasCard[]>();
     for (const card of [...state.cards].reverse()) {
       const region = regionOf(state, card);
       const list = byRegion.get(region) ?? [];
       list.push(card);
       byRegion.set(region, list);
     }
-    const ordered: { id: string; name: string; cards: ImageCard[] }[] = state.regions.map((region) => ({
+    const ordered: { id: string; name: string; cards: CanvasCard[] }[] = state.regions.map((region) => ({
       id: region.id,
       name: region.name,
       cards: byRegion.get(region.id) ?? [],
@@ -44,14 +44,20 @@ export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, 
             </div>
             {group.cards.length === 0 && <div className="layer-empty">还没有内容</div>}
             {group.cards.map((card) => {
+              if (!isImageCard(card)) {
+                return (
+                  <LayerRow key={card.id} card={card} selected={selectedIds.has(card.id)} kind="prompt" onSelect={onSelect} onFocusCard={onFocusCard} />
+                );
+              }
               const version = currentVersion(card);
               return (
                 <LayerRow
                   key={card.id}
                   card={card}
                   selected={selectedIds.has(card.id)}
-                  missing={missingVersionIds.has(version.id)}
+                  kind={missingVersionIds.has(version.id) ? 'missing' : 'image'}
                   thumbnail={thumbnailUrl(version, cacheBust.get(version.id))}
+                  badge={card.versions.length > 1 ? card.versions.length : undefined}
                   onSelect={onSelect}
                   onFocusCard={onFocusCard}
                 />
@@ -65,15 +71,16 @@ export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, 
 }
 
 interface LayerRowProps {
-  card: ImageCard;
+  card: CanvasCard;
   selected: boolean;
-  missing: boolean;
-  thumbnail: string;
+  kind: 'image' | 'missing' | 'prompt';
+  thumbnail?: string;
+  badge?: number;
   onSelect(id: string, additive: boolean): void;
   onFocusCard(id: string): void;
 }
 
-const LayerRow = memo(function LayerRow({ card, selected, missing, thumbnail, onSelect, onFocusCard }: LayerRowProps) {
+const LayerRow = memo(function LayerRow({ card, selected, kind, thumbnail, badge, onSelect, onFocusCard }: LayerRowProps) {
   return (
     <button
       className={`layer-row ${selected ? 'selected' : ''}`}
@@ -81,9 +88,11 @@ const LayerRow = memo(function LayerRow({ card, selected, missing, thumbnail, on
       onDoubleClick={() => onFocusCard(card.id)}
       title="单击选中，双击定位到画布"
     >
-      {missing ? <span className="layer-thumb missing">缺失</span> : <img className="layer-thumb" src={thumbnail} alt="" loading="lazy" />}
+      {kind === 'prompt' && <span className="layer-thumb prompt">✎</span>}
+      {kind === 'missing' && <span className="layer-thumb missing">缺失</span>}
+      {kind === 'image' && <img className="layer-thumb" src={thumbnail} alt="" loading="lazy" />}
       <span className="layer-name">{card.name}</span>
-      {card.versions.length > 1 && <span className="layer-badge">{card.versions.length}</span>}
+      {badge !== undefined && <span className="layer-badge">{badge}</span>}
     </button>
   );
 });
