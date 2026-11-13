@@ -6,7 +6,7 @@ import type { JobUpdate } from '../shared/generation';
 const flagArg = process.argv.find((arg) => arg.startsWith('--anye-flags='));
 const flags: LaunchFlags = flagArg
   ? (JSON.parse(flagArg.slice('--anye-flags='.length)) as LaunchFlags)
-  : { uncapped: false, autoBench: false, m1Check: null, m2Check: null, m3Check: null, m4Check: null };
+  : { uncapped: false, autoBench: false, m1Check: null, m2Check: null, m3Check: null, m4Check: null, realCheck: false };
 
 function subscribe<T>(channel: string, listener: (value: T) => void): () => void {
   const handler = (_event: IpcRendererEvent, value: T): void => listener(value);

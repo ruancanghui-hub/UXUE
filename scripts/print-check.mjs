@@ -4,9 +4,10 @@ import { join } from 'node:path';
 
 const name = process.argv[2] ?? 'm1';
 const root = join(tmpdir(), `anye-${name}-check`);
-const titles = { write: '第一次启动', verify: '第二次启动：重新打开并核对' };
+const titles = { write: name === 'real' ? '真实调用自检' : '第一次启动', verify: '第二次启动：重新打开并核对' };
 let passed = true;
-for (const phase of ['write', 'verify']) {
+const phases = name === 'real' ? ['write'] : ['write', 'verify'];
+for (const phase of phases) {
   let report;
   try {
     report = JSON.parse(readFileSync(join(root, `report-${phase}.json`), 'utf8'));

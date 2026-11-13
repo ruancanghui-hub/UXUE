@@ -31,9 +31,12 @@ const flags: LaunchFlags = {
   m2Check: checkPhase('m2-check'),
   m3Check: checkPhase('m3-check'),
   m4Check: checkPhase('m4-check'),
+  realCheck: process.argv.includes('--real-check'),
 };
-const checkName = flags.m1Check ? 'm1' : flags.m2Check ? 'm2' : flags.m3Check ? 'm3' : flags.m4Check ? 'm4' : null;
-const checkPhaseValue = flags.m1Check ?? flags.m2Check ?? flags.m3Check ?? flags.m4Check;
+const checkName = flags.m1Check ? 'm1' : flags.m2Check ? 'm2' : flags.m3Check ? 'm3' : flags.m4Check ? 'm4' : flags.realCheck ? 'real' : null;
+const checkPhaseValue = flags.m1Check ?? flags.m2Check ?? flags.m3Check ?? flags.m4Check ?? (flags.realCheck ? 'write' : null);
+/** 自检默认强制本地模拟；真实调用自检按用户设置走 */
+const forceMock = checkName !== null && checkName !== 'real';
 const selfTestMode = hasFlag('--self-test', 'ANYE_SELF_TEST');
 /** 开发用：窗口加载完 1.5 秒后把界面截图存到这个路径并退出 */
 const capturePath = process.argv.find((arg) => arg.startsWith('--capture='))?.slice('--capture='.length) ?? null;
@@ -63,7 +66,7 @@ const generationQueue = new GenerationQueue(
   generationSettings,
   { openai, mock: new MockProvider(worker) },
   (update) => mainWindow?.webContents.send('gen:update', update),
-  checkName ? 'mock' : null,
+  forceMock ? 'mock' : null,
 );
 const assistants = { openai: new OpenAIAssistant(worker, () => generationSettings.getApiKey()), mock: new MockAssistant() };
 
@@ -206,7 +209,7 @@ function registerIpc(): void {
     if (request.projectDir !== projects.currentDir()) throw new Error('只能为当前打开的项目提问');
     if (request.images.some((image) => image.file.includes('..') || image.file.startsWith('/'))) throw new Error('图片路径不合法');
     const config = generationSettings.config();
-    const provider = checkName ? 'mock' : config.provider;
+    const provider = forceMock ? 'mock' : config.provider;
     return assistants[provider].ask(request, config.assistantModel, new AbortController().signal);
   });
 

@@ -39,6 +39,7 @@ import { runM1Check } from './project/m1Check';
 import { runM2Check } from './project/m2Check';
 import { runM3Check } from './project/m3Check';
 import { runM4Check } from './project/m4Check';
+import { runRealCheck } from './project/realCheck';
 import { ProjectSession, type SaveState } from './project/ProjectSession';
 
 interface Toast {
@@ -456,8 +457,8 @@ export function ProjectApp() {
   // ───────────── 验收自检 ─────────────
 
   useEffect(() => {
-    const { m1Check, m2Check, m3Check, m4Check } = window.anye.flags;
-    if ((!m1Check && !m2Check && !m3Check && !m4Check) || !engine || !session || !assistant || checkStarted.current) return;
+    const { m1Check, m2Check, m3Check, m4Check, realCheck } = window.anye.flags;
+    if ((!m1Check && !m2Check && !m3Check && !m4Check && !realCheck) || !engine || !session || !assistant || checkStarted.current) return;
     checkStarted.current = true;
     const run = m1Check
       ? runM1Check(m1Check, { engine, session, importInto })
@@ -465,7 +466,9 @@ export function ProjectApp() {
         ? runM2Check(m2Check, { engine, session, importInto, tracker })
         : m3Check
           ? runM3Check(m3Check, { engine, session, importInto, tracker, assistant, setRightTab })
-          : runM4Check(m4Check!, { engine, session, importInto, tracker, assistant, setRightTab, createPage, exportPage });
+          : m4Check
+            ? runM4Check(m4Check, { engine, session, importInto, tracker, assistant, setRightTab, createPage, exportPage })
+            : runRealCheck({ engine, session, importInto, tracker, assistant });
     void run
       .catch((error: unknown) => console.error(`[check] 异常 ${error instanceof Error ? error.stack : String(error)}`))
       .finally(() => window.anye.quit());

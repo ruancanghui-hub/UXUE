@@ -19,6 +19,8 @@ export interface LaunchFlags {
   m3Check: CheckPhase | null;
   /** M4 验收自检：完整跑一遍寿司首页（主题 → 素材 → 页面 → 导出） */
   m4Check: CheckPhase | null;
+  /** 真实调用自检：用 OpenAI 跑一次助手和一张低质量生图，会产生少量费用 */
+  realCheck: boolean;
 }
 
 export interface RecentProject {
