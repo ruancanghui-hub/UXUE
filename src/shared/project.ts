@@ -427,9 +427,14 @@ export interface ProjectFile {
   viewport: ViewportState | null;
 }
 
-const REGION_WIDTH = 6000;
-const REGION_HEIGHT = 4000;
+export const REGION_WIDTH = 12000;
+/** 区域的最小高度；内容往下超出时自动长高 */
+export const REGION_MIN_HEIGHT = 4000;
 const REGION_GAP = 600;
+/** 区域底边留在最低内容下面的空白 */
+const REGION_BOTTOM_PAD = 600;
+/** 2026-11 之前的区域宽度；打开旧项目时按它迁移 */
+const LEGACY_REGION_WIDTH = 6000;
 
 export function defaultRegions(): Region[] {
   const names: [RegionId, string][] = [
@@ -443,8 +448,36 @@ export function defaultRegions(): Region[] {
     x: index * (REGION_WIDTH + REGION_GAP),
     y: 0,
     width: REGION_WIDTH,
-    height: REGION_HEIGHT,
+    height: REGION_MIN_HEIGHT,
   }));
+}
+
+/** 区域按列归属：中心点横坐标落在区域宽度内、且不在区域顶部之上，就算这一列（不看底边，区域会长高） */
+export function regionColumnOf(regions: readonly Region[], rect: { x: number; y: number; width: number; height: number }): Region | null {
+  const cx = rect.x + rect.width / 2;
+  const cy = rect.y + rect.height / 2;
+  return regions.find((r) => cx >= r.x && cx <= r.x + r.width && cy >= r.y) ?? null;
+}
+
+/**
+ * 每个区域的高度 = max(最小高度, 这一列内容的最底边 − 区域顶部 + 留白)；内容删掉后会缩回去。
+ * 高度都没变时返回原来的数组，调用方可以靠引用判断有没有变化。
+ */
+export function fitRegionHeights(regions: readonly Region[], cards: readonly CanvasCard[]): readonly Region[] {
+  const bottoms = new Map<RegionId, number>();
+  for (const card of cards) {
+    const region = regionColumnOf(regions, card);
+    if (region) bottoms.set(region.id, Math.max(bottoms.get(region.id) ?? -Infinity, card.y + card.height));
+  }
+  let changed = false;
+  const next = regions.map((region) => {
+    const bottom = bottoms.get(region.id);
+    const height = Math.max(REGION_MIN_HEIGHT, bottom === undefined ? 0 : bottom - region.y + REGION_BOTTOM_PAD);
+    if (height === region.height) return region;
+    changed = true;
+    return { ...region, height };
+  });
+  return changed ? next : regions;
 }
 
 export function emptyProject(): ProjectFile {
@@ -478,13 +511,16 @@ export function parseProject(raw: unknown): ParseResult {
   }
 
   const defaults = defaultRegions();
-  const regions = defaults.map((fallback) => {
+  let regions = defaults.map((fallback) => {
     const found = Array.isArray(raw.regions) ? raw.regions.find((r) => isObject(r) && r.id === fallback.id) : undefined;
     if (isObject(found) && isRect(found)) {
       return { ...fallback, x: found.x, y: found.y, width: found.width, height: found.height };
     }
     return fallback;
   });
+  // 旧项目的区域只有 6000 宽：区域按新布局放宽，后面两列的内容整体右移（在读卡片之后做）
+  const legacyRegions = regions.some((region) => region.width <= LEGACY_REGION_WIDTH) ? regions : null;
+  if (legacyRegions) regions = defaults.map((fallback, i) => ({ ...fallback, y: legacyRegions[i].y }));
 
   const cards: CanvasCard[] = [];
   const seen = new Set<string>();
@@ -530,6 +566,11 @@ export function parseProject(raw: unknown): ParseResult {
     if (inputs.length !== card.inputs.length || outputCardId !== card.outputCardId || styleRefCardId !== card.styleRefCardId) {
       cards[index] = { ...card, inputs, outputCardId, styleRefCardId };
     }
+  }
+
+  if (legacyRegions) {
+    migrateLegacyColumns(cards, legacyRegions, regions);
+    warnings.push('区域已放大到原来的两倍宽，核心素材区和高保真页面区的内容已整体右移');
   }
 
   const viewport = isObject(raw.viewport) && isFiniteNumber(raw.viewport.originX) && isFiniteNumber(raw.viewport.originY) &&
@@ -623,6 +664,26 @@ export function parseProject(raw: unknown): ParseResult {
       : null;
 
   return { project: { schemaVersion: PROJECT_SCHEMA_VERSION, regions, cards, activeThemeCardId, viewport }, warnings };
+}
+
+/**
+ * 旧布局的卡片按中心点所在的旧列平移到新列：主题区及左边不动，
+ * 核心素材区右移到新的核心素材区，高保真页面区及更右边右移到新的高保真页面区。
+ */
+function migrateLegacyColumns(cards: CanvasCard[], before: readonly Region[], after: readonly Region[]): void {
+  const shifts = after.map((region, i) => region.x - before[i].x);
+  for (const [index, card] of cards.entries()) {
+    const cx = card.x + card.width / 2;
+    let column = 0;
+    for (let i = before.length - 1; i > 0; i--) {
+      if (cx >= before[i].x) {
+        column = i;
+        break;
+      }
+    }
+    const dx = shifts[column];
+    if (dx) cards[index] = { ...card, x: card.x + dx };
+  }
 }
 
 function parseGroupId(value: unknown): string | null {

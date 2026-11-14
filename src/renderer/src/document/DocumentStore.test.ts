@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { defaultRegions, type ImageCard, type Version } from '../../../shared/project';
+import { defaultRegions, REGION_MIN_HEIGHT, REGION_WIDTH, type ImageCard, type Version } from '../../../shared/project';
 import { DocumentStore } from './DocumentStore';
 import {
   addCards,
@@ -41,14 +41,14 @@ describe('layoutNewCards', () => {
     expect(cards[0]).toMatchObject({ width: 800, height: 400, x: 100, y: 300, name: 'a', currentVersionId: 'a' });
   });
 
-  it('一次导入 100 张时整批能放进一个 6000 × 4000 的区域', () => {
+  it('一次导入 100 张时整批能放进一个区域的宽度和最小高度', () => {
     const cards = layoutNewCards(Array.from({ length: 100 }, (_, i) => version(`b${i}`, 2048, 2048)), 0, 0, makeId);
     const minX = Math.min(...cards.map((c) => c.x));
     const maxX = Math.max(...cards.map((c) => c.x + c.width));
     const minY = Math.min(...cards.map((c) => c.y));
     const maxY = Math.max(...cards.map((c) => c.y + c.height));
-    expect(maxX - minX).toBeLessThan(6000);
-    expect(maxY - minY).toBeLessThan(4000);
+    expect(maxX - minX).toBeLessThan(REGION_WIDTH);
+    expect(maxY - minY).toBeLessThan(REGION_MIN_HEIGHT);
   });
 
   it('小图保持原尺寸，多张排成网格不重叠', () => {

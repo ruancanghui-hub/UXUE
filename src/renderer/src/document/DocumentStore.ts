@@ -22,8 +22,15 @@ export class DocumentStore {
   private gesture: { label: string; before: DocState } | null = null;
   private readonly listeners = new Set<(state: DocState, change: DocChange) => void>();
 
-  constructor(initial: DocState) {
-    this.state = initial;
+  /**
+   * normalize：每次换快照前套用一次的整理函数（比如区域跟着内容长高）；
+   * 必须在没有变化时原样返回，否则每次改动都会多出一个新快照。
+   */
+  constructor(
+    initial: DocState,
+    private readonly normalize: (state: DocState) => DocState = (state) => state,
+  ) {
+    this.state = normalize(initial);
   }
 
   get(): DocState {
@@ -36,7 +43,7 @@ export class DocumentStore {
   }
 
   reset(state: DocState): void {
-    this.state = state;
+    this.state = this.normalize(state);
     this.undoStack = [];
     this.redoStack = [];
     this.gesture = null;
@@ -44,9 +51,10 @@ export class DocumentStore {
   }
 
   /** 一次性改动：next 和当前快照相同时什么也不做 */
-  apply(label: string, next: DocState): void {
+  apply(label: string, raw: DocState): void {
     if (this.gesture) this.commitGesture();
-    if (next === this.state) return;
+    if (raw === this.state) return;
+    const next = this.normalize(raw);
     this.push({ label, before: this.state, after: next });
     this.state = next;
     this.emit('commit');
@@ -59,9 +67,9 @@ export class DocumentStore {
     return this.state;
   }
 
-  updateGesture(next: DocState): void {
-    if (!this.gesture || next === this.state) return;
-    this.state = next;
+  updateGesture(raw: DocState): void {
+    if (!this.gesture || raw === this.state) return;
+    this.state = this.normalize(raw);
     this.emit('transient');
   }
 
@@ -95,11 +103,12 @@ export class DocumentStore {
     // 当前状态就是撤销栈顶的结果时，栈顶也要带上 presentOnly，否则"撤销再重做"会回不到现在的样子
     const top = this.undoStack[this.undoStack.length - 1];
     const presentIsTop = !this.gesture && top?.after === this.state;
-    const rewrite = (entry: HistoryEntry): HistoryEntry => ({ ...entry, before: additive(entry.before), after: additive(entry.after) });
+    const fixed = (state: DocState): DocState => this.normalize(additive(state));
+    const rewrite = (entry: HistoryEntry): HistoryEntry => ({ ...entry, before: fixed(entry.before), after: fixed(entry.after) });
     this.undoStack = this.undoStack.map(rewrite);
     this.redoStack = this.redoStack.map(rewrite);
-    if (this.gesture) this.gesture = { ...this.gesture, before: additive(this.gesture.before) };
-    const next = presentOnly(additive(this.state));
+    if (this.gesture) this.gesture = { ...this.gesture, before: fixed(this.gesture.before) };
+    const next = this.normalize(presentOnly(additive(this.state)));
     if (presentIsTop) this.undoStack[this.undoStack.length - 1].after = next;
     if (next === this.state) return;
     this.state = next;

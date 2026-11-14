@@ -8,6 +8,8 @@ import {
   currentVersion,
   detectPreset,
   DEVICE_PRESETS,
+  fitRegionHeights,
+  regionColumnOf,
   isBlockCard,
   isGroupCard,
   isSketchMark,
@@ -1322,10 +1324,13 @@ export function updatePageBaseSource(state: DocState, pageId: string, baseSource
   return mapCards(state, (card) => (card.id === pageId && isPageCard(card) && card.baseSource !== baseSource ? { ...card, baseSource } : card));
 }
 export function regionOf(state: DocState, card: Rect): RegionId | null {
-  const cx = card.x + card.width / 2;
-  const cy = card.y + card.height / 2;
-  const region = state.regions.find((r) => cx >= r.x && cx <= r.x + r.width && cy >= r.y && cy <= r.y + r.height);
-  return region?.id ?? null;
+  return regionColumnOf(state.regions, card)?.id ?? null;
+}
+
+/** 区域高度跟着内容走；高度没变时返回同一个快照 */
+export function fitRegionsToContent(state: DocState): DocState {
+  const regions = fitRegionHeights(state.regions, state.cards);
+  return regions === state.regions ? state : { ...state, regions };
 }
 
 function mapCards(state: DocState, fn: (card: CanvasCard) => CanvasCard): DocState {

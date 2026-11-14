@@ -1,7 +1,7 @@
 import type { OpenedProject } from '../../../shared/api';
 import { PROJECT_SCHEMA_VERSION, type ProjectFile, type ViewportState } from '../../../shared/project';
 import { DocumentStore } from '../document/DocumentStore';
-import type { DocState } from '../document/operations';
+import { fitRegionsToContent, type DocState } from '../document/operations';
 import { Selection } from '../document/Selection';
 
 const SAVE_AFTER_EDIT_MS = 300;
@@ -32,11 +32,14 @@ export class ProjectSession {
     this.name = opened.name;
     this.missingVersionIds = new Set(opened.missingVersionIds);
     this.viewport = opened.file.viewport;
-    this.doc = new DocumentStore({
-      cards: opened.file.cards,
-      regions: opened.file.regions,
-      activeThemeCardId: opened.file.activeThemeCardId,
-    });
+    this.doc = new DocumentStore(
+      {
+        cards: opened.file.cards,
+        regions: opened.file.regions,
+        activeThemeCardId: opened.file.activeThemeCardId,
+      },
+      fitRegionsToContent,
+    );
     this.unsubscribe = this.doc.subscribe((_state, change) => {
       if (change !== 'transient' && change !== 'reset') this.scheduleSave(SAVE_AFTER_EDIT_MS);
     });
