@@ -48,6 +48,32 @@ export function SettingsDialog({ config, onChange, onClose }: SettingsDialogProp
       setBusy(false);
     }
   };
+  const [transferNote, setTransferNote] = useState<Message>(null);
+  /** 导出 / 导入配置：结果就近显示在按钮下面；task 返回 null 表示用户取消 */
+  const transfer = async (task: () => Promise<string | null>): Promise<void> => {
+    setBusy(true);
+    setTransferNote(null);
+    try {
+      const text = await task();
+      if (text) setTransferNote({ text, tone: 'good' });
+    } catch (error) {
+      setTransferNote({ text: cleanError(error), tone: 'bad' });
+    } finally {
+      setBusy(false);
+    }
+  };
+  const exportConfig = async (): Promise<string | null> => {
+    const path = await window.anye.exportConfig();
+    return path ? `已导出到 ${path}` : null;
+  };
+  const importConfig = async (): Promise<string | null> => {
+    const result = await window.anye.importConfig();
+    if (!result) return null;
+    onChange(result.config);
+    setTemplates(await window.anye.listPromptTemplates());
+    const provider = providers.find((p) => p.id === result.config.provider)?.label ?? result.config.provider;
+    return `已导入：生图 ${provider}、${result.keyCount} 个 Key、${result.templateCount} 个模板`;
+  };
   const update = (patch: Parameters<typeof window.anye.updateGenerationConfig>[0]): void =>
     void run(() => window.anye.updateGenerationConfig(patch));
 
@@ -261,6 +287,23 @@ export function SettingsDialog({ config, onChange, onClose }: SettingsDialogProp
           run={run}
         />
         <p className="hint">Key 用系统钥匙串加密保存在本机，只在主进程里使用，不会出现在界面或项目文件里。</p>
+
+        <section className="dialog-section">
+          <div className="section-title">配置迁移</div>
+          <p className="hint">
+            把供应商、模型、Base URL、API Key 和提示词模板导出成一个文件，换电脑后导入就能直接用。导入会覆盖这些设置；模板会合并进来，同一个模板覆盖、新的追加。
+          </p>
+          <p className="warning">导出文件里的 API Key 是明文，请妥善保管，不要发给别人或传到公开的地方。</p>
+          <div className="button-row tight">
+            <button disabled={busy} onClick={() => void transfer(exportConfig)}>
+              导出配置…
+            </button>
+            <button disabled={busy} onClick={() => void transfer(importConfig)}>
+              导入配置…
+            </button>
+          </div>
+          {transferNote && <p className={transferNote.tone === 'good' ? 'good-text' : 'warning'}>{transferNote.text}</p>}
+        </section>
 
         <section className="dialog-section">
           <div className="section-title">提示词模板</div>

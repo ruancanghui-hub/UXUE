@@ -44,7 +44,15 @@ import {
 } from '../../../shared/project';
 import { isImageCardStale, regenPromptIdsForSelection } from '../../../shared/stale';
 import type { DocumentStore } from '../document/DocumentStore';
-import { blockHasOutput, isWireframeOutput, pageBlocks, updatePrompt, type DocState } from '../document/operations';
+import {
+  blockHasOutput,
+  currentStyleBenchmark,
+  elementPrompts,
+  isWireframeOutput,
+  pageBlocks,
+  updatePrompt,
+  type DocState,
+} from '../document/operations';
 import { activeTheme, effectiveConfig } from '../project/GenerationTracker';
 import type { TrackedJob } from '../project/GenerationTracker';
 import { thumbnailUrl } from '../project/thumbnails';
@@ -92,6 +100,14 @@ interface InspectorProps {
   blockActions: BlockActions;
   wireframeActions: WireframeActions;
   themeMarkdownActions: ThemeMarkdownActions;
+  elementActions: ElementActions;
+}
+
+/** 素材清单：list 走助手；setBenchmark 传 null 是取消风格基准 */
+export interface ElementActions {
+  busy: boolean;
+  list(themeId: string): void;
+  setBenchmark(imageCardId: string | null): void;
 }
 
 /** 主题说明：copy 写剪贴板；save 写进项目 themes/，返回完整路径 */
@@ -282,6 +298,8 @@ function ImageInfo(props: InspectorProps & { card: ImageCard }) {
 
       <WireframeSection {...props} />
 
+      <StyleBenchmarkSection {...props} />
+
       <section className="inspector-section">
         <CardActions {...props} />
       </section>
@@ -319,8 +337,12 @@ function PromptInfo(props: InspectorProps & { card: PromptCard; textareaRef: Rea
   return (
     <>
       <section className="inspector-section">
-        <div className="panel-title">提示词卡</div>
+        <div className="panel-title">
+          提示词卡 {card.purpose === 'element' && <span className="lock-badge">素材清单</span>}
+          {card.purpose === 'wireframe' && <span className="lock-badge">转线框</span>}
+        </div>
         <NameInput id={card.id} name={card.name} onRename={props.onRename} label="提示词卡名称" />
+        {card.purpose === 'element' && <StyleRefLine {...props} />}
         <textarea
           ref={props.textareaRef}
           className="prompt-input"
@@ -440,6 +462,48 @@ function PromptInfo(props: InspectorProps & { card: PromptCard; textareaRef: Rea
         <CardActions {...props} />
       </section>
     </>
+  );
+}
+
+/** 素材清单提示词卡上显示当前风格基准 */
+function StyleRefLine(props: InspectorProps & { card: PromptCard }) {
+  const ref = props.card.styleRefCardId ? props.state.cards.find((c) => c.id === props.card.styleRefCardId) : undefined;
+  if (!ref || !isImageCard(ref)) {
+    return <p className="hint">还没有风格基准。挑一张满意的图，在它的属性里点「以此为风格基准」，整套素材会统一画风。</p>;
+  }
+  return (
+    <p className="hint">
+      风格基准：{ref.name}（{'{{Image 1}}'}）{'　'}
+      <button className="link" onClick={() => props.onSelectCard(ref.id)}>
+        选中
+      </button>
+    </p>
+  );
+}
+
+function StyleBenchmarkSection(props: InspectorProps & { card: ImageCard }) {
+  const { card, state, elementActions } = props;
+  const prompts = elementPrompts(state);
+  if (prompts.length === 0) return null;
+  const current = currentStyleBenchmark(state);
+  const isCurrent = current === card.id;
+  const targets = prompts.filter((prompt) => prompt.outputCardId !== card.id).length;
+  return (
+    <section className="inspector-section">
+      <div className="panel-title">风格基准 {isCurrent && <span className="active-badge">当前基准</span>}</div>
+      <p className="hint">
+        {isCurrent
+          ? `${targets} 张素材清单提示词卡正以这张图为参考统一画风。`
+          : `设为风格基准后，${targets} 张素材清单提示词卡都会绑定这张图做参考（画风一致、不复制内容）；已生成的会标成已过期。`}
+      </p>
+      {isCurrent ? (
+        <button onClick={() => elementActions.setBenchmark(null)}>取消风格基准</button>
+      ) : (
+        <button className="primary" disabled={props.missingVersionIds.has(card.currentVersionId)} onClick={() => elementActions.setBenchmark(card.id)}>
+          以此为风格基准
+        </button>
+      )}
+    </section>
   );
 }
 
@@ -990,6 +1054,9 @@ function ThemeInfo(props: InspectorProps & { card: ThemeCard }) {
         </button>
         <p className="hint">生效主题卡的规则会附加到每次生成的提示词后面；每张提示词卡可以单独关掉。</p>
         <ThemeMarkdownActions {...props} />
+        <button disabled={props.elementActions.busy} onClick={() => props.elementActions.list(card.id)}>
+          {props.elementActions.busy ? '助手忙…' : '列出素材清单'}
+        </button>
         {card.sourceImageCardId && source && isImageCard(source) && sourceVersion && (
           <div className="ref-source">
             <img className="lowfi-thumb" src={thumbnailUrl(sourceVersion, cacheBust.get(sourceVersion.id))} alt="" />

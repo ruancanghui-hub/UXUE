@@ -11,10 +11,12 @@ import {
   isImageCard,
   isPageCard,
   isPromptCard,
+  isThemeCard,
   themeSuffix,
   type BlockCard,
   type ImageCard,
   type PageCard,
+  type ThemeCard,
   type Version,
 } from '../../../shared/project';
 import type { CanvasEngine } from '../canvas/CanvasEngine';
@@ -22,6 +24,8 @@ import {
   applyAssistantDrafts,
   applyBlockPrompts,
   applyDecomposition,
+  applyElementList,
+  elementPrompts,
   pageBlocks,
   placeBlockCrops,
 } from '../document/operations';
@@ -171,6 +175,30 @@ export class AssistantSession {
       this.busy = false;
       this.emit();
     }
+  }
+
+  // ───────────────────────── 素材清单 ─────────────────────────
+
+  /** 从主题卡（默认生效主题卡）列出素材清单，落成核心素材区里按类别分组的提示词卡；scope 是可选的范围说明 */
+  async listElements(scope: string, themeId: string | null = null): Promise<AssistantMessage> {
+    const state = this.session.doc.get();
+    const id = themeId ?? state.activeThemeCardId;
+    const theme = id ? state.cards.find((card): card is ThemeCard => card.id === id && isThemeCard(card)) : undefined;
+    if (!theme) return this.fail('还没有生效主题卡，先生成或选一张主题卡再列素材清单。');
+    const range = scope.trim();
+    return this.run(`从主题卡「${theme.name}」列出素材清单${range ? `：${range}` : ''}`, async () => {
+      const response = await window.anye.askAssistant({
+        ...this.baseRequest(range ? `列出素材清单，范围：${range}` : '列出素材清单'),
+        task: 'elementList',
+        activeTheme: themeSuffix(theme),
+        existingElements: elementPrompts(this.session.doc.get()).map((prompt) => prompt.name),
+      });
+      if (response.elements.length === 0) return { response, text: `${response.reply}（没有列出新的素材）` };
+      const applied = applyElementList(this.session.doc.get(), response.elements, () => crypto.randomUUID());
+      this.session.doc.apply(`素材清单：新建 ${applied.promptIds.length} 张提示词卡`, applied.state);
+      this.session.selection.set(applied.promptIds);
+      return { response, created: { themeId: null, promptIds: applied.promptIds } };
+    });
   }
 
   // ───────────────────────── 区块 ─────────────────────────

@@ -9,6 +9,7 @@ import {
   type AssistantRequest,
   type AssistantResponse,
   type BlockDraft,
+  type ElementDraft,
   type PromptDraft,
   type ThemeDraft,
 } from '../../shared/assistant';
@@ -58,10 +59,17 @@ const INSTRUCTIONS = `你是「暗夜精灵」里的设计助手，帮设计师�
 - 底稿是「借鉴的成品截图」时，只借鉴布局和构图，不照搬截图里的具体内容、元素、角色和文字。
 - 这个任务里 theme 为 null、blocks 为空数组。
 
-不是拆解任务时 blocks 给空数组。
+六、列素材清单（任务为「列素材清单」时，elements）：根据生效主题卡回答三个问题——产品是什么（产品主题）、希望用户感受到什么（视觉关键词）、哪些视觉元素能持续表达这种感觉（视觉线索）——推导出接下来要设计的核心素材。
+- 共 8–16 项，以图标为主（功能入口、导航、状态），再加少量插画（Banner、空状态、登录页主图）、装饰元素（点缀小物、分隔、角标）、纹样 / 背景（可平铺的底纹）。
+- category 只能是 icon、illustration、decor、pattern；每项写 name（简短中文，如「握寿司图标」）、usage（用在页面哪里）、cue（出自哪条视觉线索）。
+- text 是能直接拿去文生图的中文提示词：画什么（具体物件和造型）、用在哪（比如「首页金刚位，缩到 48px 也要认得出」）、构图（icon / decor：单个物件居中、纯色浅底背景；pattern：能无缝平铺；illustration：主体明确、留出放文字的空间）、不要什么（文字、Logo、水印）。不要重复主题卡里的配色和统一规则，生成时会自动附加。
+- 上下文里列出的已有清单项不要重复；用户写了范围说明（比如「个人页要用的」）就按范围列。
+- 这个任务里 theme 为 null、prompts 和 blocks 为空数组。
+
+不是拆解任务时 blocks 给空数组；不是列素材清单任务时 elements 给空数组。
 reply 用一两句中文说明你做了什么。`;
 
-const TASK_LABELS = { chat: '普通对话', decompose: '拆解', blockPrompts: '为区块写提示词' } as const;
+const TASK_LABELS = { chat: '普通对话', decompose: '拆解', blockPrompts: '为区块写提示词', elementList: '列素材清单' } as const;
 /** 区块截图本来就小，缩到长边 512 就够看清 */
 const BLOCK_IMAGE_EDGE = 512;
 /** 拆解时把原型放大或缩小到长边 1024：太小的截图模型看不清图标边界 */
@@ -261,12 +269,14 @@ function maxPromptsFor(request: AssistantRequest): number {
 }
 
 function maxOutputTokens(request: AssistantRequest): number {
-  return request.task === 'blockPrompts' ? 16_000 : 6000;
+  if (request.task === 'blockPrompts') return 16_000;
+  return request.task === 'elementList' ? 10_000 : 6000;
 }
 
 function describeContext(request: AssistantRequest): string {
   const lines = [`项目：${request.projectName}`, `任务：${TASK_LABELS[request.task ?? 'chat']}`];
   if (request.baseSource) lines.push(`底稿来源：${request.baseSource === 'borrowed' ? '借鉴的成品截图' : '自己的线框'}`);
+  if (request.existingElements?.length) lines.push(`已有的清单项（不要重复）：${request.existingElements.join('、')}`);
   lines.push(request.activeTheme ? `当前生效的主题卡：\n${request.activeTheme}` : '当前没有生效的主题卡。');
   if (request.selectedPrompts.length) {
     lines.push('选中的提示词卡：');
@@ -327,6 +337,24 @@ const MOCK_HOME_BLOCKS: BlockDraft[] = [
   })),
 ];
 
+/** 本地模拟的素材清单：每条线索一个图标，再加插画、装饰和纹样各一项 */
+function mockElements(cues: string[]): ElementDraft[] {
+  const icons = cues.slice(0, 6).map((cue): ElementDraft => ({
+    name: `${cue}图标`,
+    category: 'icon',
+    usage: '首页金刚位',
+    cue,
+    text: `画一个「${cue}」功能图标：单个物件居中，造型简洁，缩到 48px 也要认得出，纯色浅底背景；不要文字、Logo 和水印。`,
+  }));
+  const main = cues[0] ?? '主体';
+  return [
+    ...icons,
+    { name: 'Banner 主插画', category: 'illustration', usage: '首页 Banner', cue: main, text: `画一张以「${main}」为主体的横幅插画，右侧留出放标题文字的空间；不要文字和 Logo。` },
+    { name: '点缀小物', category: 'decor', usage: '卡片角标与分隔', cue: cues[1] ?? main, text: `画一个小巧的「${cues[1] ?? main}」点缀元素，单个物件居中，纯色浅底背景；不要文字。` },
+    { name: '页面底纹', category: 'pattern', usage: '页面背景', cue: cues[2] ?? main, text: `画一张由「${cues[2] ?? main}」简化图形组成、能无缝平铺的浅色底纹；不要文字。` },
+  ];
+}
+
 const MOCK_BLOCK_PROMPTS: Record<BlockDraft['type'], string> = {
   hero: '画一张饱满的横幅主视觉，标题文字的位置留出有氛围的视觉空区。',
   icon: '画一个居中的单个功能图标，造型简洁、识别度高，纯色浅底背景，同组图标视觉重量一致。',
@@ -346,7 +374,14 @@ export class MockAssistant implements AssistantProvider {
       });
     });
     const message = request.message;
-    const base = { provider: 'mock' as const, model: 'local-mock', costUsd: 0, blocks: [] as BlockDraft[] };
+    const base = { provider: 'mock' as const, model: 'local-mock', costUsd: 0, blocks: [] as BlockDraft[], elements: [] as ElementDraft[] };
+
+    if (request.task === 'elementList') {
+      const cues = (request.activeTheme?.match(/视觉线索：(.+)/)?.[1] ?? '主体物件、品牌形象').split('、').map((c) => c.trim()).filter(Boolean);
+      const taken = new Set(request.existingElements ?? []);
+      const elements = mockElements(cues).filter((element) => !taken.has(element.name));
+      return { ...base, reply: `（本地模拟）从主题卡列出了 ${elements.length} 项素材。`, theme: null, prompts: [], elements };
+    }
 
     if (request.task === 'decompose') {
       return { ...base, reply: `（本地模拟）把页面拆成了 ${MOCK_HOME_BLOCKS.length} 个区块，可以拖动、缩放或删掉不需要的。`, theme: null, prompts: [], blocks: MOCK_HOME_BLOCKS };

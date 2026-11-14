@@ -1,4 +1,4 @@
-import type { BlockDraft, PromptDraft, ThemeDraft } from '../../../shared/assistant';
+import { ELEMENT_CATEGORIES, type BlockDraft, type ElementCategory, type ElementDraft, type PromptDraft, type ThemeDraft } from '../../../shared/assistant';
 import { DEFAULT_PROMPT_SETTINGS, type PromptSettings } from '../../../shared/generation';
 import {
   blockRelativeRect,
@@ -143,6 +143,7 @@ export function removeCards(state: DocState, requested: ReadonlySet<string>): Do
         };
       }
       if (!isPromptCard(next)) return next;
+      if (next.styleRefCardId && ids.has(next.styleRefCardId)) next = withoutStyleRef(next);
       const inputs = next.inputs.filter((id) => !ids.has(id));
       const outputCardId = next.outputCardId && ids.has(next.outputCardId) ? null : next.outputCardId;
       return inputs.length === next.inputs.length && outputCardId === next.outputCardId ? next : { ...next, inputs, outputCardId };
@@ -287,6 +288,7 @@ export function createPromptCard(
     settings: { ...DEFAULT_PROMPT_SETTINGS },
     groupId: null,
     purpose: null,
+    styleRefCardId: null,
   };
   return { state: addCards(state, [card]), card };
 }
@@ -413,7 +415,8 @@ function needsOutputLink(state: DocState, result: GenerationResult): boolean {
 /** 第一次生成时输出图像卡的位置：提示词卡右侧，竖直居中；宽度跟随第一张输入图 */
 export function outputPlacement(state: DocState, prompt: PromptCard, aspect: number): Rect {
   const firstInput = state.cards.find((card) => card.id === prompt.inputs[0]);
-  const width = firstInput ? Math.min(800, Math.max(240, firstInput.width)) : 400;
+  // 素材清单排成网格，输出宽度固定，绑了大的风格基准图也不会压住旁边的卡
+  const width = prompt.purpose === 'element' ? ELEMENT_OUTPUT_WIDTH : firstInput ? Math.min(800, Math.max(240, firstInput.width)) : 400;
   const height = width / aspect;
   return { x: prompt.x + prompt.width + CHAIN_GAP, y: prompt.y + prompt.height / 2 - height / 2, width, height };
 }
@@ -518,6 +521,7 @@ export function applyAssistantDrafts(
       settings: { ...DEFAULT_PROMPT_SETTINGS },
       groupId: null,
       purpose: null,
+      styleRefCardId: null,
     };
     y += PROMPT_CARD_HEIGHT + DRAFT_COLUMN_GAP;
     promptIds.push(card.id);
@@ -938,6 +942,7 @@ export function applyBlockPrompts(
       settings: { ...DEFAULT_PROMPT_SETTINGS, count: 1 },
       groupId: crop.groupId,
       purpose: null,
+      styleRefCardId: null,
     };
     prompts.push(card);
     promptIds.push(card.id);
@@ -945,6 +950,123 @@ export function applyBlockPrompts(
   }
   if (prompts.length) next = addCards(next, prompts);
   return { state: next, promptIds };
+}
+
+// ───────────────────────── 素材清单与风格基准 ─────────────────────────
+
+const ELEMENT_OUTPUT_WIDTH = 400;
+const ELEMENT_COLUMNS = 3;
+const ELEMENT_COLUMN_WIDTH = PROMPT_CARD_WIDTH + CHAIN_GAP + ELEMENT_OUTPUT_WIDTH + 80;
+const ELEMENT_ROW_HEIGHT = ELEMENT_OUTPUT_WIDTH + 60;
+const ELEMENT_GROUP_GAP = 120;
+
+const ELEMENT_SIZE: Record<ElementCategory, PromptSettings['size']> = {
+  icon: '1024x1024',
+  decor: '1024x1024',
+  pattern: '1024x1024',
+  illustration: '1536x1024',
+};
+
+export const STYLE_REF_SENTENCE = '【画风参照】画风、线条、材质、光影与 {{Image 1}} 保持一致，但不要复制它的内容和构图。';
+
+/**
+ * 素材清单落到核心素材区：每个类别一个分组框，排在已有内容下方；组内 3 列网格，
+ * 列宽留出输出图的位置。已有风格基准时新卡直接绑定它。
+ */
+export function applyElementList(
+  state: DocState,
+  drafts: ElementDraft[],
+  makeId: () => string,
+): { state: DocState; promptIds: string[]; groupIds: string[] } {
+  if (drafts.length === 0) return { state, promptIds: [], groupIds: [] };
+  const region = state.regions.find((r) => r.id === 'assets') ?? state.regions[0];
+  const left = (region?.x ?? 0) + BLOCK_REGION_PAD;
+  let top = Math.max(
+    (region?.y ?? 0) + BLOCK_REGION_PAD,
+    ...state.cards.filter((card) => regionOf(state, card) === 'assets').map((card) => card.y + card.height + BLOCK_REGION_PAD),
+  );
+  const benchmark = currentStyleBenchmark(state);
+  const cards: CanvasCard[] = [];
+  const promptIds: string[] = [];
+  const groupIds: string[] = [];
+  for (const category of ELEMENT_CATEGORIES) {
+    const items = drafts.filter((draft) => draft.category === category.id);
+    if (items.length === 0) continue;
+    const groupId = makeId();
+    const rows = Math.ceil(items.length / ELEMENT_COLUMNS);
+    const columns = Math.min(ELEMENT_COLUMNS, items.length);
+    items.forEach((draft, i) => {
+      const prompt: PromptCard = {
+        kind: 'prompt',
+        id: makeId(),
+        name: draft.name,
+        x: left + (i % ELEMENT_COLUMNS) * ELEMENT_COLUMN_WIDTH,
+        y: top + Math.floor(i / ELEMENT_COLUMNS) * ELEMENT_ROW_HEIGHT + (ELEMENT_ROW_HEIGHT - PROMPT_CARD_HEIGHT) / 2,
+        width: PROMPT_CARD_WIDTH,
+        height: PROMPT_CARD_HEIGHT,
+        text: draft.text,
+        inputs: [],
+        outputCardId: null,
+        settings: { count: 1, size: ELEMENT_SIZE[draft.category], quality: 'medium', useTheme: true },
+        groupId,
+        purpose: 'element',
+        styleRefCardId: null,
+      };
+      cards.push(benchmark ? withStyleRef(prompt, benchmark) : prompt);
+      promptIds.push(prompt.id);
+    });
+    const group: GroupCard = {
+      kind: 'group',
+      id: groupId,
+      name: `素材清单 · ${category.label}`,
+      x: left - GROUP_PAD,
+      y: top - GROUP_PAD,
+      width: columns * ELEMENT_COLUMN_WIDTH - 80 + GROUP_PAD * 2,
+      height: rows * ELEMENT_ROW_HEIGHT + GROUP_PAD * 2,
+    };
+    cards.push(group);
+    groupIds.push(groupId);
+    top += rows * ELEMENT_ROW_HEIGHT + GROUP_PAD * 2 + ELEMENT_GROUP_GAP;
+  }
+  return { state: addCards(state, cards), promptIds, groupIds };
+}
+
+export function elementPrompts(state: DocState): PromptCard[] {
+  return state.cards.filter((card): card is PromptCard => isPromptCard(card) && card.purpose === 'element');
+}
+
+/** 当前的风格基准：清单提示词卡上绑定的那张（同时只有一张） */
+export function currentStyleBenchmark(state: DocState): string | null {
+  return elementPrompts(state).find((prompt) => prompt.styleRefCardId)?.styleRefCardId ?? null;
+}
+
+function withoutStyleRef(prompt: PromptCard): PromptCard {
+  if (!prompt.styleRefCardId) return prompt;
+  const text = prompt.text.replace(`${STYLE_REF_SENTENCE}\n`, '').replace(STYLE_REF_SENTENCE, '').trim();
+  return { ...prompt, inputs: prompt.inputs.filter((id) => id !== prompt.styleRefCardId), styleRefCardId: null, text };
+}
+
+function withStyleRef(prompt: PromptCard, imageCardId: string): PromptCard {
+  const base = withoutStyleRef(prompt);
+  return {
+    ...base,
+    inputs: [imageCardId, ...base.inputs.filter((id) => id !== imageCardId)],
+    styleRefCardId: imageCardId,
+    text: `${STYLE_REF_SENTENCE}\n${base.text}`,
+  };
+}
+
+/**
+ * 设风格基准：全部清单提示词卡（输出就是这张图的那张除外）换绑到它；null 就是取消。
+ * 已生成的因为输入变了，会被判为已过期。
+ */
+export function setStyleBenchmark(state: DocState, imageCardId: string | null): DocState {
+  if (imageCardId && !state.cards.some((card) => card.id === imageCardId && isImageCard(card))) return state;
+  return mapCards(state, (card) => {
+    if (!isPromptCard(card) || card.purpose !== 'element') return card;
+    if (!imageCardId || card.outputCardId === imageCardId) return withoutStyleRef(card);
+    return card.styleRefCardId === imageCardId ? card : withStyleRef(card, imageCardId);
+  });
 }
 
 // ───────────────────────── 转线框 ─────────────────────────

@@ -52,6 +52,8 @@ const api: AnyeApi = {
   sampleLowFi: () => ipcRenderer.invoke('dev:sample-lowfi'),
 
   listPromptTemplates: () => ipcRenderer.invoke('templates:list'),
+  exportConfig: () => ipcRenderer.invoke('config:export'),
+  importConfig: () => ipcRenderer.invoke('config:import'),
   createPromptTemplate: (name, text, settings) => ipcRenderer.invoke('templates:create', name, text, settings),
   updatePromptTemplate: (id, patch) => ipcRenderer.invoke('templates:update', id, patch),
   removePromptTemplate: (id) => ipcRenderer.invoke('templates:remove', id),

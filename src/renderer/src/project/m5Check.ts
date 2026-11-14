@@ -16,7 +16,7 @@ import {
 } from '../../../shared/project';
 import { isImageCardStale } from '../../../shared/stale';
 import type { CanvasEngine } from '../canvas/CanvasEngine';
-import { moveCards, pageBlocks, wireframeFromPage } from '../document/operations';
+import { elementPrompts, moveCards, pageBlocks, setStyleBenchmark, wireframeFromPage } from '../document/operations';
 import type { AssistantSession } from './AssistantSession';
 import type { GenerationTracker } from './GenerationTracker';
 import { stableStringify, wait, waitForJobs } from './m2Check';
@@ -87,6 +87,28 @@ async function writePhase({ engine, session, tracker, assistant, createPage, exp
     check('主题说明存进项目的 themes/', saved.endsWith(`/themes/${forClip.name}.md`), saved);
   }
 
+  // 0b. 素材清单 → 生成两项 → 以第一项结果为风格基准 → 带基准再生成一项
+  await assistant.listElements('首页要用的');
+  const listed = elementPrompts(doc.get());
+  const listGroups = doc.get().cards.filter((c) => c.kind === 'group' && c.name.startsWith('素材清单'));
+  check('从主题卡列出素材清单，按类别分组', listed.length >= 8 && listed.length <= 16 && listGroups.length >= 3, `${listed.length} 项、${listGroups.length} 组`);
+  const [firstItem, secondItem, thirdItem] = listed;
+  const listJobs = await Promise.all([firstItem, secondItem].map((p) => tracker.submit(session, p.id)));
+  await waitForJobs(tracker, listJobs.map((job) => job.update.jobId), 60_000);
+  const firstOut = promptOf(firstItem.id)?.outputCardId ?? null;
+  check('清单项可以直接文生图', !!firstOut && !!promptOf(secondItem.id)?.outputCardId);
+  if (firstOut) {
+    doc.apply('设为风格基准', setStyleBenchmark(doc.get(), firstOut));
+    const bound = elementPrompts(doc.get()).filter((p) => p.outputCardId !== firstOut);
+    check('设风格基准后其余清单卡都绑定它做 Image 1', bound.every((p) => p.inputs[0] === firstOut && p.styleRefCardId === firstOut));
+    const secondOut = imageOf(promptOf(secondItem.id)?.outputCardId ?? null);
+    check('已生成的清单项因为换了参考图标成已过期', !!secondOut && isImageCardStale(secondOut, doc.get()));
+    const styled = await tracker.submit(session, thirdItem.id);
+    await waitForJobs(tracker, [styled.update.jobId], 60_000);
+    const thirdOut = imageOf(promptOf(thirdItem.id)?.outputCardId ?? null);
+    check('带风格基准生成一项', !!thirdOut && thirdOut.versions[0].generation?.inputVersionIds.length === 1);
+  }
+
   // 1. 页面框
   const page = await createPage([{ kind: 'path', path: await window.anye.sampleLowFi() }]);
   check('从低保真原型新建页面框', !!page?.base);
@@ -114,8 +136,8 @@ async function writePhase({ engine, session, tracker, assistant, createPage, exp
     return Math.abs(v.width / v.height - expected) < 0.05 * expected;
   });
   check('截图比例和区块一致', aspectOk);
-  const group = doc.get().cards.find(isGroupCard);
-  check('截图放进核心素材区的分组框', !!group && group.name === `${page.name} · 区块` && crops.every((c) => c?.groupId === group.id));
+  const group = doc.get().cards.find((c) => isGroupCard(c) && c.name === `${page.name} · 区块`);
+  check('截图放进核心素材区的分组框', !!group && crops.every((c) => c?.groupId === group.id));
   const prompts = written.map((b) => promptOf(b.promptCardId));
   check('每个区块一张提示词卡，绑定自己的截图', prompts.every((p, i) => p && p.inputs.length === 1 && p.inputs[0] === crops[i]?.id));
   await engine.whenAllL0Settled();

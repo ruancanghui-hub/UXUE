@@ -64,6 +64,18 @@ export class PromptTemplatesStore {
     return true;
   }
 
+  /** 导入别处导出的模板：同 id 覆盖，新的追加 */
+  async importMany(templates: PromptTemplate[]): Promise<number> {
+    const incoming = templates.map(parseTemplate).filter((item): item is PromptTemplate => item !== null);
+    if (incoming.length === 0) return 0;
+    const byId = new Map(incoming.map((item) => [item.id, item]));
+    const kept = this.items.map((item) => byId.get(item.id) ?? item);
+    const added = incoming.filter((item) => !this.items.some((existing) => existing.id === item.id));
+    this.items = [...kept, ...added];
+    await this.persist();
+    return incoming.length;
+  }
+
   private async persist(): Promise<void> {
     await writeFile(join(this.dir, 'prompt-templates.json'), JSON.stringify(this.items, null, 2));
   }

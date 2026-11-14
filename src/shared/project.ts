@@ -83,8 +83,10 @@ export interface PromptCard {
   outputCardId: string | null;
   settings: PromptSettings;
   groupId: string | null;
-  /** 特殊用途：wireframe 表示这是一张转线框提示词卡 */
-  purpose: 'wireframe' | null;
+  /** 特殊用途：wireframe 转线框；element 素材清单里的一项 */
+  purpose: 'wireframe' | 'element' | null;
+  /** 绑定的风格基准图像卡；有值时它是第 1 个输入 */
+  styleRefCardId: string | null;
 }
 
 export interface ThemeColor {
@@ -471,8 +473,9 @@ export function parseProject(raw: unknown): ParseResult {
     if (!isPromptCard(card)) continue;
     const inputs = card.inputs.filter((id) => imageIds.has(id));
     const outputCardId = card.outputCardId && imageIds.has(card.outputCardId) ? card.outputCardId : null;
-    if (inputs.length !== card.inputs.length || outputCardId !== card.outputCardId) {
-      cards[index] = { ...card, inputs, outputCardId };
+    const styleRefCardId = card.styleRefCardId && inputs.includes(card.styleRefCardId) ? card.styleRefCardId : null;
+    if (inputs.length !== card.inputs.length || outputCardId !== card.outputCardId || styleRefCardId !== card.styleRefCardId) {
+      cards[index] = { ...card, inputs, outputCardId, styleRefCardId };
     }
   }
 
@@ -716,7 +719,8 @@ function parsePromptCard(value: Record<string, unknown>): PromptCard | null {
       useTheme: typeof settings.useTheme === 'boolean' ? settings.useTheme : DEFAULT_PROMPT_SETTINGS.useTheme,
     },
     groupId: parseGroupId(value.groupId),
-    purpose: value.purpose === 'wireframe' ? 'wireframe' : null,
+    purpose: value.purpose === 'wireframe' || value.purpose === 'element' ? value.purpose : null,
+    styleRefCardId: typeof value.styleRefCardId === 'string' ? value.styleRefCardId : null,
   };
 }
 

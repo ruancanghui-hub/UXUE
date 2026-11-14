@@ -2,6 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { safeStorage } from 'electron';
 import { ASSISTANT_MODELS, DEFAULT_ASSISTANT_MODEL } from '../../shared/assistant';
+import type { ConfigKeys, ConfigSettings } from '../../shared/configTransfer';
 import {
   DEFAULT_NEWAPI_ASSISTANT_MODEL,
   DEFAULT_NEWAPI_BASE_URL,
@@ -175,6 +176,25 @@ export class GenerationSettingsStore {
     }
     this.keys[provider] = trimmed;
     return this.config();
+  }
+
+  /** 导出用：设置和明文 Key，只在主进程里用，不发给渲染进程 */
+  exportSnapshot(): { settings: ConfigSettings; keys: ConfigKeys } {
+    const { calibration: _calibration, ...settings } = this.settings;
+    return { settings, keys: { ...this.keys } };
+  }
+
+  /** 导入：设置走 update 的同一套校验；非空的 Key 用本机钥匙串重新加密保存 */
+  async importSnapshot(settings: ConfigSettings, keys: ConfigKeys): Promise<{ config: GenerationConfig; keyCount: number }> {
+    await this.update(settings as SettingsPatch);
+    let keyCount = 0;
+    for (const provider of Object.keys(KEY_FILES) as KeyProvider[]) {
+      const key = keys[provider];
+      if (!key) continue;
+      await this.setApiKey(provider, key);
+      keyCount++;
+    }
+    return { config: this.config(), keyCount };
   }
 
   async recordCalibration(key: string, ratio: number): Promise<void> {

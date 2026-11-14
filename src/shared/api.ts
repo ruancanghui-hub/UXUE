@@ -1,4 +1,5 @@
 import type { AssistantRequest, AssistantResponse } from './assistant';
+import type { ConfigImportResult } from './configTransfer';
 import type { BenchManifest, BenchProgress, BenchReport } from './bench';
 import type { ExportResult, PageExportPlan } from './export';
 import type {
@@ -163,6 +164,10 @@ export interface AnyeApi {
   sampleLowFi(): Promise<string>;
 
   listPromptTemplates(): Promise<PromptTemplate[]>;
+  /** 导出模型配置（含明文 API Key 和提示词模板）；返回文件路径，取消为 null */
+  exportConfig(): Promise<string | null>;
+  /** 导入模型配置；取消为 null */
+  importConfig(): Promise<(ConfigImportResult & { config: GenerationConfig }) | null>;
   createPromptTemplate(name: string, text: string, settings?: PromptSettings): Promise<PromptTemplate>;
   updatePromptTemplate(
     id: string,

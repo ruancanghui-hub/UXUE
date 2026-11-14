@@ -64,6 +64,7 @@ describe('parseProject', () => {
       settings: { count: 4, size: 'match', quality: 'high', useTheme: true },
       groupId: null,
       purpose: null,
+      styleRefCardId: null,
     });
   });
 

@@ -24,7 +24,27 @@ export const ASSISTANT_MAX_BLOCKS = 24;
  * chat：普通对话；decompose：拆解第 1 张图（低保真原型）为区块；
  * blockPrompts：第 N 张图是第 N 个区块的截图，为每个区块写一条提示词。
  */
-export type AssistantTask = 'chat' | 'decompose' | 'blockPrompts';
+export type AssistantTask = 'chat' | 'decompose' | 'blockPrompts' | 'elementList';
+
+export type ElementCategory = 'icon' | 'illustration' | 'decor' | 'pattern';
+export const ELEMENT_CATEGORIES: { id: ElementCategory; label: string }[] = [
+  { id: 'icon', label: '图标' },
+  { id: 'illustration', label: '插画' },
+  { id: 'decor', label: '装饰元素' },
+  { id: 'pattern', label: '纹样 / 背景' },
+];
+export const MAX_ELEMENTS = 16;
+
+/** 素材清单里的一项：text 是能直接拿去文生图的提示词 */
+export interface ElementDraft {
+  name: string;
+  category: ElementCategory;
+  /** 在页面里的用途 */
+  usage: string;
+  /** 出自哪条视觉线索 */
+  cue: string;
+  text: string;
+}
 
 /** 为区块写提示词时，每张截图对应的区块信息 */
 export interface AssistantBlockContext {
@@ -57,6 +77,8 @@ export interface AssistantRequest {
   blocks?: AssistantBlockContext[];
   /** decompose / blockPrompts 时的底稿来源 */
   baseSource?: BaseSource;
+  /** elementList 时项目里已有的清单项名字，避免重复 */
+  existingElements?: string[];
 }
 
 /** 助手提议的区块；坐标 0–1000，相对第 1 张图 */
@@ -91,6 +113,7 @@ export interface AssistantResponse {
   theme: ThemeDraft | null;
   prompts: PromptDraft[];
   blocks: BlockDraft[];
+  elements: ElementDraft[];
   provider: 'openai' | 'newapi' | 'mock';
   model: string;
   /** NewAPI 中转按站点计价，拿不到真实单价时为 0 */
@@ -103,7 +126,7 @@ const stringArray = { type: 'array', items: { type: 'string' } };
 export const ASSISTANT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['reply', 'theme', 'prompts', 'blocks'],
+  required: ['reply', 'theme', 'prompts', 'blocks', 'elements'],
   properties: {
     reply: { type: 'string', description: '给用户看的简短中文回复' },
     theme: {
@@ -178,6 +201,22 @@ export const ASSISTANT_SCHEMA = {
         },
       },
     },
+    elements: {
+      type: 'array',
+      description: '只在列素材清单时填写',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['name', 'category', 'usage', 'cue', 'text'],
+        properties: {
+          name: { type: 'string' },
+          category: { type: 'string', enum: ELEMENT_CATEGORIES.map((c) => c.id) },
+          usage: { type: 'string' },
+          cue: { type: 'string' },
+          text: { type: 'string' },
+        },
+      },
+    },
   },
 } as const;
 
@@ -219,7 +258,7 @@ export function sanitizeAssistantOutput(
   raw: unknown,
   imageCount: number,
   maxPrompts: number = ASSISTANT_MAX_PROMPTS,
-): Pick<AssistantResponse, 'reply' | 'theme' | 'prompts' | 'blocks'> {
+): Pick<AssistantResponse, 'reply' | 'theme' | 'prompts' | 'blocks' | 'elements'> {
   const value = (raw ?? {}) as Record<string, unknown>;
   const text = (input: unknown): string => (typeof input === 'string' ? input.trim() : '');
   const strings = (input: unknown): string[] =>
@@ -270,5 +309,17 @@ export function sanitizeAssistantOutput(
     .filter((b): b is BlockDraft => b !== null)
     .slice(0, MAX_BLOCK_DRAFTS);
 
-  return { reply: text(value.reply) || '好了。', theme, prompts, blocks };
+  const elements = (Array.isArray(value.elements) ? value.elements : [])
+    .map((item): ElementDraft | null => {
+      const e = (item ?? {}) as Record<string, unknown>;
+      const name = text(e.name);
+      const body = text(e.text);
+      if (!name || !body) return null;
+      const category = ELEMENT_CATEGORIES.some((c) => c.id === e.category) ? (e.category as ElementCategory) : 'icon';
+      return { name, category, usage: text(e.usage), cue: text(e.cue), text: body };
+    })
+    .filter((e): e is ElementDraft => e !== null)
+    .slice(0, MAX_ELEMENTS);
+
+  return { reply: text(value.reply) || '好了。', theme, prompts, blocks, elements };
 }

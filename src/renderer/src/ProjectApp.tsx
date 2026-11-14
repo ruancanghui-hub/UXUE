@@ -23,6 +23,7 @@ import {
   fitIntoPage,
   newPageFromImageCard,
   setPageBaseFromCard,
+  setStyleBenchmark,
   wireframeFromPage,
   layoutNewCards,
   newPageCard,
@@ -898,6 +899,12 @@ const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function Ri
         },
         update: (id, patch) => doc.apply('编辑区块', updateBlock(doc.get(), id, patch)),
         refreshCrop: (blockId) => void assistant.refreshBlockCrop(blockId),
+      }}
+      elementActions={{
+        busy: assistantBusy,
+        list: (themeId) => void assistant.listElements('', themeId),
+        setBenchmark: (imageCardId) =>
+          doc.apply(imageCardId ? '设为风格基准' : '取消风格基准', setStyleBenchmark(doc.get(), imageCardId)),
       }}
       themeMarkdownActions={{
         copy: async (themeId) => {

@@ -5,7 +5,8 @@ import type { CheckPhase, ImportSource, LaunchFlags, MenuCommand, StartupInfo } 
 import { BENCH_HOST, PROJECT_HOST, type BenchManifest, type BenchReport } from '../shared/bench';
 import type { AssistantRequest } from '../shared/assistant';
 import { safeFileName, type ExportResult, type PageExportPlan } from '../shared/export';
-import type { GenerationRequest } from '../shared/generation';
+import { buildConfigExport, CONFIG_FILE_NAME, parseConfigExport, type ConfigImportResult } from '../shared/configTransfer';
+import type { GenerationConfig, GenerationRequest } from '../shared/generation';
 import { MockAssistant, NewApiAssistant, OpenAIAssistant } from './assistant/providers';
 import { GenerationQueue } from './generation/GenerationQueue';
 import { MockProvider, NewApiProvider, OpenAIProvider, SiliconFlowProvider } from './generation/providers';
@@ -288,6 +289,36 @@ function registerIpc(): void {
       filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'avif', 'tif', 'tiff', 'svg', 'heic'] }],
     });
     return result.canceled ? [] : result.filePaths;
+  });
+  ipcMain.handle('config:export', async (): Promise<string | null> => {
+    const result = await dialog.showSaveDialog({
+      title: '导出模型配置',
+      defaultPath: join(app.getPath('documents'), CONFIG_FILE_NAME),
+      filters: [{ name: '暗夜精灵配置', extensions: ['json'] }],
+    });
+    if (result.canceled || !result.filePath) return null;
+    const { settings, keys } = generationSettings.exportSnapshot();
+    await writeFile(result.filePath, JSON.stringify(buildConfigExport(settings, keys, promptTemplates.list()), null, 2));
+    return result.filePath;
+  });
+  ipcMain.handle('config:import', async (): Promise<(ConfigImportResult & { config: GenerationConfig }) | null> => {
+    const result = await dialog.showOpenDialog({
+      title: '导入模型配置',
+      properties: ['openFile'],
+      filters: [{ name: '暗夜精灵配置', extensions: ['json'] }],
+    });
+    const file = result.filePaths[0];
+    if (result.canceled || !file) return null;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await readFile(file, 'utf8'));
+    } catch {
+      throw new Error('读不了这个文件，或者它不是 JSON');
+    }
+    const data = parseConfigExport(raw);
+    const imported = await generationSettings.importSnapshot(data.settings, data.keys);
+    const templateCount = await promptTemplates.importMany(data.templates);
+    return { config: imported.config, keyCount: imported.keyCount, templateCount };
   });
   ipcMain.handle('clipboard:write', (_event, text: string) => clipboard.writeText(String(text)));
   ipcMain.handle('theme:save-markdown', (_event, name: string, markdown: string) => projects.saveThemeMarkdown(name, markdown));

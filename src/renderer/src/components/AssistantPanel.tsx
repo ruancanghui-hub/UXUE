@@ -101,6 +101,17 @@ export function AssistantPanel({ assistant, state, selectedIds, projectName, pro
         <button disabled={!images.length || busy} onClick={() => prefill('给选中的图各写一条提示词：')}>
           给选中的图各写一条提示词
         </button>
+        <button
+          disabled={!theme || busy}
+          title="输入框里的文字会当作范围说明，比如「个人页要用的」"
+          onClick={() => {
+            const scope = draft;
+            setDraft('');
+            void assistant.listElements(scope);
+          }}
+        >
+          从主题卡列出素材清单
+        </button>
         {selectedPage && (
           <>
             <button disabled={busy || !selectedPage.base} onClick={() => void assistant.decomposePage(selectedPage.id)}>

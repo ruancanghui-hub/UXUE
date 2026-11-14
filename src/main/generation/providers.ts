@@ -10,6 +10,7 @@ import {
 } from '../../shared/generation';
 import type { MockGenerateResult, PreparedInput } from '../../shared/workerProtocol';
 import { httpFetch } from '../http';
+import { buildMultipart } from './multipart';
 import type { ImageWorkerClient } from '../imageWorkerClient';
 
 export interface ProviderResult {
@@ -279,6 +280,8 @@ export class NewApiProvider implements ImageProvider {
       body.output_format = 'png';
     }
 
+    // 中转的 /images/edits 按 NewAPI 文档只收 multipart/form-data（图片是文件字段）；文生图仍是 JSON
+    let payload: { body: string | Buffer; contentType: string };
     if (request.inputs.length > 0) {
       if (request.inputs.length > 16) throw new Error('一次最多接受 16 张输入图');
       const prepared = await Promise.all(
@@ -286,15 +289,27 @@ export class NewApiProvider implements ImageProvider {
           this.worker.request<PreparedInput>({ type: 'prepareInput', path: join(request.projectDir, input.file) }),
         ),
       );
-      body.images = prepared.map((image) => ({ image_url: `data:${image.mime};base64,${image.base64}` }));
+      const field = prepared.length === 1 ? 'image' : 'image[]';
+      const files = prepared.map((image, i) => ({
+        field,
+        filename: `image-${i + 1}.png`,
+        contentType: image.mime,
+        data: new Uint8Array(Buffer.from(image.base64, 'base64')),
+      }));
+      const fields = Object.fromEntries(
+        Object.entries(body).filter((entry): entry is [string, string | number] => typeof entry[1] === 'string' || typeof entry[1] === 'number'),
+      );
+      payload = buildMultipart(fields, files);
+    } else {
+      payload = { body: JSON.stringify(body), contentType: 'application/json' };
     }
 
     const endpoint = request.inputs.length > 0 ? '/images/edits' : '/images/generations';
     const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
     const response = await httpFetch('请求 NewAPI 生图', `${base}${endpoint}`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': payload.contentType },
+      body: payload.body,
       signal: AbortSignal.any([signal, timeout]),
     });
     const json = (await response.json().catch(() => null)) as {
@@ -388,9 +403,13 @@ export class NewApiProvider implements ImageProvider {
 export function newApiErrorMessage(message: string | undefined, status: number): string {
   if (!message) return `NewAPI 返回 HTTP ${status}`;
   const quota = /quota|insufficient|balance|credit|余额|额度/i.test(message);
-  return quota
-    ? `NewAPI：额度不足。若账户有余额，多半是这个 Key（令牌）设了额度上限——到站点「令牌」页把它改成无限额度或调高（${message}）`
-    : `NewAPI：${message}`;
+  if (quota) {
+    return `NewAPI：额度不足。若账户有余额，多半是这个 Key（令牌）设了额度上限——到站点「令牌」页把它改成无限额度或调高（${message}）`;
+  }
+  if (/no usable image|upload or identify the image|image target/i.test(message)) {
+    return `NewAPI：中转没收到参考图。请确认中转站和这个模型支持 /images/edits，或解绑参考图改用文生图（${message}）`;
+  }
+  return `NewAPI：${message}`;
 }
 
 function mapDalleQuality(quality: Quality): 'standard' | 'hd' {
