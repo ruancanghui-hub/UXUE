@@ -31,7 +31,12 @@ const flags: LaunchFlags = {
   m2Check: checkPhase('m2-check'),
   m3Check: checkPhase('m3-check'),
   m4Check: checkPhase('m4-check'),
-  realCheck: process.argv.includes('--real-check'),
+  realCheck: ((): LaunchFlags['realCheck'] => {
+    const arg = process.argv.find((a) => a === '--real-check' || a.startsWith('--real-check='));
+    if (!arg) return false;
+    const value = arg.split('=')[1];
+    return value === 'assistant' || value === 'image' ? value : 'all';
+  })(),
 };
 const checkName = flags.m1Check ? 'm1' : flags.m2Check ? 'm2' : flags.m3Check ? 'm3' : flags.m4Check ? 'm4' : flags.realCheck ? 'real' : null;
 const checkPhaseValue = flags.m1Check ?? flags.m2Check ?? flags.m3Check ?? flags.m4Check ?? (flags.realCheck ? 'write' : null);

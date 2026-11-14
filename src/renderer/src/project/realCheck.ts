@@ -34,6 +34,13 @@ export async function runRealCheck({ engine, session, tracker, assistant, import
   };
 
   const config = await window.anye.getGenerationConfig();
+  const only = window.anye.flags.realCheck;
+  const doc = session.doc;
+  if (only === 'assistant') {
+    if (config.hasApiKey) await checkAssistant();
+    else check('助手需要 OpenAI Key', false);
+    return finish();
+  }
   const imageProvider = config.provider;
   const imageKey = imageProvider === 'siliconflow' ? config.hasSiliconflowKey : imageProvider === 'openai' ? config.hasApiKey : false;
   check('生图供应商是真实服务并且填了 Key', imageKey, `生图供应商 ${imageProvider}`);
@@ -46,9 +53,8 @@ export async function runRealCheck({ engine, session, tracker, assistant, import
     return finish();
   }
 
-  const doc = session.doc;
-  if (config.assistantProvider === 'openai' && config.hasApiKey) await checkAssistant();
-  else timings.assistant = '助手设成了本地模拟或没有 OpenAI Key，跳过';
+  if (only === 'all' && config.assistantProvider === 'openai' && config.hasApiKey) await checkAssistant();
+  else if (only === 'all') timings.assistant = '助手设成了本地模拟或没有 OpenAI Key，跳过';
 
   async function checkAssistant(): Promise<void> {
   const askStart = performance.now();

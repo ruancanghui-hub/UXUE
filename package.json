@@ -19,7 +19,9 @@
     "check:m2": "electron-vite build && electron . --m2-check=write && electron . --m2-check=verify; node scripts/print-check.mjs m2",
     "check:m3": "electron-vite build && electron . --m3-check=write && electron . --m3-check=verify; node scripts/print-check.mjs m3",
     "check:m4": "electron-vite build && electron . --m4-check=write && electron . --m4-check=verify; node scripts/print-check.mjs m4",
-    "check:real": "electron-vite build && electron . --real-check; node scripts/print-check.mjs real"
+    "check:real": "electron-vite build && electron . --real-check; node scripts/print-check.mjs real",
+    "check:real:assistant": "electron-vite build && electron . --real-check=assistant; node scripts/print-check.mjs real",
+    "check:real:image": "electron-vite build && electron . --real-check=image; node scripts/print-check.mjs real"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
