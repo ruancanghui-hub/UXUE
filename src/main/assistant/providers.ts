@@ -1,10 +1,14 @@
 import { join } from 'node:path';
 import {
+  ASSISTANT_MAX_BLOCKS,
+  ASSISTANT_MAX_PROMPTS,
   ASSISTANT_SCHEMA,
   assistantCostUsd,
+  normalizeBlockCoordinates,
   sanitizeAssistantOutput,
   type AssistantRequest,
   type AssistantResponse,
+  type BlockDraft,
   type PromptDraft,
   type ThemeDraft,
 } from '../../shared/assistant';
@@ -37,7 +41,31 @@ const INSTRUCTIONS = `你是「暗夜精灵」里的设计助手，帮设计师�
 三、为选中的图写提示词（prompts）：每张图一条，inputIndex 填那张图的序号；text 里用 {{Image 1}} 指代这张图——每张提示词卡只绑定这一张图，所以永远写 {{Image 1}}。提示词要结构化、具体、可执行：说清楚保留什么、改变什么、不要什么（不要文字、Logo、多余的人物和元素）。
 
 有生效主题卡时，提示词的风格要与它一致，但不要重复主题卡里的规则，生成时系统会自动把规则附加在后面。
+
+四、拆解页面（任务为「拆解」时，blocks）：第 1 张图是一个 APP / 桌面页面的低保真原型（线框或截图）。把页面里需要单独生成图片素材的块框出来：
+- type 只能是：hero（顶部视觉 / Banner / 大主视觉）、icon（金刚位等功能入口图标）、tile（瓷片区、卡片里的插画图形）、tabbar（底部导航图标）、illustration（登录页、空状态等主插图）、other。
+- 一排图标里每个图标单独一个区块，框住图标本身（不含下方文字）；同一排的 group 填同一个组名，比如「金刚位」「底部导航」；不成排的 group 为 null。
+- 纯文字、输入框、按钮、列表文字、状态栏不要框。区块不要嵌套。
+- x、y、width、height 是第 1 张图上的像素坐标（图的尺寸写在图片说明里），左上角为原点；框要紧贴目标的外沿，不要偏移，也不要包进旁边的文字和按钮。
+- name 用简短中文，比如「Banner」「金刚位 1 · 热门」。这个任务里 theme 为 null、prompts 为空数组。
+
+五、为区块写提示词（任务为「为区块写提示词」时，prompts）：第 N 张图是第 N 个区块从原型裁下的截图，上下文里写了每个区块的名字、类型和组。
+- 每个区块一条提示词，inputIndex 填 N；text 用 {{Image 1}} 指代这张截图（每张提示词卡只绑定这一张）。
+- 说清楚：沿用截图的构图、比例、主体位置和留白；画什么内容（结合区块名字和产品主题）；不要什么（文字、Logo、水印、多余元素）。
+- hero：画面饱满，在原型里放标题文字的位置留出有氛围的视觉空区（不是纯白）。
+- icon / tabbar：单个物件居中，造型简洁、识别度高，纯色背景（用生效主题卡里的浅底或暖白色），同组图标视觉重量、视角、细节密度一致。
+- tile / illustration：主体明确、构图完整，背景和页面底色协调。
+- 底稿是「借鉴的成品截图」时，只借鉴布局和构图，不照搬截图里的具体内容、元素、角色和文字。
+- 这个任务里 theme 为 null、blocks 为空数组。
+
+不是拆解任务时 blocks 给空数组。
 reply 用一两句中文说明你做了什么。`;
+
+const TASK_LABELS = { chat: '普通对话', decompose: '拆解', blockPrompts: '为区块写提示词' } as const;
+/** 区块截图本来就小，缩到长边 512 就够看清 */
+const BLOCK_IMAGE_EDGE = 512;
+/** 拆解时把原型放大或缩小到长边 1024：太小的截图模型看不清图标边界 */
+const DECOMPOSE_IMAGE_EDGE = 1024;
 
 export interface AssistantProvider {
   ask(request: AssistantRequest, model: string, signal: AbortSignal): Promise<AssistantResponse>;
@@ -58,13 +86,14 @@ export class OpenAIAssistant implements AssistantProvider {
         this.worker.request<PreparedInput>({
           type: 'prepareInput',
           path: join(request.projectDir, image.file),
-          maxEdge: CONTEXT_IMAGE_EDGE,
+          maxEdge: imageEdge(request),
+          enlarge: request.task === 'decompose',
         }),
       ),
     );
     const content: Record<string, unknown>[] = [{ type: 'input_text', text: describeContext(request) }];
     request.images.forEach((image, i) => {
-      content.push({ type: 'input_text', text: `第 ${image.index} 张图：「${image.name}」` });
+      content.push({ type: 'input_text', text: imageLabel(request, image.index, image.name, images[i]) });
       content.push({ type: 'input_image', image_url: `data:${images[i].mime};base64,${images[i].base64}`, detail: 'auto' });
     });
     content.push({ type: 'input_text', text: `用户这次的要求：${request.message}` });
@@ -77,7 +106,7 @@ export class OpenAIAssistant implements AssistantProvider {
         instructions: INSTRUCTIONS,
         input: [{ role: 'user', content }],
         text: { format: { type: 'json_schema', name: 'assistant_actions', strict: true, schema: ASSISTANT_SCHEMA } },
-        max_output_tokens: 6000,
+        max_output_tokens: maxOutputTokens(request),
         store: false,
       }),
       signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]),
@@ -103,7 +132,7 @@ export class OpenAIAssistant implements AssistantProvider {
     }
     const usage = json?.usage;
     return {
-      ...sanitizeAssistantOutput(parsed, request.images.length),
+      ...sanitizeAssistantOutput(normalizeBlockCoordinates(parsed, images[0]?.width ?? 1000, images[0]?.height ?? 1000), request.images.length, maxPromptsFor(request)),
       provider: 'openai',
       model,
       costUsd: usage ? assistantCostUsd(model, usage.input_tokens ?? 0, usage.output_tokens ?? 0) : 0,
@@ -132,13 +161,14 @@ export class NewApiAssistant implements AssistantProvider {
         this.worker.request<PreparedInput>({
           type: 'prepareInput',
           path: join(request.projectDir, image.file),
-          maxEdge: CONTEXT_IMAGE_EDGE,
+          maxEdge: imageEdge(request),
+          enlarge: request.task === 'decompose',
         }),
       ),
     );
     const content: Record<string, unknown>[] = [{ type: 'text', text: describeContext(request) }];
     request.images.forEach((image, i) => {
-      content.push({ type: 'text', text: `第 ${image.index} 张图：「${image.name}」` });
+      content.push({ type: 'text', text: imageLabel(request, image.index, image.name, images[i]) });
       content.push({ type: 'image_url', image_url: { url: `data:${images[i].mime};base64,${images[i].base64}` } });
     });
     content.push({ type: 'text', text: `用户这次的要求：${request.message}` });
@@ -152,7 +182,7 @@ export class NewApiAssistant implements AssistantProvider {
           { role: 'system', content: `${INSTRUCTIONS}\n\n${JSON_OUTPUT_RULE}` },
           { role: 'user', content },
         ],
-        max_tokens: 6000,
+        max_tokens: maxOutputTokens(request),
       }),
       signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]),
     });
@@ -168,7 +198,7 @@ export class NewApiAssistant implements AssistantProvider {
     const parsed = extractJsonObject(text);
     if (parsed === null) throw new Error('NewAPI 返回的不是合法的 JSON，可以换一个对话模型再试');
     return {
-      ...sanitizeAssistantOutput(parsed, request.images.length),
+      ...sanitizeAssistantOutput(normalizeBlockCoordinates(parsed, images[0]?.width ?? 1000, images[0]?.height ?? 1000), request.images.length, maxPromptsFor(request)),
       provider: 'newapi',
       model,
       costUsd: 0,
@@ -214,8 +244,29 @@ interface OpenAIResponse {
   error?: { message?: string };
 }
 
+function imageEdge(request: AssistantRequest): number {
+  if (request.task === 'decompose') return DECOMPOSE_IMAGE_EDGE;
+  return request.task === 'blockPrompts' ? BLOCK_IMAGE_EDGE : CONTEXT_IMAGE_EDGE;
+}
+
+function imageLabel(request: AssistantRequest, index: number, name: string, image: PreparedInput): string {
+  if (request.task === 'decompose') return `第 ${index} 张图：「${name}」，尺寸 ${image.width} × ${image.height} 像素`;
+  const block = request.blocks?.find((b) => b.index === index);
+  if (!block) return `第 ${index} 张图：「${name}」`;
+  return `第 ${index} 张图：区块「${block.name}」，类型 ${block.type}${block.group ? `，组「${block.group}」` : ''}`;
+}
+
+function maxPromptsFor(request: AssistantRequest): number {
+  return request.task === 'blockPrompts' ? ASSISTANT_MAX_BLOCKS : ASSISTANT_MAX_PROMPTS;
+}
+
+function maxOutputTokens(request: AssistantRequest): number {
+  return request.task === 'blockPrompts' ? 16_000 : 6000;
+}
+
 function describeContext(request: AssistantRequest): string {
-  const lines = [`项目：${request.projectName}`];
+  const lines = [`项目：${request.projectName}`, `任务：${TASK_LABELS[request.task ?? 'chat']}`];
+  if (request.baseSource) lines.push(`底稿来源：${request.baseSource === 'borrowed' ? '借鉴的成品截图' : '自己的线框'}`);
   lines.push(request.activeTheme ? `当前生效的主题卡：\n${request.activeTheme}` : '当前没有生效的主题卡。');
   if (request.selectedPrompts.length) {
     lines.push('选中的提示词卡：');
@@ -251,6 +302,40 @@ const SUSHI_THEME: ThemeDraft = {
   },
 };
 
+/** 本地模拟的拆解结果：一张常见的 APP 首页 */
+const MOCK_HOME_BLOCKS: BlockDraft[] = [
+  { name: 'Banner', type: 'hero', group: null, x: 40, y: 110, width: 920, height: 230 },
+  ...['热门', '上新', '推荐', '全部'].map((label, i) => ({
+    name: `金刚位 ${i + 1} · ${label}`,
+    type: 'icon' as const,
+    group: '金刚位',
+    x: 70 + i * 230,
+    y: 380,
+    width: 170,
+    height: 80,
+  })),
+  { name: '瓷片 · 左', type: 'tile', group: '瓷片', x: 40, y: 520, width: 450, height: 220 },
+  { name: '瓷片 · 右', type: 'tile', group: '瓷片', x: 510, y: 520, width: 450, height: 220 },
+  ...['首页', '分类', '购物车', '我的'].map((label, i) => ({
+    name: `底部导航 · ${label}`,
+    type: 'tabbar' as const,
+    group: '底部导航',
+    x: 80 + i * 240,
+    y: 925,
+    width: 90,
+    height: 45,
+  })),
+];
+
+const MOCK_BLOCK_PROMPTS: Record<BlockDraft['type'], string> = {
+  hero: '画一张饱满的横幅主视觉，标题文字的位置留出有氛围的视觉空区。',
+  icon: '画一个居中的单个功能图标，造型简洁、识别度高，纯色浅底背景，同组图标视觉重量一致。',
+  tile: '画一张瓷片插画，主体明确、构图完整，背景与页面底色协调。',
+  tabbar: '画一个简洁的底部导航图标，单个物件居中，纯色浅底背景，同组图标风格一致。',
+  illustration: '画一张主插图，主体明确、构图完整，背景与页面底色协调。',
+  other: '按截图的构图画出这一块的素材。',
+};
+
 export class MockAssistant implements AssistantProvider {
   async ask(request: AssistantRequest, _model: string, signal: AbortSignal): Promise<AssistantResponse> {
     await new Promise<void>((resolve, reject) => {
@@ -261,7 +346,20 @@ export class MockAssistant implements AssistantProvider {
       });
     });
     const message = request.message;
-    const base = { provider: 'mock' as const, model: 'local-mock', costUsd: 0 };
+    const base = { provider: 'mock' as const, model: 'local-mock', costUsd: 0, blocks: [] as BlockDraft[] };
+
+    if (request.task === 'decompose') {
+      return { ...base, reply: `（本地模拟）把页面拆成了 ${MOCK_HOME_BLOCKS.length} 个区块，可以拖动、缩放或删掉不需要的。`, theme: null, prompts: [], blocks: MOCK_HOME_BLOCKS };
+    }
+    if (request.task === 'blockPrompts') {
+      const borrowed = request.baseSource === 'borrowed' ? '只借鉴截图的布局和构图，不照搬里面的内容和文字；' : '';
+      const prompts: PromptDraft[] = (request.blocks ?? []).map((block) => ({
+        name: block.name,
+        text: `${MOCK_BLOCK_PROMPTS[block.type]}（区块「${block.name}」）沿用 {{Image 1}} 的构图、比例和留白；${borrowed}不要文字、Logo 和水印。`,
+        inputIndex: block.index,
+      }));
+      return { ...base, reply: `（本地模拟）为 ${prompts.length} 个区块各写了一条提示词，已经绑定各自的截图。`, theme: null, prompts };
+    }
 
     if (/主题|视觉方向|品牌线索/.test(message)) {
       const fromImage = request.images.length === 1;

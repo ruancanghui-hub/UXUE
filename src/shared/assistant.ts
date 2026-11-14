@@ -1,4 +1,4 @@
-import { normalizeHex, type ThemeColor, type ThemeRules } from './project';
+import { BLOCK_TYPES, normalizeHex, type BaseSource, type BlockType, type ThemeColor, type ThemeRules } from './project';
 
 /** 助手用的文本 / 看图模型（2026-11）：每百万 token 的输入、输出价格 */
 export const ASSISTANT_MODELS = [
@@ -17,6 +17,22 @@ export function assistantCostUsd(model: string, inputTokens: number, outputToken
 /** 一次最多带给助手的图片数量 */
 export const ASSISTANT_MAX_IMAGES = 8;
 export const ASSISTANT_MAX_PROMPTS = 12;
+/** 为区块写提示词时一次最多的区块数（截图很小，可以多带一些） */
+export const ASSISTANT_MAX_BLOCKS = 24;
+
+/**
+ * chat：普通对话；decompose：拆解第 1 张图（低保真原型）为区块；
+ * blockPrompts：第 N 张图是第 N 个区块的截图，为每个区块写一条提示词。
+ */
+export type AssistantTask = 'chat' | 'decompose' | 'blockPrompts';
+
+/** 为区块写提示词时，每张截图对应的区块信息 */
+export interface AssistantBlockContext {
+  index: number;
+  name: string;
+  type: BlockType;
+  group: string | null;
+}
 
 export interface AssistantContextImage {
   /** 在这次请求里的序号，从 1 开始；提示词卡草稿用它指明绑定哪张图 */
@@ -35,6 +51,23 @@ export interface AssistantRequest {
   /** 生效主题卡的文字版（themeSuffix） */
   activeTheme: string | null;
   selectedPrompts: { name: string; text: string }[];
+  /** 缺省为 chat */
+  task?: AssistantTask;
+  /** blockPrompts 时每张图对应的区块 */
+  blocks?: AssistantBlockContext[];
+  /** decompose / blockPrompts 时的底稿来源 */
+  baseSource?: BaseSource;
+}
+
+/** 助手提议的区块；坐标 0–1000，相对第 1 张图 */
+export interface BlockDraft {
+  name: string;
+  type: BlockType;
+  group: string | null;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 export interface ThemeDraft {
@@ -57,6 +90,7 @@ export interface AssistantResponse {
   reply: string;
   theme: ThemeDraft | null;
   prompts: PromptDraft[];
+  blocks: BlockDraft[];
   provider: 'openai' | 'newapi' | 'mock';
   model: string;
   /** NewAPI 中转按站点计价，拿不到真实单价时为 0 */
@@ -69,7 +103,7 @@ const stringArray = { type: 'array', items: { type: 'string' } };
 export const ASSISTANT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['reply', 'theme', 'prompts'],
+  required: ['reply', 'theme', 'prompts', 'blocks'],
   properties: {
     reply: { type: 'string', description: '给用户看的简短中文回复' },
     theme: {
@@ -126,14 +160,66 @@ export const ASSISTANT_SCHEMA = {
         },
       },
     },
+    blocks: {
+      type: 'array',
+      description: '只在拆解页面时填写；坐标是第 1 张图上的像素（图的尺寸写在上下文里），左上角为原点',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['name', 'type', 'group', 'x', 'y', 'width', 'height'],
+        properties: {
+          name: { type: 'string' },
+          type: { type: 'string', enum: BLOCK_TYPES.map((t) => t.id) },
+          group: { type: ['string', 'null'] },
+          x: { type: 'number' },
+          y: { type: 'number' },
+          width: { type: 'number' },
+          height: { type: 'number' },
+        },
+      },
+    },
   },
 } as const;
 
-/** 模型输出再过一遍业务校验：颜色必须是 #RRGGBB，绑定序号必须在范围内，数量有上限 */
+const MAX_BLOCK_DRAFTS = 40;
+
+/**
+ * 把助手给的区块坐标统一换成 0–1000（sanitizeAssistantOutput 之前调用）。
+ * 要求模型给像素，但不同模型会自作主张给 0–1 小数或 0–1000，这里按取值范围判断：
+ * 全部 ≤ 1 当小数；不超出图片像素范围当像素；否则当 0–1000。
+ */
+export function normalizeBlockCoordinates(raw: unknown, imageWidth: number, imageHeight: number): unknown {
+  if (!raw || typeof raw !== 'object' || !Array.isArray((raw as Record<string, unknown>).blocks)) return raw;
+  const value = raw as Record<string, unknown>;
+  const num = (input: unknown): number => (typeof input === 'number' && Number.isFinite(input) ? input : 0);
+  const items = (value.blocks as unknown[]).map((item) => (item ?? {}) as Record<string, unknown>);
+  if (items.length === 0) return raw;
+  const right = Math.max(...items.map((b) => num(b.x) + num(b.width)));
+  const bottom = Math.max(...items.map((b) => num(b.y) + num(b.height)));
+  const [sx, sy] =
+    right <= 1.01 && bottom <= 1.01
+      ? [1000, 1000]
+      : right <= imageWidth * 1.03 && bottom <= imageHeight * 1.03
+        ? [1000 / imageWidth, 1000 / imageHeight]
+        : [1, 1];
+  return {
+    ...value,
+    blocks: items.map((b) => ({
+      ...b,
+      x: num(b.x) * sx,
+      y: num(b.y) * sy,
+      width: num(b.width) * sx,
+      height: num(b.height) * sy,
+    })),
+  };
+}
+
+/** 模型输出再过一遍业务校验：颜色必须是 #RRGGBB，绑定序号必须在范围内，区块坐标夹在 0–1000，数量有上限 */
 export function sanitizeAssistantOutput(
   raw: unknown,
   imageCount: number,
-): Pick<AssistantResponse, 'reply' | 'theme' | 'prompts'> {
+  maxPrompts: number = ASSISTANT_MAX_PROMPTS,
+): Pick<AssistantResponse, 'reply' | 'theme' | 'prompts' | 'blocks'> {
   const value = (raw ?? {}) as Record<string, unknown>;
   const text = (input: unknown): string => (typeof input === 'string' ? input.trim() : '');
   const strings = (input: unknown): string[] =>
@@ -166,7 +252,23 @@ export function sanitizeAssistantOutput(
       return { name: text(p.name) || '提示词', text: body, inputIndex: index && index >= 1 && index <= imageCount ? index : null };
     })
     .filter((p): p is PromptDraft => p !== null)
-    .slice(0, ASSISTANT_MAX_PROMPTS);
+    .slice(0, maxPrompts);
 
-  return { reply: text(value.reply) || '好了。', theme, prompts };
+  const clamp = (input: unknown): number =>
+    typeof input === 'number' && Number.isFinite(input) ? Math.min(1000, Math.max(0, Math.round(input))) : 0;
+  const blocks = (Array.isArray(value.blocks) ? value.blocks : [])
+    .map((item): BlockDraft | null => {
+      const b = (item ?? {}) as Record<string, unknown>;
+      const x = clamp(b.x);
+      const y = clamp(b.y);
+      const width = Math.min(clamp(b.width), 1000 - x);
+      const height = Math.min(clamp(b.height), 1000 - y);
+      if (width < 5 || height < 5) return null;
+      const type = BLOCK_TYPES.some((t) => t.id === b.type) ? (b.type as BlockType) : 'other';
+      return { name: text(b.name), type, group: text(b.group) || null, x, y, width, height };
+    })
+    .filter((b): b is BlockDraft => b !== null)
+    .slice(0, MAX_BLOCK_DRAFTS);
+
+  return { reply: text(value.reply) || '好了。', theme, prompts, blocks };
 }

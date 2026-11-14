@@ -6,7 +6,7 @@ import type { JobUpdate } from '../shared/generation';
 const flagArg = process.argv.find((arg) => arg.startsWith('--anye-flags='));
 const flags: LaunchFlags = flagArg
   ? (JSON.parse(flagArg.slice('--anye-flags='.length)) as LaunchFlags)
-  : { uncapped: false, autoBench: false, m1Check: null, m2Check: null, m3Check: null, m4Check: null, realCheck: false };
+  : { uncapped: false, autoBench: false, m1Check: null, m2Check: null, m3Check: null, m4Check: null, m5Check: null, realCheck: false, checkImage: null };
 
 function subscribe<T>(channel: string, listener: (value: T) => void): () => void {
   const handler = (_event: IpcRendererEvent, value: T): void => listener(value);
@@ -26,6 +26,8 @@ const api: AnyeApi = {
   importImages: (sources) => ipcRenderer.invoke('images:import', sources),
   getPathForFile: (file) => webUtils.getPathForFile(file),
   revealInFinder: (path) => ipcRenderer.send('shell:reveal', path),
+  copyText: (text) => ipcRenderer.invoke('clipboard:write', text),
+  saveThemeMarkdown: (name, markdown) => ipcRenderer.invoke('theme:save-markdown', name, markdown),
   onCacheReady: (listener) => subscribe<string>('project:cache-ready', listener),
   onMenuCommand: (listener) => subscribe<MenuCommand>('menu:command', listener),
   onProjectFsChange: (listener) => subscribe<ProjectFsChange>('project:fs-change', listener),

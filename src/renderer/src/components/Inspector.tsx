@@ -14,8 +14,12 @@ import {
 } from '../../../shared/generation';
 import type { ExportResult } from '../../../shared/export';
 import {
+  BLOCK_TYPES,
+  blockTypeLabel,
   currentVersion,
   DEVICE_PRESETS,
+  isBlockCard,
+  isBlockCropStale,
   isGroupCard,
   isImageCard,
   isPageCard,
@@ -27,6 +31,8 @@ import {
   refDisplayVersion,
   RULE_LABELS,
   themeSuffix,
+  type BlockCard,
+  type BlockType,
   type GroupCard,
   type ImageCard,
   type PageCard,
@@ -38,7 +44,7 @@ import {
 } from '../../../shared/project';
 import { isImageCardStale, regenPromptIdsForSelection } from '../../../shared/stale';
 import type { DocumentStore } from '../document/DocumentStore';
-import { updatePrompt, type DocState } from '../document/operations';
+import { blockHasOutput, isWireframeOutput, pageBlocks, updatePrompt, type DocState } from '../document/operations';
 import { activeTheme, effectiveConfig } from '../project/GenerationTracker';
 import type { TrackedJob } from '../project/GenerationTracker';
 import { thumbnailUrl } from '../project/thumbnails';
@@ -83,6 +89,36 @@ interface InspectorProps {
   onLockRef(refId: string, lockedVersionId: string | null): void;
   onRegenDownstream(promptIds: string[]): void;
   exports: ReadonlyMap<string, ExportResult | 'running' | { error: string }>;
+  blockActions: BlockActions;
+  wireframeActions: WireframeActions;
+  themeMarkdownActions: ThemeMarkdownActions;
+}
+
+/** 主题说明：copy 写剪贴板；save 写进项目 themes/，返回完整路径 */
+export interface ThemeMarkdownActions {
+  copy(themeId: string): Promise<void>;
+  save(themeId: string): Promise<string>;
+}
+
+/** 转线框与"拿图像卡做页面" */
+export interface WireframeActions {
+  /** 在图像卡右侧建转线框提示词卡并发起生成 */
+  fromImage(imageCardId: string): void;
+  /** 从页面框的低保真原型发起，出图后自动换底稿 */
+  fromPage(pageId: string): void;
+  newPage(imageCardId: string): void;
+  /** 用 baseCardId 那张图像卡的当前版本做底稿 */
+  useBaseCard(pageId: string): void;
+}
+
+/** 区块相关的操作：拆解和写提示词要走助手，忙的时候按钮置灰 */
+export interface BlockActions {
+  busy: boolean;
+  decompose(pageId: string): void;
+  writePrompts(pageId: string): void;
+  addBlock(pageId: string): void;
+  update(id: string, patch: Partial<Pick<BlockCard, 'name' | 'blockType' | 'group'>>): void;
+  refreshCrop(blockId: string): void;
 }
 
 export const Inspector = forwardRef<InspectorHandle, InspectorProps>(function Inspector(props, ref) {
@@ -108,6 +144,7 @@ export const Inspector = forwardRef<InspectorHandle, InspectorProps>(function In
       {only && isPageCard(only) && <PageInfo card={only} {...props} />}
       {only && isRefCard(only) && <RefInfo card={only} {...props} />}
       {only && isGroupCard(only) && <GroupInfo card={only} {...props} />}
+      {only && isBlockCard(only) && <BlockInfo card={only} {...props} />}
       {selected.length > 1 && (
         <section className="inspector-section">
           <div className="panel-title">已选 {selected.length} 个对象</div>
@@ -242,6 +279,8 @@ function ImageInfo(props: InspectorProps & { card: ImageCard }) {
       </section>
 
       <PlaceInPage {...props} />
+
+      <WireframeSection {...props} />
 
       <section className="inspector-section">
         <CardActions {...props} />
@@ -404,6 +443,32 @@ function PromptInfo(props: InspectorProps & { card: PromptCard; textareaRef: Rea
   );
 }
 
+function WireframeSection(props: InspectorProps & { card: ImageCard }) {
+  const { card, state, wireframeActions } = props;
+  const wireframe = isWireframeOutput(state, card.id);
+  const missing = props.missingVersionIds.has(card.currentVersionId);
+  return (
+    <section className="inspector-section">
+      <div className="panel-title">线框与页面</div>
+      {wireframe ? (
+        <p className="hint">这是转线框的结果。用它新建页面框时，底稿来源会设成「借鉴的截图」。</p>
+      ) : (
+        <p className="hint">「转线框」用当前生图供应商把这张截图改画成黑白线描的低保真原型：保留布局和原文字，不附加主题规则。</p>
+      )}
+      <div className="button-row tight">
+        {!wireframe && (
+          <button disabled={missing} onClick={() => wireframeActions.fromImage(card.id)}>
+            转线框
+          </button>
+        )}
+        <button disabled={missing} onClick={() => wireframeActions.newPage(card.id)}>
+          用这张图新建页面框
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function PlaceInPage(props: InspectorProps & { card: ImageCard }) {
   const pages = props.state.cards.filter(isPageCard);
   const [pageId, setPageId] = useState(pages[0]?.id ?? '');
@@ -435,6 +500,7 @@ function PageInfo(props: InspectorProps & { card: PageCard }) {
   const logical = pageLogicalSize(card);
   const refs = state.cards.filter((c): c is RefCard => isRefCard(c) && c.pageId === card.id);
   const exported = props.exports.get(card.id);
+  const baseCard = card.baseCardId ? state.cards.find((c): c is ImageCard => c.id === card.baseCardId && isImageCard(c)) : undefined;
   return (
     <>
       <section className="inspector-section">
@@ -478,9 +544,20 @@ function PageInfo(props: InspectorProps & { card: PageCard }) {
         )}
         <div className="button-row tight">
           <button onClick={() => props.onReplaceLowFi(card.id)}>{card.base ? '替换…' : '选择图片…'}</button>
-          {card.base && <button onClick={() => props.onUpdatePage(card.id, { base: null })}>移除</button>}
+          {card.base && <button onClick={() => props.onUpdatePage(card.id, { base: null, baseCardId: null })}>移除</button>}
+          {card.base && (
+            <button disabled={!!card.wireframePromptId} onClick={() => props.wireframeActions.fromPage(card.id)}>
+              {card.wireframePromptId ? '转线框中…' : '转线框'}
+            </button>
+          )}
         </div>
+        {card.wireframePromptId && <p className="hint">线框出图后会自动换成这里的低保真原型。</p>}
+        {baseCard && baseCard.currentVersionId !== card.base?.id && (
+          <button onClick={() => props.wireframeActions.useBaseCard(card.id)}>用「{baseCard.name}」的当前版本做底稿</button>
+        )}
       </section>
+
+      <PageBlocks {...props} />
 
       <section className="inspector-section">
         <div className="panel-title">
@@ -515,6 +592,149 @@ function PageInfo(props: InspectorProps & { card: PageCard }) {
               在 Finder 中显示
             </button>
           </>
+        )}
+      </section>
+
+      <section className="inspector-section">
+        <CardActions {...props} />
+      </section>
+    </>
+  );
+}
+
+function PageBlocks(props: InspectorProps & { card: PageCard }) {
+  const { card, state, blockActions } = props;
+  const blocks = pageBlocks(state, card.id);
+  const withPrompt = blocks.filter((block) => block.promptCardId).length;
+  return (
+    <section className="inspector-section">
+      <div className="panel-title">
+        区块 <span className="dim">{blocks.length}</span>
+      </div>
+      <div className="field">
+        <span className="field-label">底稿来源</span>
+        <div className="segmented small">
+          {(['own', 'borrowed'] as const).map((source) => (
+            <button
+              key={source}
+              className={card.baseSource === source ? 'active' : ''}
+              onClick={() => props.onUpdatePage(card.id, { baseSource: source })}
+            >
+              {source === 'own' ? '自己的线框' : '借鉴的截图'}
+            </button>
+          ))}
+        </div>
+      </div>
+      <p className="hint">
+        「拆解」让助手看低保真原型，把要单独生成的块框出来（已经出图的区块会保留）；调整好之后点「为区块写提示词」，会裁出每块的截图并写好绑定截图的提示词卡，放在核心素材区。生成后结果自动放回区块位置。
+      </p>
+      <div className="button-row tight">
+        <button disabled={blockActions.busy || !card.base} onClick={() => blockActions.decompose(card.id)}>
+          {blockActions.busy ? '助手忙…' : '拆解'}
+        </button>
+        <button
+          className="primary"
+          disabled={blockActions.busy || blocks.length === 0 || withPrompt === blocks.length}
+          onClick={() => blockActions.writePrompts(card.id)}
+        >
+          为区块写提示词
+        </button>
+        <button onClick={() => blockActions.addBlock(card.id)}>新增区块</button>
+      </div>
+      {blocks.map((block) => {
+        const stale = isBlockCropStale(block, card);
+        const done = blockHasOutput(state, block);
+        return (
+          <button key={block.id} className="layer-row" onClick={() => props.onSelectCard(block.id)}>
+            <span className="layer-thumb block">⬒</span>
+            <span className="layer-name">
+              {block.name}
+              <span className="dim">　{blockTypeLabel(block.blockType)}</span>
+            </span>
+            {(stale || done || block.promptCardId) && (
+              <span className={`layer-badge ${stale ? 'stale' : ''}`}>{stale ? '过期' : done ? '已出图' : '有提示词'}</span>
+            )}
+          </button>
+        );
+      })}
+    </section>
+  );
+}
+
+function BlockInfo(props: InspectorProps & { card: BlockCard }) {
+  const { card, state, cacheBust, blockActions } = props;
+  const page = state.cards.find((c): c is PageCard => c.id === card.pageId && isPageCard(c));
+  const crop = card.cropCardId ? state.cards.find((c): c is ImageCard => c.id === card.cropCardId && isImageCard(c)) : undefined;
+  const prompt = card.promptCardId ? state.cards.find((c): c is PromptCard => c.id === card.promptCardId && isPromptCard(c)) : undefined;
+  const stale = !!page && isBlockCropStale(card, page);
+  const groups = [...new Set(pageBlocks(state, card.pageId).map((b) => b.group).filter((g): g is string => !!g))];
+  return (
+    <>
+      <section className="inspector-section">
+        <div className="panel-title">区块</div>
+        <NameInput id={card.id} name={card.name} onRename={props.onRename} label="名字" />
+        <div className="field">
+          <span className="field-label">类型</span>
+          <select value={card.blockType} onChange={(e) => blockActions.update(card.id, { blockType: e.target.value as BlockType })}>
+            {BLOCK_TYPES.map((type) => (
+              <option key={type.id} value={type.id}>
+                {type.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <span className="field-label">区块组</span>
+          <input
+            key={`${card.id}-${card.group ?? ''}`}
+            list={`block-groups-${card.pageId}`}
+            defaultValue={card.group ?? ''}
+            placeholder="同一排的图标填同一个组名，比如「金刚位」"
+            onBlur={(e) => {
+              const value = e.target.value.trim() || null;
+              if (value !== card.group) blockActions.update(card.id, { group: value });
+            }}
+          />
+          <datalist id={`block-groups-${card.pageId}`}>
+            {groups.map((group) => (
+              <option key={group} value={group} />
+            ))}
+          </datalist>
+        </div>
+        {page && <Field label="所在页面" value={page.name} />}
+      </section>
+
+      <section className="inspector-section">
+        <div className="panel-title">区块截图 {stale && <span className="stale-badge">截图过时</span>}</div>
+        {crop ? (
+          <>
+            <button className="ref-source link-like" onClick={() => props.onSelectCard(crop.id)}>
+              <img className="lowfi-thumb" src={thumbnailUrl(currentVersion(crop), cacheBust.get(crop.currentVersionId))} alt="" />
+              <div>
+                <div className="field-value">{crop.name}</div>
+                <div className="hint">版本 {crop.versions.findIndex((v) => v.id === crop.currentVersionId) + 1} / {crop.versions.length}</div>
+              </div>
+            </button>
+            {stale && <p className="hint">区块相对低保真原型挪过位置或改过大小，截图还是旧的。更新后下游会标成已过期，不会自动重新生成。</p>}
+            <button disabled={!stale} onClick={() => blockActions.refreshCrop(card.id)}>
+              更新截图
+            </button>
+          </>
+        ) : (
+          <p className="hint">还没有截图。在页面框里点「为区块写提示词」时会自动裁出来。</p>
+        )}
+      </section>
+
+      <section className="inspector-section">
+        <div className="panel-title">提示词卡</div>
+        {prompt ? (
+          <button className="layer-row" onClick={() => props.onSelectCard(prompt.id)}>
+            <span className="layer-thumb prompt">✎</span>
+            <span className="layer-name">{prompt.name}</span>
+            {prompt.outputCardId && <span className="layer-badge">已出图</span>}
+          </button>
+        ) : (
+          <p className="hint">还没有提示词卡。</p>
         )}
       </section>
 
@@ -701,6 +921,52 @@ function TemplateCreateSelect({ onPick }: { onPick(template: PromptTemplate): vo
   );
 }
 
+/** 复制 / 存为主题说明（Markdown），给别的模型或别人用 */
+function ThemeMarkdownActions(props: InspectorProps & { card: ThemeCard }) {
+  const { card, themeMarkdownActions } = props;
+  const [status, setStatus] = useState<{ text: string; path?: string; error?: boolean } | null>(null);
+  useEffect(() => setStatus(null), [card.id]);
+  const run = async (task: () => Promise<{ text: string; path?: string }>): Promise<void> => {
+    try {
+      setStatus(await task());
+    } catch (error) {
+      setStatus({ text: error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : String(error), error: true });
+    }
+  };
+  return (
+    <div className="theme-markdown">
+      <div className="button-row tight">
+        <button onClick={() => void run(async () => (await themeMarkdownActions.copy(card.id), { text: '已复制主题说明（Markdown），可以直接粘贴给别的模型' }))}>
+          复制为 Markdown
+        </button>
+        <button
+          onClick={() =>
+            void run(async () => {
+              const path = await themeMarkdownActions.save(card.id);
+              return { text: `已存到 themes/${path.split('/').pop()}`, path };
+            })
+          }
+        >
+          存为 Markdown
+        </button>
+      </div>
+      {status && (
+        <p className={status.error ? 'warning' : 'good-text'}>
+          {status.text}
+          {status.path && (
+            <>
+              {'　'}
+              <button className="link" onClick={() => props.onReveal(status.path!)}>
+                在 Finder 中显示
+              </button>
+            </>
+          )}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function ThemeInfo(props: InspectorProps & { card: ThemeCard }) {
   const { card, state, onUpdateTheme, cacheBust } = props;
   const active = state.activeThemeCardId === card.id;
@@ -723,6 +989,7 @@ function ThemeInfo(props: InspectorProps & { card: ThemeCard }) {
           {active ? '取消生效' : '设为生效主题卡'}
         </button>
         <p className="hint">生效主题卡的规则会附加到每次生成的提示词后面；每张提示词卡可以单独关掉。</p>
+        <ThemeMarkdownActions {...props} />
         {card.sourceImageCardId && source && isImageCard(source) && sourceVersion && (
           <div className="ref-source">
             <img className="lowfi-thumb" src={thumbnailUrl(sourceVersion, cacheBust.get(sourceVersion.id))} alt="" />

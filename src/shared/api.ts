@@ -38,8 +38,11 @@ export interface LaunchFlags {
   m3Check: CheckPhase | null;
   /** M4 验收自检：完整跑一遍寿司首页（主题 → 素材 → 页面 → 导出） */
   m4Check: CheckPhase | null;
+  m5Check: CheckPhase | null;
   /** 真实调用自检：按设置跑一次助手和一张生图，会产生少量费用；可以只测其中一项 */
-  realCheck: false | 'all' | 'assistant' | 'image';
+  realCheck: false | 'all' | 'assistant' | 'image' | 'blocks';
+  /** --real-check=blocks 时拆解的图片路径（--check-image=…） */
+  checkImage: string | null;
 }
 
 export interface RecentProject {
@@ -65,7 +68,11 @@ export interface OpenedProject {
   warnings: string[];
 }
 
-export type ImportSource = { kind: 'path'; path: string } | { kind: 'bytes'; name: string; bytes: Uint8Array };
+export type ImportSource =
+  | { kind: 'path'; path: string }
+  | { kind: 'bytes'; name: string; bytes: Uint8Array }
+  /** 从项目里已有的原图裁一块（像素坐标），比如区块截图 */
+  | { kind: 'crop'; name: string; file: string; rect: { left: number; top: number; width: number; height: number } };
 
 export interface ImportResult {
   versions: Version[];
@@ -99,6 +106,9 @@ export type MenuCommand =
   | 'openSettings'
   | 'toggleAssistant'
   | 'newPageFromLowFi'
+  | 'toWireframe'
+  | 'copyThemeMarkdown'
+  | 'saveThemeMarkdown'
   | 'newBlankPage'
   | 'exportPage'
   | 'commandPalette'
@@ -116,6 +126,9 @@ export interface AnyeApi {
   importImages(sources: ImportSource[]): Promise<ImportResult>;
   getPathForFile(file: File): string;
   revealInFinder(path: string): void;
+  copyText(text: string): Promise<void>;
+  /** 主题说明写到当前项目的 themes/名字.md（同名覆盖），返回完整路径 */
+  saveThemeMarkdown(name: string, markdown: string): Promise<string>;
   onCacheReady(listener: (versionId: string) => void): () => void;
   onMenuCommand(listener: (command: MenuCommand) => void): () => void;
   /** 项目目录被外部改动时（忽略自己保存后的短窗口） */

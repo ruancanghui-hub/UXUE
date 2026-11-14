@@ -275,6 +275,6 @@ export function activeTheme(state: DocState): ThemeCard | null {
 
 /** 自检（M1–M4）时主进程强制用本地模拟，这里也按本地模拟来渲染提示词和估算 */
 export function effectiveConfig(config: GenerationConfig): GenerationConfig {
-  const { m1Check, m2Check, m3Check, m4Check } = window.anye.flags;
-  return m1Check || m2Check || m3Check || m4Check ? { ...config, provider: 'mock' } : config;
+  const { m1Check, m2Check, m3Check, m4Check, m5Check } = window.anye.flags;
+  return m1Check || m2Check || m3Check || m4Check || m5Check ? { ...config, provider: 'mock' } : config;
 }

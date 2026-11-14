@@ -4,6 +4,7 @@ import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { ImportResult, ImportSource, OpenedProject, ProjectFsChange, RecentProject } from '../shared/api';
 import { emptyProject, isImageCard, isPageCard, parseProject, PROJECT_FILE, type ProjectFile, type Version } from '../shared/project';
+import { safeFileName } from '../shared/export';
 import type { EnsureCacheResult, ImportedImage } from '../shared/workerProtocol';
 import type { ImageWorkerClient } from './imageWorkerClient';
 
@@ -13,6 +14,8 @@ const CACHE_CONCURRENCY = 2;
 const PROJECT_GITIGNORE = '.cache/\n';
 /** 自己写盘后忽略一段外部 watch 事件，避免把自己的保存当成外部改动 */
 const OWN_SAVE_IGNORE_MS = 800;
+/** 主题说明放在项目目录的这个子目录里 */
+export const THEMES_DIR = 'themes';
 
 export interface ProjectServiceEvents {
   onCacheReady(versionId: string): void;
@@ -112,6 +115,15 @@ export class ProjectService {
     return missing;
   }
 
+  async saveThemeMarkdown(name: string, markdown: string): Promise<string> {
+    const dir = this.current?.dir;
+    if (!dir) throw new Error('还没有打开项目');
+    await mkdir(join(dir, THEMES_DIR), { recursive: true });
+    const path = join(dir, THEMES_DIR, `${safeFileName(name)}.md`);
+    await writeFile(path, markdown);
+    return path;
+  }
+
   async importImages(sources: ImportSource[]): Promise<ImportResult> {
     const dir = this.current?.dir;
     if (!dir) throw new Error('还没有打开项目');
@@ -127,6 +139,9 @@ export class ProjectService {
         const name = source.kind === 'path' ? basename(source.path) : source.name;
         const key = randomUUID();
         try {
+          if (source.kind === 'crop' && (source.file.includes('..') || source.file.startsWith('/'))) {
+            throw new Error('裁剪的原图路径不合法');
+          }
           const imported = await this.worker.request<ImportedImage>({ type: 'importImage', dir, key, source });
           versions[index] = {
             id: key,

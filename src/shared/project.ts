@@ -83,6 +83,8 @@ export interface PromptCard {
   outputCardId: string | null;
   settings: PromptSettings;
   groupId: string | null;
+  /** 特殊用途：wireframe 表示这是一张转线框提示词卡 */
+  purpose: 'wireframe' | null;
 }
 
 export interface ThemeColor {
@@ -150,6 +152,59 @@ export interface PageCard {
   devicePreset: string | null;
   /** 导出倍数，相对页面的逻辑尺寸 */
   exportScale: number;
+  /** 底稿来源：自己的线框，还是只借布局的成品截图 */
+  baseSource: BaseSource;
+  /** 底稿来自哪张图像卡（比如转线框的结果）；直接从文件导入的为 null */
+  baseCardId: string | null;
+  /** 从页面框发起的转线框：这张提示词卡第一次出图就换成底稿 */
+  wireframePromptId: string | null;
+}
+
+export type BaseSource = 'own' | 'borrowed';
+
+export type BlockType = 'hero' | 'icon' | 'tile' | 'tabbar' | 'illustration' | 'other';
+
+export const BLOCK_TYPES: { id: BlockType; label: string }[] = [
+  { id: 'hero', label: '顶部视觉 / Banner' },
+  { id: 'icon', label: '金刚位图标' },
+  { id: 'tile', label: '瓷片' },
+  { id: 'tabbar', label: '底部导航图标' },
+  { id: 'illustration', label: '主插图' },
+  { id: 'other', label: '其他' },
+];
+
+export function blockTypeLabel(type: BlockType): string {
+  return BLOCK_TYPES.find((t) => t.id === type)?.label ?? '其他';
+}
+
+/** 相对页面框的矩形，0–1 */
+export interface RelativeRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** 页面框里要单独生成一张核心素材的一块；只属于一个页面框 */
+export interface BlockCard {
+  kind: 'block';
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  pageId: string;
+  blockType: BlockType;
+  /** 区块组名，比如"金刚位"；不成组为 null */
+  group: string | null;
+  /** 区块截图图像卡 */
+  cropCardId: string | null;
+  /** 截图时区块相对页面框的位置；和现在不同就是截图过时 */
+  cropRect: RelativeRect | null;
+  /** 截图时页面框的低保真原型版本；页面框换了底稿截图也过时 */
+  cropBaseVersionId: string | null;
+  promptCardId: string | null;
 }
 
 /** 页面框里对某张核心素材的引用：默认跟当前版本；可锁定到指定版本 */
@@ -167,10 +222,55 @@ export interface RefCard {
   lockedVersionId: string | null;
 }
 
-export type CanvasCard = ImageCard | PromptCard | ThemeCard | PageCard | RefCard | GroupCard;
+export type CanvasCard = ImageCard | PromptCard | ThemeCard | PageCard | RefCard | GroupCard | BlockCard;
 
 export function isPageCard(card: CanvasCard): card is PageCard {
   return card.kind === 'page';
+}
+
+export function isBlockCard(card: CanvasCard): card is BlockCard {
+  return card.kind === 'block';
+}
+
+/** 区块现在相对页面框的位置 */
+export function blockRelativeRect(block: BlockCard, page: PageCard): RelativeRect {
+  return {
+    x: (block.x - page.x) / page.width,
+    y: (block.y - page.y) / page.height,
+    width: block.width / page.width,
+    height: block.height / page.height,
+  };
+}
+
+const CROP_TOLERANCE = 0.005;
+
+/** 区块相对低保真原型挪了位置或改了大小，截图就过时；整个页面框一起动不算 */
+export function isBlockCropStale(block: BlockCard, page: PageCard): boolean {
+  if (!block.cropCardId || !block.cropRect) return false;
+  if (block.cropBaseVersionId && block.cropBaseVersionId !== page.base?.id) return true;
+  const now = blockRelativeRect(block, page);
+  const before = block.cropRect;
+  return (
+    Math.abs(now.x - before.x) > CROP_TOLERANCE ||
+    Math.abs(now.y - before.y) > CROP_TOLERANCE ||
+    Math.abs(now.width - before.width) > CROP_TOLERANCE ||
+    Math.abs(now.height - before.height) > CROP_TOLERANCE
+  );
+}
+
+/** 区块在低保真原型原图上的像素范围（夹在原图内） */
+export function blockPixelRect(
+  block: BlockCard,
+  page: PageCard,
+): { left: number; top: number; width: number; height: number } | null {
+  if (!page.base) return null;
+  const rel = blockRelativeRect(block, page);
+  const left = Math.max(0, Math.round(rel.x * page.base.width));
+  const top = Math.max(0, Math.round(rel.y * page.base.height));
+  const right = Math.min(page.base.width, Math.round((rel.x + rel.width) * page.base.width));
+  const bottom = Math.min(page.base.height, Math.round((rel.y + rel.height) * page.base.height));
+  if (right - left < 4 || bottom - top < 4) return null;
+  return { left, top, width: right - left, height: bottom - top };
 }
 
 export function isRefCard(card: CanvasCard): card is RefCard {
@@ -350,7 +450,9 @@ export function parseProject(raw: unknown): ParseResult {
               ? parseRefCard(value)
               : value.kind === 'group'
                 ? parseGroupCard(value)
-                : parseCard(value);
+                : value.kind === 'block'
+                  ? parseBlockCard(value)
+                  : parseCard(value);
     if (!card) {
       warnings.push(`第 ${index + 1} 个对象结构不完整，已跳过`);
       continue;
@@ -395,6 +497,35 @@ export function parseProject(raw: unknown): ParseResult {
         if (!source?.versions.some((v) => v.id === card.lockedVersionId)) next = { ...next, lockedVersionId: null };
       }
       if (next !== card) cards[index] = next;
+    }
+  }
+
+  // 区块：页面框不在就丢掉；截图卡、提示词卡不在就断开
+  const promptIds = new Set(cards.filter(isPromptCard).map((card) => card.id));
+  for (const [index, card] of cards.entries()) {
+    if (!isPageCard(card)) continue;
+    const baseCardId = card.baseCardId && imageIds.has(card.baseCardId) ? card.baseCardId : null;
+    const wireframePromptId = card.wireframePromptId && promptIds.has(card.wireframePromptId) ? card.wireframePromptId : null;
+    if (baseCardId !== card.baseCardId || wireframePromptId !== card.wireframePromptId) cards[index] = { ...card, baseCardId, wireframePromptId };
+  }
+  for (let index = cards.length - 1; index >= 0; index--) {
+    const card = cards[index];
+    if (!isBlockCard(card)) continue;
+    if (!pageIds.has(card.pageId)) {
+      warnings.push('一个区块所在的页面框不存在，已去掉');
+      cards.splice(index, 1);
+      continue;
+    }
+    const cropCardId = card.cropCardId && imageIds.has(card.cropCardId) ? card.cropCardId : null;
+    const promptCardId = card.promptCardId && promptIds.has(card.promptCardId) ? card.promptCardId : null;
+    if (cropCardId !== card.cropCardId || promptCardId !== card.promptCardId) {
+      cards[index] = {
+        ...card,
+        cropCardId,
+        cropRect: cropCardId ? card.cropRect : null,
+        cropBaseVersionId: cropCardId ? card.cropBaseVersionId : null,
+        promptCardId,
+      };
     }
   }
 
@@ -462,6 +593,32 @@ function parsePageCard(value: Record<string, unknown>): PageCard | null {
     background: normalizeHex(typeof value.background === 'string' ? value.background : '') ?? '#FFFFFF',
     devicePreset: preset ? preset.id : null,
     exportScale: Math.min(4, Math.max(1, scale)),
+    baseSource: value.baseSource === 'borrowed' ? 'borrowed' : 'own',
+    baseCardId: typeof value.baseCardId === 'string' ? value.baseCardId : null,
+    wireframePromptId: typeof value.wireframePromptId === 'string' ? value.wireframePromptId : null,
+  };
+}
+
+function parseBlockCard(value: Record<string, unknown>): BlockCard | null {
+  if (typeof value.id !== 'string' || typeof value.pageId !== 'string' || !isRect(value)) return null;
+  if (value.width <= 0 || value.height <= 0) return null;
+  const blockType = BLOCK_TYPES.some((t) => t.id === value.blockType) ? (value.blockType as BlockType) : 'other';
+  const crop = isObject(value.cropRect) && isRect(value.cropRect) ? value.cropRect : null;
+  return {
+    kind: 'block',
+    id: value.id,
+    name: typeof value.name === 'string' && value.name.trim() ? value.name : blockTypeLabel(blockType),
+    x: value.x,
+    y: value.y,
+    width: value.width,
+    height: value.height,
+    pageId: value.pageId,
+    blockType,
+    group: typeof value.group === 'string' && value.group.trim() ? value.group : null,
+    cropCardId: typeof value.cropCardId === 'string' ? value.cropCardId : null,
+    cropRect: crop ? { x: crop.x, y: crop.y, width: crop.width, height: crop.height } : null,
+    cropBaseVersionId: typeof value.cropBaseVersionId === 'string' ? value.cropBaseVersionId : null,
+    promptCardId: typeof value.promptCardId === 'string' ? value.promptCardId : null,
   };
 }
 
@@ -559,6 +716,7 @@ function parsePromptCard(value: Record<string, unknown>): PromptCard | null {
       useTheme: typeof settings.useTheme === 'boolean' ? settings.useTheme : DEFAULT_PROMPT_SETTINGS.useTheme,
     },
     groupId: parseGroupId(value.groupId),
+    purpose: value.purpose === 'wireframe' ? 'wireframe' : null,
   };
 }
 

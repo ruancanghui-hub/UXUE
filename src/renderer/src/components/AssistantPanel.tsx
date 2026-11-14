@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { formatUsd } from '../../../shared/generation';
-import type { DocState } from '../document/operations';
+import { isBlockCard, isPageCard, type PageCard } from '../../../shared/project';
+import { pageBlocks, type DocState } from '../document/operations';
 import type { AssistantMessage, AssistantSession } from '../project/AssistantSession';
 import { activeTheme } from '../project/GenerationTracker';
 
@@ -11,6 +12,19 @@ interface AssistantPanelProps {
   projectName: string;
   providerLabel: string;
   onSelectCards(ids: string[]): void;
+}
+
+/** 选中了恰好一个页面框，或者选中的区块都属于同一个页面框 */
+function selectedPageOf(state: DocState, selectedIds: ReadonlySet<string>): PageCard | null {
+  const pageIds = new Set<string>();
+  for (const card of state.cards) {
+    if (!selectedIds.has(card.id)) continue;
+    if (isPageCard(card)) pageIds.add(card.id);
+    else if (isBlockCard(card)) pageIds.add(card.pageId);
+  }
+  if (pageIds.size !== 1) return null;
+  const [id] = pageIds;
+  return state.cards.find((card): card is PageCard => card.id === id && isPageCard(card)) ?? null;
 }
 
 export function AssistantPanel({ assistant, state, selectedIds, projectName, providerLabel, onSelectCards }: AssistantPanelProps) {
@@ -36,6 +50,7 @@ export function AssistantPanel({ assistant, state, selectedIds, projectName, pro
   const images = assistant.contextImages();
   const theme = activeTheme(state);
   const selectedPrompts = state.cards.filter((card) => card.kind === 'prompt' && selectedIds.has(card.id)).length;
+  const selectedPage = selectedPageOf(state, selectedIds);
 
   const send = (text: string): void => {
     if (!text.trim() || busy) return;
@@ -86,6 +101,16 @@ export function AssistantPanel({ assistant, state, selectedIds, projectName, pro
         <button disabled={!images.length || busy} onClick={() => prefill('给选中的图各写一条提示词：')}>
           给选中的图各写一条提示词
         </button>
+        {selectedPage && (
+          <>
+            <button disabled={busy || !selectedPage.base} onClick={() => void assistant.decomposePage(selectedPage.id)}>
+              拆解选中的页面
+            </button>
+            <button disabled={busy || pageBlocks(state, selectedPage.id).length === 0} onClick={() => void assistant.writeBlockPrompts(selectedPage.id)}>
+              为区块写提示词
+            </button>
+          </>
+        )}
       </div>
 
       <div className="assistant-messages" ref={listRef}>

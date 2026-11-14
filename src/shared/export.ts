@@ -1,4 +1,13 @@
-import { isImageCard, isRefCard, pageLogicalSize, refDisplayVersion, type CanvasCard, type PageCard } from './project';
+import {
+  isBlockCard,
+  isImageCard,
+  isRefCard,
+  pageLogicalSize,
+  refDisplayVersion,
+  type BlockCard,
+  type CanvasCard,
+  type PageCard,
+} from './project';
 
 export interface ExportLayer {
   /** 图层名：引用的图像卡名字，重名时加序号 */
@@ -26,6 +35,8 @@ export interface PageExportPlan {
   base: { file: string } | null;
   /** 从下到上 */
   layers: ExportLayer[];
+  /** 区块只写进坐标清单（逻辑坐标），不画进 PNG / SVG */
+  blocks: { name: string; type: string; group: string | null; x: number; y: number; width: number; height: number }[];
 }
 
 /** 页面框 + 里面的素材引用 → 导出用的像素坐标；画布单位按页面宽度换算 */
@@ -68,7 +79,22 @@ export function planPageExport(page: PageCard, cards: readonly CanvasCard[]): Pa
     background: page.background,
     base: page.base ? { file: page.base.file } : null,
     layers,
+    blocks: cards
+      .filter((card): card is BlockCard => isBlockCard(card) && card.pageId === page.id)
+      .map((block) => ({
+        name: block.name,
+        type: block.blockType,
+        group: block.group,
+        x: round2(((block.x - page.x) / page.width) * logical.width),
+        y: round2(((block.y - page.y) / page.height) * logical.height),
+        width: round2((block.width / page.width) * logical.width),
+        height: round2((block.height / page.height) * logical.height),
+      })),
   };
+}
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
 }
 
 /** 文件夹 / 文件名里不能出现的字符换成下划线 */

@@ -1,6 +1,7 @@
 import { copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import sharp, { type OverlayOptions } from 'sharp';
+import type { ImportSource } from '../shared/api';
 import { safeFileName, type ExportResult } from '../shared/export';
 import { CACHE_VERSION, cacheFiles, computeTiles, l2Size, tileExtent } from '../shared/textures';
 import type {
@@ -53,7 +54,7 @@ async function handle(request: WorkerRequest): Promise<void> {
         data = await ensureCache(request.dir, request.key, request.file);
         break;
       case 'prepareInput':
-        data = await prepareInput(request.path, request.maxEdge);
+        data = await prepareInput(request.path, request.maxEdge, request.enlarge);
         break;
       case 'mockGenerate':
         data = await mockGenerate(request);
@@ -78,12 +79,13 @@ async function handle(request: WorkerRequest): Promise<void> {
 
 // ───────────────────────── 导入与缓存 ─────────────────────────
 
-async function importImage(
-  dir: string,
-  key: string,
-  source: { kind: 'path'; path: string } | { kind: 'bytes'; name: string; bytes: Uint8Array },
-): Promise<ImportedImage> {
-  const input = source.kind === 'path' ? source.path : Buffer.from(source.bytes);
+async function importImage(dir: string, key: string, source: ImportSource): Promise<ImportedImage> {
+  const input =
+    source.kind === 'path'
+      ? source.path
+      : source.kind === 'bytes'
+        ? Buffer.from(source.bytes)
+        : await sharp(join(dir, source.file)).extract(source.rect).png().toBuffer();
   const meta = await sharp(input).metadata();
   const name = source.kind === 'path' ? basename(source.path) : source.name;
   if (!meta.format || !meta.width || !meta.height) throw new Error(`${name} 不是能识别的图片`);
@@ -167,13 +169,13 @@ async function exists(path: string): Promise<boolean> {
 
 const INPUT_MAX_EDGE = 2048;
 
-async function prepareInput(path: string, maxEdge = INPUT_MAX_EDGE): Promise<PreparedInput> {
-  const buffer = await sharp(path)
+async function prepareInput(path: string, maxEdge = INPUT_MAX_EDGE, enlarge = false): Promise<PreparedInput> {
+  const { data, info } = await sharp(path)
     .rotate()
-    .resize(maxEdge, maxEdge, { fit: 'inside', withoutEnlargement: true })
+    .resize(maxEdge, maxEdge, { fit: 'inside', withoutEnlargement: !enlarge })
     .png()
-    .toBuffer();
-  return { base64: buffer.toString('base64'), mime: 'image/png' };
+    .toBuffer({ resolveWithObject: true });
+  return { base64: data.toString('base64'), mime: 'image/png', width: info.width, height: info.height };
 }
 
 /** 模拟结果要一眼能看出"变了"：每张换一个色相、做海报化，并在角上标出提示词开头 */
@@ -310,7 +312,14 @@ async function exportPage({ dir, folder, plan }: ExportRequest): Promise<ExportR
   await writeFile(
     join(out, 'manifest.json'),
     JSON.stringify(
-      { page: plan.pageName, logicalWidth: plan.logicalWidth, logicalHeight: plan.logicalHeight, exportScale: plan.exportScale, layers: manifest },
+      {
+        page: plan.pageName,
+        logicalWidth: plan.logicalWidth,
+        logicalHeight: plan.logicalHeight,
+        exportScale: plan.exportScale,
+        layers: manifest,
+        blocks: plan.blocks ?? [],
+      },
       null,
       2,
     ),

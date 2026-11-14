@@ -5,6 +5,8 @@ import type { PromptTemplate } from '../../../shared/api';
 import {
   cardGroupId,
   defaultRegions,
+  isBlockCard,
+  isBlockCropStale,
   isGroupCard,
   isImageCard,
   isPageCard,
@@ -25,6 +27,7 @@ import { texturedImage } from '../../../shared/textures';
 import { DocumentStore, type DocChange } from '../document/DocumentStore';
 import {
   addPromptInput,
+  blockHasOutput,
   createPromptCard,
   displayVersion,
   duplicateCards,
@@ -38,6 +41,7 @@ import {
   removeCards,
   renderOrder,
   reorderCards,
+  resizeBlock,
   scaleCards,
   ungroupCards,
   updatePrompt,
@@ -116,6 +120,7 @@ const MISSING_TINT = 0x4a2028;
 const MISSING_OUTLINE = 0xff6b7a;
 const ACCENT = 0x7c8cff;
 const OUTPUT_LINK = 0x5ad19a;
+const BLOCK_COLOR = 0xffb547;
 const REGION_FILL = 0x17171c;
 const REGION_STROKE = 0x2a2a33;
 const FOCUS_DIM_ALPHA = 0.16;
@@ -177,6 +182,7 @@ export class CanvasEngine {
   private readonly spriteLayers = new Map<string, Container>();
   private readonly pageBackgrounds = new Map<string, Graphics>();
   private readonly pageLabels = new Map<string, Text>();
+  private readonly blockLabels = new Map<string, Text>();
   private renderedSequence: CanvasCard[] = [];
   private regionLabels = new Map<RegionId, Text>();
   private readonly slotLabels: Text[] = [];
@@ -759,6 +765,7 @@ export class CanvasEngine {
       if (isPromptCard(card)) this.syncPromptCard(card);
       else if (isThemeCard(card)) this.syncThemeCard(card);
       else if (isGroupCard(card)) this.ensureGroupNode(card);
+      else if (isBlockCard(card)) this.ensureBlockNode(card);
       else this.ensureSpriteNode(card);
       if (keyChanged) this.rebindTexture(card.id, version);
       this.rendered.set(card.id, card);
@@ -802,6 +809,12 @@ export class CanvasEngine {
     const node = new Container();
     this.nodes.set(card.id, node);
     this.spriteLayers.set(card.id, node);
+  }
+
+  /** 区块的虚线框和标签画在覆盖层（线宽、字号不随缩放变）；世界里只留一个空节点参与排序和命中 */
+  private ensureBlockNode(card: CanvasCard): void {
+    if (this.nodes.has(card.id)) return;
+    this.nodes.set(card.id, new Container());
   }
 
   private ensureGroupNode(card: CanvasCard): void {
@@ -935,6 +948,8 @@ export class CanvasEngine {
     }
     this.pageLabels.get(id)?.destroy();
     this.pageLabels.delete(id);
+    this.blockLabels.get(id)?.destroy();
+    this.blockLabels.delete(id);
     this.spriteLayers.delete(id);
     this.pageBackgrounds.delete(id);
     this.nodes.delete(id);
@@ -1013,6 +1028,7 @@ export class CanvasEngine {
       }
     }
     this.drawPageFrames(g, state);
+    this.drawBlocks(g, state, view);
     this.drawJobs(g, state, now);
 
     if (this.hoverId && !selection.has(this.hoverId) && this.interaction.kind === 'none') {
@@ -1080,6 +1096,53 @@ export class CanvasEngine {
       if (!alive.has(id)) {
         label.destroy();
         this.pageLabels.delete(id);
+      }
+    }
+  }
+
+  /**
+   * 区块：虚线框 + 左上角标签（名字，截图过时时标红）。
+   * 已经放好素材的区块框变淡、标签只在选中或悬停时显示，免得挡住画面。
+   */
+  private drawBlocks(g: Graphics, state: DocState, view: Rect): void {
+    const byId = new Map(state.cards.map((card) => [card.id, card]));
+    const alive = new Set<string>();
+    for (const card of state.cards) {
+      if (!isBlockCard(card)) continue;
+      const page = byId.get(card.pageId);
+      if (!page || !isPageCard(page) || !intersects(card, view)) continue;
+      alive.add(card.id);
+      const filled = blockHasOutput(state, card);
+      const stale = isBlockCropStale(card, page);
+      const focused = this.selection.has(card.id) || this.hoverId === card.id;
+      const color = stale ? MISSING_OUTLINE : BLOCK_COLOR;
+      const a = this.viewport.worldToScreen(card.x, card.y);
+      const w = card.width * this.viewport.zoom;
+      const h = card.height * this.viewport.zoom;
+      if (!filled) g.rect(a.x, a.y, w, h).fill({ color, alpha: 0.08 });
+      dashedRect(g, a.x, a.y, w, h);
+      g.stroke({ color, width: 1.5, alpha: filled && !focused ? 0.35 : 0.95 });
+
+      let label = this.blockLabels.get(card.id);
+      if (!label) {
+        label = new Text({
+          text: '',
+          style: { fontFamily: 'PingFang SC, -apple-system, sans-serif', fontSize: 11, fill: BLOCK_COLOR },
+          resolution: window.devicePixelRatio * 2,
+        });
+        this.labels.addChild(label);
+        this.blockLabels.set(card.id, label);
+      }
+      label.text = stale ? `${card.name} · 截图过时` : card.name;
+      label.style.fill = color;
+      label.position.set(Math.round(a.x + 3), Math.round(a.y + 2));
+      // 小区块放不下名字时只在选中或悬停时显示，免得压到旁边的区块
+      label.visible = focused ? h > 12 : !filled && h > 16 && label.width <= w - 4;
+    }
+    for (const [id, label] of this.blockLabels) {
+      if (!alive.has(id)) {
+        label.destroy();
+        this.blockLabels.delete(id);
       }
     }
   }
@@ -1528,6 +1591,11 @@ export class CanvasEngine {
       }
       case 'resize': {
         const world = this.viewport.screenToWorld(x, y);
+        const [only] = interaction.origins.values();
+        if (interaction.origins.size === 1 && only && isBlockCard(only)) {
+          this.doc.updateGesture(resizeBlock(this.doc.get(), only, interaction.anchorX, interaction.anchorY, world.x, world.y));
+          return;
+        }
         const sx = (world.x - interaction.anchorX) / (interaction.cornerX - interaction.anchorX);
         const sy = (world.y - interaction.anchorY) / (interaction.cornerY - interaction.anchorY);
         this.doc.updateGesture(

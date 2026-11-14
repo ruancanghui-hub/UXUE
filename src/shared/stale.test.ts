@@ -57,6 +57,7 @@ const prompt = (id: string, inputs: string[], outputCardId: string | null, text 
   outputCardId,
   settings: { ...DEFAULT_PROMPT_SETTINGS, useTheme: false },
   groupId: null,
+  purpose: null,
 });
 
 describe('isImageCardStale', () => {

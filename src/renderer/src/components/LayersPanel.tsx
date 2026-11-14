@@ -1,6 +1,8 @@
 import { memo, useMemo } from 'react';
 import {
   currentVersion,
+  isBlockCard,
+  isBlockCropStale,
   isGroupCard,
   isImageCard,
   isPageCard,
@@ -8,6 +10,7 @@ import {
   isRefCard,
   isThemeCard,
   refDisplayVersion,
+  type BlockCard,
   type CanvasCard,
   type RefCard,
   type RegionId,
@@ -25,7 +28,7 @@ interface LayersPanelProps {
   onFocusCard(id: string): void;
 }
 
-type RowKind = 'image' | 'missing' | 'prompt' | 'theme' | 'page' | 'group' | 'ref';
+type RowKind = 'image' | 'missing' | 'prompt' | 'theme' | 'page' | 'group' | 'ref' | 'block';
 
 interface Row {
   id: string;
@@ -40,10 +43,10 @@ interface Row {
 export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, onSelect, onFocusCard }: LayersPanelProps) {
   const groups = useMemo(() => {
     const byId = new Map(state.cards.map((card) => [card.id, card]));
-    const pageChildren = new Map<string, RefCard[]>();
+    const pageChildren = new Map<string, (RefCard | BlockCard)[]>();
     const groupChildren = new Map<string, CanvasCard[]>();
     for (const card of state.cards) {
-      if (isRefCard(card) && card.pageId && byId.has(card.pageId)) {
+      if ((isRefCard(card) || isBlockCard(card)) && card.pageId && byId.has(card.pageId)) {
         const list = pageChildren.get(card.pageId) ?? [];
         list.unshift(card);
         pageChildren.set(card.pageId, list);
@@ -81,18 +84,28 @@ export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, 
           indent,
         };
       }
+      if (isBlockCard(card)) {
+        const page = byId.get(card.pageId);
+        const stale = !!page && isPageCard(page) && isBlockCropStale(card, page);
+        return { id: card.id, label: card.name, kind: 'block', badge: stale ? '过期' : undefined, indent };
+      }
       return {
         id: card.id,
         label: card.name,
         kind: card.kind,
-        badge: card.id === state.activeThemeCardId ? '生效' : isPageCard(card) ? (pageChildren.get(card.id)?.length ?? 0) || undefined : undefined,
+        badge:
+          card.id === state.activeThemeCardId
+            ? '生效'
+            : isPageCard(card)
+              ? pageChildren.get(card.id)?.filter(isRefCard).length || undefined
+              : undefined,
         indent,
       };
     };
 
     const byRegion = new Map<RegionId | null, Row[]>();
     for (const card of [...state.cards].reverse()) {
-      if (isRefCard(card) && card.pageId && byId.has(card.pageId)) continue;
+      if ((isRefCard(card) || isBlockCard(card)) && card.pageId && byId.has(card.pageId)) continue;
       if ((isImageCard(card) || isPromptCard(card) || isThemeCard(card)) && card.groupId && byId.has(card.groupId)) continue;
       const region = regionOf(state, card);
       const rows = byRegion.get(region) ?? [];
@@ -128,7 +141,7 @@ export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, 
   );
 }
 
-const ICONS: Partial<Record<RowKind, string>> = { prompt: '✎', theme: '◆', page: '▢', group: '⬚' };
+const ICONS: Partial<Record<RowKind, string>> = { prompt: '✎', theme: '◆', page: '▢', group: '⬚', block: '⬒' };
 
 const LayerRow = memo(function LayerRow({
   row,

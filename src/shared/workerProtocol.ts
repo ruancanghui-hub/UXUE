@@ -23,11 +23,11 @@ export type WorkerRequest =
       type: 'importImage';
       dir: string;
       key: string;
-      source: { kind: 'path'; path: string } | { kind: 'bytes'; name: string; bytes: Uint8Array };
+      source: import('./api').ImportSource;
     }
   | { requestId: number; type: 'ensureCache'; dir: string; key: string; file: string }
   /** 把输入图缩到长边 ≤ 2048 的 PNG，减小上传体积和图像输入 token */
-  | { requestId: number; type: 'prepareInput'; path: string; maxEdge?: number }
+  | { requestId: number; type: 'prepareInput'; path: string; maxEdge?: number; enlarge?: boolean }
   /** 导出一个页面：整页 PNG、分层 SVG、素材包（每个素材 @1x/@2x/@3x）和清单 */
   | ({ requestId: number; type: 'exportPage' } & ExportRequest)
   /** 开发和验收用：生成一张 iPhone 3 倍尺寸的首页低保真线框图 */
@@ -49,6 +49,9 @@ export type ExportRequest = { dir: string; folder: string; plan: import('./expor
 export interface PreparedInput {
   base64: string;
   mime: 'image/png';
+  /** 实际发出去的像素尺寸 */
+  width: number;
+  height: number;
 }
 
 export interface MockGenerateResult {

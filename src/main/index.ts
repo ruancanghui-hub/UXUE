@@ -1,6 +1,6 @@
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron';
 import type { CheckPhase, ImportSource, LaunchFlags, MenuCommand, StartupInfo } from '../shared/api';
 import { BENCH_HOST, PROJECT_HOST, type BenchManifest, type BenchReport } from '../shared/bench';
 import type { AssistantRequest } from '../shared/assistant';
@@ -33,15 +33,17 @@ const flags: LaunchFlags = {
   m2Check: checkPhase('m2-check'),
   m3Check: checkPhase('m3-check'),
   m4Check: checkPhase('m4-check'),
+  m5Check: checkPhase('m5-check'),
   realCheck: ((): LaunchFlags['realCheck'] => {
     const arg = process.argv.find((a) => a === '--real-check' || a.startsWith('--real-check='));
     if (!arg) return false;
     const value = arg.split('=')[1];
-    return value === 'assistant' || value === 'image' ? value : 'all';
+    return value === 'assistant' || value === 'image' || value === 'blocks' ? value : 'all';
   })(),
+  checkImage: process.argv.find((arg) => arg.startsWith('--check-image='))?.slice('--check-image='.length) ?? null,
 };
-const checkName = flags.m1Check ? 'm1' : flags.m2Check ? 'm2' : flags.m3Check ? 'm3' : flags.m4Check ? 'm4' : flags.realCheck ? 'real' : null;
-const checkPhaseValue = flags.m1Check ?? flags.m2Check ?? flags.m3Check ?? flags.m4Check ?? (flags.realCheck ? 'write' : null);
+const checkName = flags.m1Check ? 'm1' : flags.m2Check ? 'm2' : flags.m3Check ? 'm3' : flags.m4Check ? 'm4' : flags.m5Check ? 'm5' : flags.realCheck ? 'real' : null;
+const checkPhaseValue = flags.m1Check ?? flags.m2Check ?? flags.m3Check ?? flags.m4Check ?? flags.m5Check ?? (flags.realCheck ? 'write' : null);
 /** 自检默认强制本地模拟；真实调用自检按用户设置走 */
 const forceMock = checkName !== null && checkName !== 'real';
 const selfTestMode = hasFlag('--self-test', 'ANYE_SELF_TEST');
@@ -287,6 +289,8 @@ function registerIpc(): void {
     });
     return result.canceled ? [] : result.filePaths;
   });
+  ipcMain.handle('clipboard:write', (_event, text: string) => clipboard.writeText(String(text)));
+  ipcMain.handle('theme:save-markdown', (_event, name: string, markdown: string) => projects.saveThemeMarkdown(name, markdown));
   ipcMain.handle('images:import', (_event, sources: ImportSource[]) => projects.importImages(sources));
 
   ipcMain.on('shell:reveal', (_event, path: string) => shell.showItemInFolder(path));

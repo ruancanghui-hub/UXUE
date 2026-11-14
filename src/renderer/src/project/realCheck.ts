@@ -1,8 +1,8 @@
 import type { ImportSource } from '../../../shared/api';
 import { formatCost, formatUsd } from '../../../shared/generation';
-import { isImageCard, isPromptCard, isThemeCard, type ImageCard } from '../../../shared/project';
+import { isImageCard, isPromptCard, isThemeCard, type ImageCard, type PageCard } from '../../../shared/project';
 import type { CanvasEngine } from '../canvas/CanvasEngine';
-import { updatePrompt } from '../document/operations';
+import { pageBlocks, updatePrompt } from '../document/operations';
 import type { AssistantSession } from './AssistantSession';
 import type { GenerationTracker } from './GenerationTracker';
 import { wait, waitForJobs } from './m2Check';
@@ -14,13 +14,14 @@ interface CheckContext {
   tracker: GenerationTracker;
   assistant: AssistantSession;
   importInto(sources: ImportSource[], at?: { x: number; y: number }): Promise<void>;
+  createPage(sources: ImportSource[] | null): Promise<PageCard | null>;
 }
 
 /**
  * 真实调用自检：按用户设置用 OpenAI 跑一次助手（生成主题卡）和一张最便宜的生图
  * （低质量、1024 方图、1 张），报告结果、耗时和实际花费。预计 1–3 美分。
  */
-export async function runRealCheck({ engine, session, tracker, assistant, importInto }: CheckContext): Promise<void> {
+export async function runRealCheck({ engine, session, tracker, assistant, importInto, createPage }: CheckContext): Promise<void> {
   const checks: { name: string; ok: boolean; detail?: string }[] = [];
   const timings: Record<string, number | string> = {};
   const check = (name: string, ok: boolean, detail?: string): void => {
@@ -36,6 +37,10 @@ export async function runRealCheck({ engine, session, tracker, assistant, import
   const config = await window.anye.getGenerationConfig();
   const only = window.anye.flags.realCheck;
   const doc = session.doc;
+  if (only === 'blocks') {
+    await checkBlocks();
+    return finish();
+  }
   if (only === 'assistant') {
     if (config.hasApiKey) await checkAssistant();
     else check('助手需要 OpenAI Key', false);
@@ -55,6 +60,35 @@ export async function runRealCheck({ engine, session, tracker, assistant, import
 
   if (only === 'all' && config.assistantProvider === 'openai' && config.hasApiKey) await checkAssistant();
   else if (only === 'all') timings.assistant = '助手设成了本地模拟或没有 OpenAI Key，跳过';
+
+  /** 用真实助手拆解 --check-image 指定的图，报告每个区块相对页面的位置（0–1000） */
+  async function checkBlocks(): Promise<void> {
+    const path = window.anye.flags.checkImage;
+    check('指定了要拆解的图（--check-image=…）', !!path);
+    if (!path) return;
+    const page = await createPage([{ kind: 'path', path }]);
+    check('建出页面框', !!page?.base);
+    if (!page) return;
+    const started = performance.now();
+    const reply = await assistant.decomposePage(page.id);
+    timings.decomposeMs = Math.round(performance.now() - started);
+    timings.assistant = `${config.assistantProvider} · ${config.assistantProvider === 'newapi' ? config.newapiAssistantModel : config.assistantModel}`;
+    const blocks = pageBlocks(doc.get(), page.id);
+    check('助手返回了区块', !reply.error && blocks.length > 0, reply.text);
+    for (const block of blocks) {
+      const r = (v: number, total: number): number => Math.round((v / total) * 1000);
+      timings[block.name] = `${block.blockType} x${r(block.x - page.x, page.width)} y${r(block.y - page.y, page.height)} w${r(block.width, page.width)} h${r(block.height, page.height)}`;
+    }
+    const spreadX = Math.max(...blocks.map((b) => b.x + b.width)) - Math.min(...blocks.map((b) => b.x));
+    const spreadY = Math.max(...blocks.map((b) => b.y + b.height)) - Math.min(...blocks.map((b) => b.y));
+    check('区块铺开在整页上，没有挤在一角', spreadX > page.width * 0.6 && spreadY > page.height * 0.6, `横向 ${Math.round((spreadX / page.width) * 100)}%，纵向 ${Math.round((spreadY / page.height) * 100)}%`);
+    session.selection.set([page.id]);
+    const zoom = Math.min((engine.viewport.screenWidth - 80) / page.width, (engine.viewport.screenHeight - 80) / page.height);
+    engine.viewport.zoom = zoom;
+    engine.viewport.centerOn(page.x + page.width / 2, page.y + page.height / 2);
+    engine.invalidateView();
+    await wait(1500);
+  }
 
   async function checkAssistant(): Promise<void> {
   const askStart = performance.now();

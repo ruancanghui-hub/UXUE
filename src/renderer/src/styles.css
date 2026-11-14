@@ -1259,6 +1259,12 @@ button.icon:hover:not(:disabled) {
   cursor: pointer;
 }
 
+.theme-markdown {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .theme-toggle {
   display: flex;
   flex-direction: column;
@@ -1299,6 +1305,15 @@ button.icon:hover:not(:disabled) {
   border: 1px solid #2d4a3c;
 }
 
+.layer-thumb.block {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ffb547;
+  background: #231d14;
+  border: 1px dashed #6b5430;
+}
+
 .layer-row.indent {
   padding-left: 22px;
 }
@@ -1316,6 +1331,19 @@ button.icon:hover:not(:disabled) {
   display: flex;
   gap: 10px;
   align-items: center;
+}
+
+.ref-source.link-like {
+  width: 100%;
+  padding: 4px;
+  border: none;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ref-source.link-like:hover {
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .ref-source .lowfi-thumb {

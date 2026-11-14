@@ -1,9 +1,9 @@
-import { forwardRef, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
+import { forwardRef, memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type DragEvent } from 'react';
 import type { ImportSource, MenuCommand, ProjectFsChange, StartupInfo } from '../../shared/api';
 import { PROJECT_HOST } from '../../shared/bench';
 import { planPageExport, type ExportResult } from '../../shared/export';
 import type { GenerationConfig, PromptSettings } from '../../shared/generation';
-import { isPageCard, type PageCard, type RegionId } from '../../shared/project';
+import { isImageCard, isPageCard, type PageCard, type RegionId } from '../../shared/project';
 import { isTyping, type CanvasEngine, type EngineStatus } from './canvas/CanvasEngine';
 import { AssistantPanel } from './components/AssistantPanel';
 import { CanvasView } from './components/CanvasView';
@@ -16,9 +16,14 @@ import { QueuePanel } from './components/QueuePanel';
 import { SettingsDialog } from './components/SettingsDialog';
 import { Welcome } from './components/Welcome';
 import {
+  addBlock,
   addCards,
   addVersions,
+  createWireframePrompt,
   fitIntoPage,
+  newPageFromImageCard,
+  setPageBaseFromCard,
+  wireframeFromPage,
   layoutNewCards,
   newPageCard,
   placeIntoPage,
@@ -30,6 +35,7 @@ import {
   setActiveTheme,
   setCurrentVersion,
   setRefLockedVersion,
+  updateBlock,
   updatePrompt,
   updateTheme,
 } from './document/operations';
@@ -41,7 +47,9 @@ import { runM1Check } from './project/m1Check';
 import { runM2Check } from './project/m2Check';
 import { runM3Check } from './project/m3Check';
 import { runM4Check } from './project/m4Check';
+import { runM5Check } from './project/m5Check';
 import { runRealCheck } from './project/realCheck';
+import { targetThemeId, themeMarkdownFor } from './project/themeMarkdown';
 import { ProjectSession, type SaveState } from './project/ProjectSession';
 
 interface Toast {
@@ -75,6 +83,9 @@ const PALETTE_COMMANDS: PaletteCommand[] = [
   { id: 'toggleFocus', label: '只看当前区域', hint: '⌘⇧F' },
   { id: 'newBlankPage', label: '新建空白页面框', hint: 'F' },
   { id: 'newPageFromLowFi', label: '从低保真原型新建页面框…', hint: '⌘⇧L' },
+  { id: 'toWireframe', label: '转线框（选中的截图或页面框）' },
+  { id: 'copyThemeMarkdown', label: '复制主题说明（Markdown）' },
+  { id: 'saveThemeMarkdown', label: '存为主题说明（themes/名字.md）' },
   { id: 'togglePerf', label: '性能面板' },
 ];
 
@@ -384,7 +395,7 @@ export function ProjectApp() {
         toast(describeImportErrors(result) ?? '低保真原型导入失败', 'error');
         return;
       }
-      current.doc.apply('替换低保真原型', updatePage(current.doc.get(), pageId, { base }));
+      current.doc.apply('替换低保真原型', updatePage(current.doc.get(), pageId, { base, baseCardId: null, wireframePromptId: null }));
     },
     [toast],
   );
@@ -545,6 +556,45 @@ export function ProjectApp() {
           for (const prompt of prompts) await generate(prompt.id);
           break;
         }
+        case 'copyThemeMarkdown':
+        case 'saveThemeMarkdown': {
+          const themeId = targetThemeId(current.doc.get(), current.selection.get());
+          const md = themeId ? themeMarkdownFor(current.doc.get(), themeId, current.name, command === 'saveThemeMarkdown') : null;
+          if (!md) {
+            toast('先选中一张主题卡，或设一张生效主题卡');
+            break;
+          }
+          try {
+            if (command === 'copyThemeMarkdown') {
+              await window.anye.copyText(md.markdown);
+              toast(`已复制「${md.name}」的主题说明`);
+            } else {
+              const path = await window.anye.saveThemeMarkdown(md.name, md.markdown);
+              toast(`已存到 themes/${path.split('/').pop()}`);
+            }
+          } catch (error) {
+            toast(error instanceof Error ? error.message : String(error), 'error');
+          }
+          break;
+        }
+        case 'toWireframe': {
+          const state = current.doc.get();
+          const selected = state.cards.filter((card) => current.selection.has(card.id));
+          const [only] = selected;
+          const created =
+            selected.length === 1 && isImageCard(only)
+              ? createWireframePrompt(state, only.id, () => crypto.randomUUID())
+              : selected.length === 1 && isPageCard(only)
+                ? wireframeFromPage(state, only.id, () => crypto.randomUUID())
+                : null;
+          if (!created) {
+            toast('先选中一张截图或一个有低保真原型的页面框');
+            break;
+          }
+          current.doc.apply('转线框', created.state);
+          await generate(created.promptId);
+          break;
+        }
       }
     },
     [createPage, exportPage, generate, importInto, openDir, toast],
@@ -555,8 +605,8 @@ export function ProjectApp() {
   // ───────────── 验收自检 ─────────────
 
   useEffect(() => {
-    const { m1Check, m2Check, m3Check, m4Check, realCheck } = window.anye.flags;
-    if ((!m1Check && !m2Check && !m3Check && !m4Check && !realCheck) || !engine || !session || !assistant || checkStarted.current) return;
+    const { m1Check, m2Check, m3Check, m4Check, m5Check, realCheck } = window.anye.flags;
+    if ((!m1Check && !m2Check && !m3Check && !m4Check && !m5Check && !realCheck) || !engine || !session || !assistant || checkStarted.current) return;
     checkStarted.current = true;
     const run = m1Check
       ? runM1Check(m1Check, { engine, session, importInto })
@@ -566,7 +616,9 @@ export function ProjectApp() {
           ? runM3Check(m3Check, { engine, session, importInto, tracker, assistant, setRightTab })
           : m4Check
             ? runM4Check(m4Check, { engine, session, importInto, tracker, assistant, setRightTab, createPage, exportPage })
-            : runRealCheck({ engine, session, importInto, tracker, assistant });
+            : m5Check
+              ? runM5Check(m5Check, { engine, session, tracker, assistant, createPage, exportPage })
+              : runRealCheck({ engine, session, importInto, tracker, assistant, createPage });
     void run
       .catch((error: unknown) => console.error(`[check] 异常 ${error instanceof Error ? error.stack : String(error)}`))
       .finally(() => window.anye.quit());
@@ -762,6 +814,10 @@ const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function Ri
 ) {
   const state = useCommittedDoc(session.doc);
   const selectedIds = useSelectionIds(session.selection);
+  const assistantBusy = useSyncExternalStore(
+    (listener) => assistant.subscribe(listener),
+    () => assistant.isBusy(),
+  );
   const doc = session.doc;
   const tabs = (
     <div className="panel-tabs">
@@ -830,6 +886,57 @@ const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function Ri
       onReplaceLowFi={onReplaceLowFi}
       onExportPage={onExportPage}
       onPlaceInPage={onPlaceInPage}
+      blockActions={{
+        busy: assistantBusy,
+        decompose: (pageId) => void assistant.decomposePage(pageId),
+        writePrompts: (pageId) => void assistant.writeBlockPrompts(pageId),
+        addBlock: (pageId) => {
+          const added = addBlock(doc.get(), pageId, () => crypto.randomUUID());
+          if (!added) return;
+          doc.apply('新增区块', added.state);
+          session.selection.set([added.blockId]);
+        },
+        update: (id, patch) => doc.apply('编辑区块', updateBlock(doc.get(), id, patch)),
+        refreshCrop: (blockId) => void assistant.refreshBlockCrop(blockId),
+      }}
+      themeMarkdownActions={{
+        copy: async (themeId) => {
+          const md = themeMarkdownFor(doc.get(), themeId, session.name, false);
+          if (!md) throw new Error('找不到这张主题卡');
+          await window.anye.copyText(md.markdown);
+        },
+        save: async (themeId) => {
+          const md = themeMarkdownFor(doc.get(), themeId, session.name, true);
+          if (!md) throw new Error('找不到这张主题卡');
+          return window.anye.saveThemeMarkdown(md.name, md.markdown);
+        },
+      }}
+      wireframeActions={{
+        fromImage: (imageCardId) => {
+          const created = createWireframePrompt(doc.get(), imageCardId, () => crypto.randomUUID());
+          if (!created) return;
+          doc.apply('转线框', created.state);
+          session.selection.set([created.promptId]);
+          onGenerate(created.promptId);
+        },
+        fromPage: (pageId) => {
+          const created = wireframeFromPage(doc.get(), pageId, () => crypto.randomUUID());
+          if (!created) return;
+          doc.apply('转线框', created.state);
+          onGenerate(created.promptId);
+        },
+        newPage: (imageCardId) => {
+          const created = newPageFromImageCard(doc.get(), imageCardId, () => crypto.randomUUID());
+          if (!created) return;
+          doc.apply('用图像卡新建页面框', created.state);
+          session.selection.set([created.pageId]);
+          engine.zoomToCard(created.pageId);
+        },
+        useBaseCard: (pageId) => {
+          const page = doc.get().cards.find((c): c is PageCard => c.id === pageId && isPageCard(c));
+          if (page?.baseCardId) doc.apply('换低保真原型', setPageBaseFromCard(doc.get(), pageId, page.baseCardId));
+        },
+      }}
     />
   );
 }));
