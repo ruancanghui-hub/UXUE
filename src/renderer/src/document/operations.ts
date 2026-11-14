@@ -387,8 +387,21 @@ function themePlacement(state: DocState): Rect {
   return { x, y, width: THEME_CARD_WIDTH, height: THEME_CARD_HEIGHT };
 }
 
-export function themeFromDraft(state: DocState, draft: ThemeDraft, id: string): ThemeCard {
-  return { kind: 'theme', id, ...themePlacement(state), ...draft, groupId: null };
+export function themeFromDraft(
+  state: DocState,
+  draft: ThemeDraft,
+  id: string,
+  source: { imageCardId: string; versionId: string } | null = null,
+): ThemeCard {
+  return {
+    kind: 'theme',
+    id,
+    ...themePlacement(state),
+    ...draft,
+    groupId: null,
+    sourceImageCardId: source?.imageCardId ?? null,
+    sourceVersionId: source?.versionId ?? null,
+  };
 }
 
 export function setActiveTheme(state: DocState, id: string | null): DocState {
@@ -420,12 +433,14 @@ export function applyAssistantDrafts(
   contextImageIds: string[],
   fallbackCenter: { x: number; y: number },
   makeId: () => string,
+  /** 看图提炼主题时写入主题来源；纯文字为 null */
+  themeSource: { imageCardId: string; versionId: string } | null = null,
 ): AppliedDrafts {
   let next = state;
   let themeId: string | null = null;
   if (drafts.theme) {
     themeId = makeId();
-    next = addCards(next, [themeFromDraft(next, drafts.theme, themeId)]);
+    next = addCards(next, [themeFromDraft(next, drafts.theme, themeId, themeSource)]);
     if (!next.activeThemeCardId) next = { ...next, activeThemeCardId: themeId };
   }
 

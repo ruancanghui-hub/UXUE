@@ -64,7 +64,22 @@ export function AssistantPanel({ assistant, state, selectedIds, projectName, pro
       </div>
 
       <div className="assistant-actions">
-        <button onClick={() => prefill(`为「${projectName}」生成一套视觉主题`, '」生成一套视觉主题'.length)}>生成主题卡</button>
+        <button
+          onClick={() => {
+            const selected = assistant.selectedImageCards();
+            if (selected.length >= 2) {
+              void assistant.send('从选中的参考图提炼主题卡');
+              return;
+            }
+            if (selected.length === 1) {
+              send('从选中的参考图提炼主题卡');
+              return;
+            }
+            prefill(`为「${projectName}」生成一套视觉主题`, '」生成一套视觉主题'.length);
+          }}
+        >
+          {assistant.selectedImageCards().length === 1 ? '从选中的参考图提炼主题卡' : '生成主题卡'}
+        </button>
         <button disabled={!images.length || busy} onClick={() => send('反推选中的图，写成能复用这种风格的提示词')}>
           反推选中的图
         </button>

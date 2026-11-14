@@ -117,6 +117,10 @@ export interface ThemeCard {
   palette: ThemeColor[];
   rules: ThemeRules;
   groupId: string | null;
+  /** 主题来源图像卡；纯文字生成时为 null */
+  sourceImageCardId: string | null;
+  /** 提炼时该图像卡的当前版本；无来源或版本已丢时可为 null */
+  sourceVersionId: string | null;
 }
 
 /** 把若干卡片框成一组的容器；page/ref 不进组 */
@@ -404,6 +408,19 @@ export function parseProject(raw: unknown): ParseResult {
     }
   }
 
+  // 主题来源：图像卡没了整段清掉；版本没了只清 versionId
+  for (let index = 0; index < cards.length; index++) {
+    const card = cards[index];
+    if (!isThemeCard(card) || !card.sourceImageCardId) continue;
+    const source = cards.find((c) => c.id === card.sourceImageCardId);
+    if (!source || !isImageCard(source)) {
+      warnings.push('一张主题卡的来源参考图不存在，已去掉主题来源');
+      cards[index] = { ...card, sourceImageCardId: null, sourceVersionId: null };
+    } else if (card.sourceVersionId && !source.versions.some((v) => v.id === card.sourceVersionId)) {
+      cards[index] = { ...card, sourceVersionId: null };
+    }
+  }
+
   const activeThemeCardId =
     typeof raw.activeThemeCardId === 'string' && cards.some((card) => card.id === raw.activeThemeCardId && isThemeCard(card))
       ? raw.activeThemeCardId
@@ -491,6 +508,8 @@ function parseThemeCard(value: Record<string, unknown>): ThemeCard | null {
     palette,
     rules: { shape: text(rules.shape), material: text(rules.material), lighting: text(rules.lighting), color: text(rules.color) },
     groupId: parseGroupId(value.groupId),
+    sourceImageCardId: typeof value.sourceImageCardId === 'string' ? value.sourceImageCardId : null,
+    sourceVersionId: typeof value.sourceVersionId === 'string' ? value.sourceVersionId : null,
   };
 }
 

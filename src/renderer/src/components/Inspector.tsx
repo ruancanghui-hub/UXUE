@@ -699,12 +699,17 @@ function TemplateCreateSelect({ onPick }: { onPick(template: PromptTemplate): vo
 }
 
 function ThemeInfo(props: InspectorProps & { card: ThemeCard }) {
-  const { card, state, onUpdateTheme } = props;
+  const { card, state, onUpdateTheme, cacheBust } = props;
   const active = state.activeThemeCardId === card.id;
   const update = (patch: Partial<Omit<ThemeCard, 'kind' | 'id'>>): void => onUpdateTheme(card.id, patch);
   const splitList = (value: string): string[] => value.split(/[、,，;；\n]+/).map((item) => item.trim()).filter(Boolean);
   const setColor = (index: number, patch: Partial<ThemeColor>): void =>
     update({ palette: card.palette.map((color, i) => (i === index ? { ...color, ...patch } : color)) });
+  const source = card.sourceImageCardId ? state.cards.find((c) => c.id === card.sourceImageCardId) : undefined;
+  const sourceVersion =
+    source && isImageCard(source)
+      ? source.versions.find((v) => v.id === card.sourceVersionId) ?? currentVersion(source)
+      : null;
 
   return (
     <>
@@ -715,6 +720,21 @@ function ThemeInfo(props: InspectorProps & { card: ThemeCard }) {
           {active ? '取消生效' : '设为生效主题卡'}
         </button>
         <p className="hint">生效主题卡的规则会附加到每次生成的提示词后面；每张提示词卡可以单独关掉。</p>
+        {card.sourceImageCardId && source && isImageCard(source) && sourceVersion && (
+          <div className="ref-source">
+            <img className="lowfi-thumb" src={thumbnailUrl(sourceVersion, cacheBust.get(sourceVersion.id))} alt="" />
+            <div>
+              <div className="field-label">主题来源</div>
+              <div className="field-value">{source.name}</div>
+              <button className="link" onClick={() => props.onSelectCard(source.id)}>
+                选中来源参考图
+              </button>
+            </div>
+          </div>
+        )}
+        {card.sourceImageCardId && !(source && isImageCard(source)) && (
+          <p className="hint">来源参考图已不在项目中。</p>
+        )}
       </section>
 
       <section className="inspector-section">

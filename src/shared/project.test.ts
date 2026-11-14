@@ -111,11 +111,41 @@ describe('parseProject', () => {
       ],
       rules: { shape: '圆润', material: '哑光', lighting: '柔光', color: '偏暖' },
       groupId: null,
+      sourceImageCardId: null,
+      sourceVersionId: null,
     };
     const { project } = parseProject({ ...emptyProject(), cards: [theme], activeThemeCardId: 't1' });
-    expect(project.cards[0]).toEqual({ ...theme, palette: [theme.palette[0]], groupId: null });
+    expect(project.cards[0]).toEqual({ ...theme, palette: [theme.palette[0]] });
     expect(project.activeThemeCardId).toBe('t1');
     expect(parseProject({ ...emptyProject(), cards: [theme], activeThemeCardId: 'nope' }).project.activeThemeCardId).toBeNull();
+  });
+
+  it('主题卡可带主题来源；来源图不存在时清掉', () => {
+    const theme = {
+      kind: 'theme' as const,
+      id: 't1',
+      name: '寿司',
+      x: 0,
+      y: 0,
+      width: 420,
+      height: 500,
+      topic: '日式寿司点餐',
+      keywords: ['新鲜'],
+      cues: ['寿司'],
+      palette: [{ role: '主色', name: '红', hex: '#E8473C', note: '' }],
+      rules: { shape: '', material: '', lighting: '', color: '' },
+      groupId: null,
+      sourceImageCardId: 'c1',
+      sourceVersionId: 'v2',
+    };
+    const withSource = parseProject({ ...emptyProject(), cards: [validCard, theme] });
+    expect(withSource.project.cards.find((c) => c.id === 't1')).toMatchObject({
+      sourceImageCardId: 'c1',
+      sourceVersionId: 'v2',
+    });
+    const orphan = parseProject({ ...emptyProject(), cards: [theme] });
+    expect(orphan.project.cards[0]).toMatchObject({ sourceImageCardId: null, sourceVersionId: null });
+    expect(orphan.warnings.some((w) => w.includes('主题来源'))).toBe(true);
   });
 
   it('能打开 schema 1 的项目并升到当前版本', () => {

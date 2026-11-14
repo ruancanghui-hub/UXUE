@@ -21,12 +21,14 @@ const INSTRUCTIONS = `你是「暗夜精灵」里的设计助手，帮设计师�
 
 按用户这一次的要求决定输出什么；不需要的部分 theme 给 null、prompts 给空数组。
 
-一、生成主题卡（theme）：从产品主题提炼一套视觉规则。
-- name：简短的主题卡名字；topic：产品主题原文。
-- keywords：4–6 个视觉关键词（例如：新鲜、热闹、亲切、有食欲）。
+一、生成 / 提炼主题卡（theme）：
+- 无图、纯文字产品主题时：从文字提炼一套视觉规则。
+- 有且仅有 1 张上下文图，且用户要求建立 / 提炼视觉主题、视觉方向或品牌线索时：仔细看图（主体、配色、造型、材质、光影、可复用符号），产出主题卡；用户消息里若写了产品主题则优先采用，否则根据画面推断短 topic。这种情况下 prompts 给空数组（除非用户同一句还要求写提示词）。
+- name：简短的主题卡名字；topic：产品主题。
+- keywords：4–6 个视觉关键词（气质，例如：新鲜、热闹、亲切、有食欲）。
 - cues：4–6 个具体的视觉线索（物件、形象、标志性颜色）。
-- palette：4–5 个颜色，按"主色、邻近辅助色、深色（标题、正文、轮廓）、暖白（平衡与留白）"组织；hex 用 #RRGGBB，note 写这个颜色用在哪里、为什么。
-- rules：造型（圆润度、比例、视角）、材质（质感、细节密度）、光影（光源、阴影、高光）、色彩协调（明度、饱和度、冷暖）。原则是"统一 ≠ 所有元素长得一样，统一 = 不同元素遵循同一套视觉规则"。
+- palette：4–5 个颜色，按"主色、邻近辅助色、深色（标题、正文、轮廓）、暖白（平衡与留白）"组织；hex 用 #RRGGBB（可估计），note 写这个颜色用在哪里、为什么。
+- rules：造型（圆润度、比例、视角）、材质（质感、细节密度）、光影（光源、阴影、高光）、色彩协调（明度、饱和度、冷暖与配色策略）。原则是"统一 ≠ 所有元素长得一样，统一 = 不同元素遵循同一套视觉规则"。
 
 二、反推参考图（prompts，inputIndex 为 null）：每张图一条，按「画面主题／构图／造型与材质／光线／色彩」分段，写成能直接拿去生成同风格画面的中文提示词；不出现品牌、Logo 和文字。
 
@@ -164,12 +166,16 @@ export class MockAssistant implements AssistantProvider {
     const message = request.message;
     const base = { provider: 'mock' as const, model: 'local-mock', costUsd: 0 };
 
-    if (/主题/.test(message)) {
-      const topic = extractTopic(message) || request.projectName;
-      const theme = /寿司/.test(topic)
-        ? { ...SUSHI_THEME, topic, name: topic === SUSHI_THEME.topic ? SUSHI_THEME.name : topic }
+    if (/主题|视觉方向|品牌线索/.test(message)) {
+      const fromImage = request.images.length === 1;
+      const topic = extractTopic(message) || (fromImage ? `基于「${request.images[0].name}」` : request.projectName);
+      const theme = /寿司/.test(topic) || (fromImage && /寿司/.test(request.images[0].name))
+        ? { ...SUSHI_THEME, topic: extractTopic(message) || SUSHI_THEME.topic, name: SUSHI_THEME.name }
         : genericTheme(topic);
-      return { ...base, reply: `（本地模拟）为「${topic}」做了一张主题卡。`, theme, prompts: [] };
+      const reply = fromImage
+        ? `（本地模拟）已从参考图「${request.images[0].name}」提炼视觉主题，可在主题卡里改色板和规则。`
+        : `（本地模拟）为「${topic}」做了一张主题卡。`;
+      return { ...base, reply, theme, prompts: [] };
     }
     if (/反推/.test(message) && request.images.length) {
       const prompts: PromptDraft[] = request.images.map((image) => ({

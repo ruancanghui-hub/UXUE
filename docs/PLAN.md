@@ -370,10 +370,16 @@ OpenAI 供应商（API Key 存钥匙串）；提示词卡、来源连线、`{{Im
 
 **验证**：`npm test`（60）；`npm run typecheck`。
 
+### 从参考图提炼主题 ✅
+
+规格全文：[`docs/specs/from-reference-to-theme.md`](./specs/from-reference-to-theme.md)。  
+助手选中一张参考图 → 产出主题卡（含主题来源）；与「生成主题卡」同一入口；多图拒绝；无生效卡时自动生效。
+
 ### 后置（G）
 
 - 更多模型供应商（Gemini、本地 ComfyUI 等；硅基流动已接入生图）
 - 如果分层 SVG 不够用，就写 Figma 插件
+- 主题来源变化后的「已过期」与一键重提炼
 
 ## 9. 风险
 

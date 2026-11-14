@@ -17,6 +17,8 @@ const theme = (id: string, shape = '圆润'): ThemeCard => ({
   palette: [],
   rules: { shape, material: '', lighting: '', color: '' },
   groupId: null,
+  sourceImageCardId: null,
+  sourceVersionId: null,
 });
 
 const image = (id: string, versionId: string, generation?: ImageCard['versions'][0]['generation']): ImageCard => ({
