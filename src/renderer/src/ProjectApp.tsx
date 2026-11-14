@@ -578,7 +578,17 @@ export function ProjectApp() {
       ? '本地模拟'
       : config.provider === 'siliconflow'
         ? config.hasSiliconflowKey ? '硅基流动' : '硅基流动 · 未设置 Key'
-        : config.hasApiKey ? 'OpenAI' : 'OpenAI · 未设置 Key';
+        : config.provider === 'newapi'
+          ? config.hasNewapiKey ? 'NewAPI 中转' : 'NewAPI · 未设置 Key'
+          : config.hasApiKey ? 'OpenAI' : 'OpenAI · 未设置 Key';
+
+  const assistantLabel = !config
+    ? ''
+    : config.assistantProvider === 'mock'
+      ? '助手 · 本地模拟'
+      : config.assistantProvider === 'newapi'
+        ? config.hasNewapiKey ? `助手 · ${config.newapiAssistantModel}` : '助手 · NewAPI 未设置 Key'
+        : config.hasApiKey ? `助手 · ${config.assistantModel}` : '助手 · OpenAI 未设置 Key';
 
   return (
     <div className="app">
@@ -655,7 +665,7 @@ export function ProjectApp() {
             tab={rightTab}
             onTab={setRightTab}
             assistant={assistant}
-            providerLabel={providerLabel}
+            assistantLabel={assistantLabel}
             session={session}
             engine={engine}
             cacheBust={cacheBust}
@@ -734,7 +744,7 @@ interface RightPanelProps extends PanelProps {
   tab: RightTab;
   onTab(tab: RightTab): void;
   assistant: AssistantSession;
-  providerLabel: string;
+  assistantLabel: string;
   config: GenerationConfig | null;
   jobs: TrackedJob[];
   onImportVersion(cardId: string): void;
@@ -747,7 +757,7 @@ interface RightPanelProps extends PanelProps {
 }
 
 const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function RightPanel(
-  { tab, onTab, assistant, providerLabel, session, engine, cacheBust, config, jobs, onImportVersion, onGenerate, onRegenDownstream, exports, onReplaceLowFi, onExportPage, onPlaceInPage },
+  { tab, onTab, assistant, assistantLabel, session, engine, cacheBust, config, jobs, onImportVersion, onGenerate, onRegenDownstream, exports, onReplaceLowFi, onExportPage, onPlaceInPage },
   ref,
 ) {
   const state = useCommittedDoc(session.doc);
@@ -772,7 +782,7 @@ const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function Ri
           state={state}
           selectedIds={selectedIds}
           projectName={session.name}
-          providerLabel={providerLabel}
+          providerLabel={assistantLabel}
           onSelectCards={(ids) => session.selection.set(ids)}
         />
       </aside>

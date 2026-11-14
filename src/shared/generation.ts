@@ -1,7 +1,32 @@
 /** 生成相关的规则：主进程和渲染进程共用，保证估算、校验和实际请求一致 */
 
-export type ProviderId = 'openai' | 'siliconflow' | 'mock';
+export type ProviderId = 'openai' | 'siliconflow' | 'newapi' | 'mock';
+export type AssistantProviderId = 'openai' | 'newapi' | 'mock';
 export type Currency = 'USD' | 'CNY';
+
+/**
+ * NewAPI（及同类 OpenAI 兼容中转）：地址和模型因站点而异，在设置里填 Base URL 与模型 id。
+ * 预设按常见中转「带 image 的 Gemini」列出；站点没有的请用自定义，以 /v1/models 为准。
+ */
+export const NEWAPI_MODELS = [
+  { id: 'gemini-2.5-flash-image', label: 'gemini-2.5-flash-image（快，推荐试）' },
+  { id: 'gemini-3.1-flash-image', label: 'gemini-3.1-flash-image' },
+  { id: 'gemini-3-pro-image', label: 'gemini-3-pro-image' },
+  { id: 'gemini-3-pro-image-preview', label: 'gemini-3-pro-image-preview' },
+  { id: 'gpt-image-2', label: 'gpt-image-2（改图+文生图）' },
+  { id: 'gpt-image-1', label: 'gpt-image-1（若站点有）' },
+  { id: 'dall-e-3', label: 'DALL·E 3（仅文生图，若站点有）' },
+] as const;
+export const DEFAULT_NEWAPI_MODEL = 'gemini-2.5-flash-image';
+/** 助手走 NewAPI 时的看图对话模型预设；站点没有的用自定义 */
+export const NEWAPI_ASSISTANT_MODELS = [
+  { id: 'claude-sonnet-5-5', label: 'claude-sonnet-5-5（看图稳，推荐）' },
+  { id: 'claude-opus-5-5', label: 'claude-opus-5-5（更强，贵）' },
+  { id: 'claude-fable-5-1', label: 'claude-fable-5-1' },
+] as const;
+export const DEFAULT_NEWAPI_ASSISTANT_MODEL = 'claude-sonnet-5-5';
+/** 未填写时的占位；真正请求前必须在设置里改成你的中转地址 */
+export const DEFAULT_NEWAPI_BASE_URL = '';
 
 /**
  * 硅基流动（国内站，2026-11）：改图只有 Qwen-Image-Edit-2509 支持多张参考图（1–3 张）；
@@ -31,6 +56,15 @@ export const SILICONFLOW_MAX_INPUTS = 3;
 /** 各供应商一次最多接受的输入图数量 */
 export function maxInputsFor(provider: ProviderId): number {
   return provider === 'siliconflow' ? SILICONFLOW_MAX_INPUTS : 16;
+}
+
+/** 规范化 OpenAI 兼容中转的 Base URL，保证以 /v1 结尾、无尾斜杠 */
+export function normalizeOpenAICompatibleBaseUrl(url: string): string {
+  let base = url.trim().replace(/\/+$/, '');
+  if (!base) throw new Error('还没有填写 NewAPI 地址，请在设置里填中转站 Base URL（例如 https://你的域名）');
+  if (!/^https?:\/\//i.test(base)) throw new Error('NewAPI 地址必须以 http:// 或 https:// 开头');
+  if (!/\/v1$/i.test(base)) base += '/v1';
+  return base;
 }
 
 /** 在模型推荐尺寸里挑比例最接近的 */
@@ -263,8 +297,10 @@ export interface GenerationConfig {
   model: string;
   /** 助手用的文本 / 看图模型 */
   assistantModel: string;
-  /** 助手走哪家：生图换成硅基流动时，助手仍可以用 OpenAI 或本地模拟 */
-  assistantProvider: 'openai' | 'mock';
+  /** 助手走哪家：和生图供应商分开选；NewAPI 复用中转的 Base URL 与 Key */
+  assistantProvider: AssistantProviderId;
+  /** 助手走 NewAPI 时用的看图对话模型 id（以中转站 /models 为准） */
+  newapiAssistantModel: string;
   hasApiKey: boolean;
   /** 显示用的 Key 末四位 */
   apiKeyHint: string | null;
@@ -272,6 +308,12 @@ export interface GenerationConfig {
   siliconflowKeyHint: string | null;
   siliconflowEditModel: string;
   siliconflowT2iModel: string;
+  /** NewAPI 中转站根地址（可含或不含 /v1） */
+  newapiBaseUrl: string;
+  /** NewAPI 生图模型 id（以中转站 /models 为准，常见 gemini-*-image） */
+  newapiModel: string;
+  hasNewapiKey: boolean;
+  newapiKeyHint: string | null;
   calibration: Record<string, number>;
 }
 
@@ -293,7 +335,10 @@ export interface ProviderPlan {
 
 /** 一张提示词卡在当前设置下会怎么调用：模型、尺寸、估算花费 */
 export function planGeneration(
-  config: Pick<GenerationConfig, 'provider' | 'model' | 'calibration' | 'siliconflowEditModel' | 'siliconflowT2iModel'>,
+  config: Pick<
+    GenerationConfig,
+    'provider' | 'model' | 'calibration' | 'siliconflowEditModel' | 'siliconflowT2iModel' | 'newapiModel'
+  >,
   settings: PromptSettings,
   firstInput: { width: number; height: number } | null,
   inputCount: number,
@@ -324,6 +369,25 @@ export function planGeneration(
       currency: 'CNY',
       promptStyle: 'image',
       maxInputs: SILICONFLOW_MAX_INPUTS,
+    };
+  }
+  if (config.provider === 'newapi') {
+    const model = (config.newapiModel || DEFAULT_NEWAPI_MODEL).trim() || DEFAULT_NEWAPI_MODEL;
+    const size = /^dall-e-3/i.test(model)
+      ? nearestSize(['1024x1024', '1792x1024', '1024x1792'], base.width / base.height)
+      : /^dall-e-2/i.test(model)
+        ? { width: 1024, height: 1024 }
+        : base;
+    const calibration = config.calibration[calibrationKey(model, settings.quality)] ?? 1;
+    return {
+      provider: 'newapi',
+      model,
+      size,
+      sizeLabel: `${size.width} × ${size.height}`,
+      estimate: estimateCostUsd(settings, size, calibration),
+      currency: 'USD',
+      promptStyle: 'image',
+      maxInputs: 16,
     };
   }
   const model = config.provider === 'mock' ? 'local-mock' : config.model;

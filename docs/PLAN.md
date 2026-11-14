@@ -375,9 +375,13 @@ OpenAI 供应商（API Key 存钥匙串）；提示词卡、来源连线、`{{Im
 规格全文：[`docs/specs/from-reference-to-theme.md`](./specs/from-reference-to-theme.md)。  
 助手选中一张参考图 → 产出主题卡（含主题来源）；与「生成主题卡」同一入口；多图拒绝；无生效卡时自动生效。
 
+### NewAPI 中转 ✅
+
+设置里可选「NewAPI 中转」：填写 Base URL（OpenAI 兼容，自动补 `/v1`）、模型 id（默认 `gemini-2.5-flash-image`，可自定义站点列表）、独立 API Key。文生图走 `/images/generations`，有参考图走 `/images/edits`；支持 `b64_json` / `url` 结果。
+
 ### 后置（G）
 
-- 更多模型供应商（Gemini、本地 ComfyUI 等；硅基流动已接入生图）
+- 更多模型供应商（Gemini、本地 ComfyUI 等；硅基流动 / NewAPI 已接入生图）
 - 如果分层 SVG 不够用，就写 Figma 插件
 - 主题来源变化后的「已过期」与一键重提炼
 

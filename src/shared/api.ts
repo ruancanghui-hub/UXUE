@@ -1,7 +1,14 @@
 import type { AssistantRequest, AssistantResponse } from './assistant';
 import type { BenchManifest, BenchProgress, BenchReport } from './bench';
 import type { ExportResult, PageExportPlan } from './export';
-import type { GenerationConfig, GenerationRequest, JobUpdate, PromptSettings, ProviderId } from './generation';
+import type {
+  AssistantProviderId,
+  GenerationConfig,
+  GenerationRequest,
+  JobUpdate,
+  PromptSettings,
+  ProviderId,
+} from './generation';
 import type { ProjectFile, Version } from './project';
 
 export interface PromptTemplate {
@@ -123,12 +130,15 @@ export interface AnyeApi {
     provider?: ProviderId;
     model?: string;
     assistantModel?: string;
-    assistantProvider?: 'openai' | 'mock';
+    assistantProvider?: AssistantProviderId;
     siliconflowEditModel?: string;
     siliconflowT2iModel?: string;
+    newapiBaseUrl?: string;
+    newapiModel?: string;
+    newapiAssistantModel?: string;
   }): Promise<GenerationConfig>;
-  setApiKey(provider: 'openai' | 'siliconflow', key: string | null): Promise<GenerationConfig>;
-  testConnection(provider: 'openai' | 'siliconflow'): Promise<string>;
+  setApiKey(provider: 'openai' | 'siliconflow' | 'newapi', key: string | null): Promise<GenerationConfig>;
+  testConnection(provider: 'openai' | 'siliconflow' | 'newapi'): Promise<string>;
   submitGeneration(request: GenerationRequest): Promise<JobUpdate>;
   cancelGeneration(jobId: string): void;
   cancelAllGenerations(): void;

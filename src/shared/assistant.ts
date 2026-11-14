@@ -57,8 +57,9 @@ export interface AssistantResponse {
   reply: string;
   theme: ThemeDraft | null;
   prompts: PromptDraft[];
-  provider: 'openai' | 'mock';
+  provider: 'openai' | 'newapi' | 'mock';
   model: string;
+  /** NewAPI 中转按站点计价，拿不到真实单价时为 0 */
   costUsd: number;
 }
 

@@ -375,6 +375,9 @@ function PromptInfo(props: InspectorProps & { card: PromptCard; textareaRef: Rea
         </div>
         <Field label="实际尺寸" value={plan?.sizeLabel ?? '—'} />
         {plan?.provider === 'siliconflow' && <p className="hint">硅基流动按模型固定质量出图，"质量"选项对它不起作用。</p>}
+        {plan?.provider === 'newapi' && (
+          <p className="hint">NewAPI 中转：改图请用 gpt-image 系模型；DALL·E 只支持文生图。费用以中转站为准。</p>
+        )}
         <ThemeToggle card={card} state={state} onSettings={props.onSettings} />
         <Field label="费用估算" value={costLabel} />
         <button className="primary" disabled={!!problem || busy} onClick={() => props.onGenerate(card.id)}>

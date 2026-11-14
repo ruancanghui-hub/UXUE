@@ -3,30 +3,48 @@ import { join } from 'node:path';
 import { safeStorage } from 'electron';
 import { ASSISTANT_MODELS, DEFAULT_ASSISTANT_MODEL } from '../../shared/assistant';
 import {
+  DEFAULT_NEWAPI_ASSISTANT_MODEL,
+  DEFAULT_NEWAPI_BASE_URL,
+  DEFAULT_NEWAPI_MODEL,
   DEFAULT_OPENAI_MODEL,
   DEFAULT_SILICONFLOW_EDIT_MODEL,
   DEFAULT_SILICONFLOW_T2I_MODEL,
   OPENAI_MODELS,
   SILICONFLOW_EDIT_MODELS,
   SILICONFLOW_T2I_MODELS,
+  type AssistantProviderId,
   type GenerationConfig,
   type ProviderId,
 } from '../../shared/generation';
 
-export type KeyProvider = 'openai' | 'siliconflow';
+export type KeyProvider = 'openai' | 'siliconflow' | 'newapi';
 
 interface StoredSettings {
   provider: ProviderId;
   model: string;
   assistantModel: string;
-  assistantProvider: 'openai' | 'mock';
+  assistantProvider: AssistantProviderId;
   siliconflowEditModel: string;
   siliconflowT2iModel: string;
+  newapiBaseUrl: string;
+  newapiModel: string;
+  newapiAssistantModel: string;
   calibration: Record<string, number>;
 }
 
 export type SettingsPatch = Partial<
-  Pick<StoredSettings, 'provider' | 'model' | 'assistantModel' | 'assistantProvider' | 'siliconflowEditModel' | 'siliconflowT2iModel'>
+  Pick<
+    StoredSettings,
+    | 'provider'
+    | 'model'
+    | 'assistantModel'
+    | 'assistantProvider'
+    | 'siliconflowEditModel'
+    | 'siliconflowT2iModel'
+    | 'newapiBaseUrl'
+    | 'newapiModel'
+    | 'newapiAssistantModel'
+  >
 >;
 
 const DEFAULTS: StoredSettings = {
@@ -36,12 +54,22 @@ const DEFAULTS: StoredSettings = {
   assistantProvider: 'openai',
   siliconflowEditModel: DEFAULT_SILICONFLOW_EDIT_MODEL,
   siliconflowT2iModel: DEFAULT_SILICONFLOW_T2I_MODEL,
+  newapiBaseUrl: DEFAULT_NEWAPI_BASE_URL,
+  newapiModel: DEFAULT_NEWAPI_MODEL,
+  newapiAssistantModel: DEFAULT_NEWAPI_ASSISTANT_MODEL,
   calibration: {},
 };
+const ASSISTANT_PROVIDERS: AssistantProviderId[] = ['openai', 'newapi', 'mock'];
+const trimmedOr = (value: unknown, fallback: string): string =>
+  typeof value === 'string' && value.trim() ? value.trim() : fallback;
 /** 校准系数取指数滑动平均，单次异常不会让估算大幅跳动 */
 const CALIBRATION_WEIGHT = 0.3;
-const PROVIDERS: ProviderId[] = ['openai', 'siliconflow', 'mock'];
-const KEY_FILES: Record<KeyProvider, string> = { openai: 'openai-key.bin', siliconflow: 'siliconflow-key.bin' };
+const PROVIDERS: ProviderId[] = ['openai', 'siliconflow', 'newapi', 'mock'];
+const KEY_FILES: Record<KeyProvider, string> = {
+  openai: 'openai-key.bin',
+  siliconflow: 'siliconflow-key.bin',
+  newapi: 'newapi-key.bin',
+};
 
 const oneOf = <T extends string>(value: unknown, allowed: readonly { id: T }[] | readonly T[], fallback: T): T => {
   const ids = (allowed as readonly (T | { id: T })[]).map((item) => (typeof item === 'string' ? item : item.id));
@@ -54,7 +82,7 @@ const oneOf = <T extends string>(value: unknown, allowed: readonly { id: T }[] |
  */
 export class GenerationSettingsStore {
   private settings: StoredSettings = DEFAULTS;
-  private readonly keys: Record<KeyProvider, string | null> = { openai: null, siliconflow: null };
+  private readonly keys: Record<KeyProvider, string | null> = { openai: null, siliconflow: null, newapi: null };
   private loaded = false;
 
   constructor(private readonly dir: string) {}
@@ -68,10 +96,16 @@ export class GenerationSettingsStore {
         provider: oneOf(raw.provider, PROVIDERS, DEFAULTS.provider),
         model: oneOf(raw.model, OPENAI_MODELS, DEFAULTS.model),
         assistantModel: oneOf(raw.assistantModel, ASSISTANT_MODELS, DEFAULTS.assistantModel),
-        // 旧设置里没有这一项：以前生图选本地模拟时助手也是本地模拟
-        assistantProvider: raw.assistantProvider === 'mock' || (!raw.assistantProvider && raw.provider === 'mock') ? 'mock' : 'openai',
+        assistantProvider: raw.assistantProvider
+          ? oneOf(raw.assistantProvider, ASSISTANT_PROVIDERS, DEFAULTS.assistantProvider)
+          : raw.provider === 'mock'
+            ? 'mock'
+            : DEFAULTS.assistantProvider,
         siliconflowEditModel: oneOf(raw.siliconflowEditModel, SILICONFLOW_EDIT_MODELS, DEFAULTS.siliconflowEditModel),
         siliconflowT2iModel: oneOf(raw.siliconflowT2iModel, SILICONFLOW_T2I_MODELS, DEFAULTS.siliconflowT2iModel),
+        newapiBaseUrl: typeof raw.newapiBaseUrl === 'string' ? raw.newapiBaseUrl.trim() : DEFAULTS.newapiBaseUrl,
+        newapiModel: trimmedOr(raw.newapiModel, DEFAULTS.newapiModel),
+        newapiAssistantModel: trimmedOr(raw.newapiAssistantModel, DEFAULTS.newapiAssistantModel),
         calibration: raw.calibration && typeof raw.calibration === 'object' ? raw.calibration : {},
       };
     } catch {
@@ -88,7 +122,7 @@ export class GenerationSettingsStore {
   }
 
   config(): GenerationConfig {
-    const { openai, siliconflow } = this.keys;
+    const { openai, siliconflow, newapi } = this.keys;
     return {
       provider: this.settings.provider,
       model: this.settings.model,
@@ -100,6 +134,11 @@ export class GenerationSettingsStore {
       siliconflowKeyHint: siliconflow ? siliconflow.slice(-4) : null,
       siliconflowEditModel: this.settings.siliconflowEditModel,
       siliconflowT2iModel: this.settings.siliconflowT2iModel,
+      newapiBaseUrl: this.settings.newapiBaseUrl,
+      newapiModel: this.settings.newapiModel,
+      newapiAssistantModel: this.settings.newapiAssistantModel,
+      hasNewapiKey: !!newapi,
+      newapiKeyHint: newapi ? newapi.slice(-4) : null,
       calibration: { ...this.settings.calibration },
     };
   }
@@ -113,9 +152,14 @@ export class GenerationSettingsStore {
     if (patch.provider) s.provider = oneOf(patch.provider, PROVIDERS, s.provider);
     if (patch.model) s.model = oneOf(patch.model, OPENAI_MODELS, s.model);
     if (patch.assistantModel) s.assistantModel = oneOf(patch.assistantModel, ASSISTANT_MODELS, s.assistantModel);
-    if (patch.assistantProvider) s.assistantProvider = patch.assistantProvider === 'mock' ? 'mock' : 'openai';
+    if (patch.assistantProvider) s.assistantProvider = oneOf(patch.assistantProvider, ASSISTANT_PROVIDERS, s.assistantProvider);
     if (patch.siliconflowEditModel) s.siliconflowEditModel = oneOf(patch.siliconflowEditModel, SILICONFLOW_EDIT_MODELS, s.siliconflowEditModel);
     if (patch.siliconflowT2iModel) s.siliconflowT2iModel = oneOf(patch.siliconflowT2iModel, SILICONFLOW_T2I_MODELS, s.siliconflowT2iModel);
+    if (patch.newapiBaseUrl !== undefined) s.newapiBaseUrl = patch.newapiBaseUrl.trim();
+    if (patch.newapiModel !== undefined) s.newapiModel = trimmedOr(patch.newapiModel, s.newapiModel);
+    if (patch.newapiAssistantModel !== undefined) {
+      s.newapiAssistantModel = trimmedOr(patch.newapiAssistantModel, s.newapiAssistantModel);
+    }
     await this.persist();
     return this.config();
   }

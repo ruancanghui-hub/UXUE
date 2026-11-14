@@ -1,5 +1,13 @@
 import { join } from 'node:path';
-import { costFromUsage, SILICONFLOW_MAX_INPUTS, type GenerationRequest, type ImageUsage, type ProviderId } from '../../shared/generation';
+import {
+  costFromUsage,
+  normalizeOpenAICompatibleBaseUrl,
+  SILICONFLOW_MAX_INPUTS,
+  type GenerationRequest,
+  type ImageUsage,
+  type ProviderId,
+  type Quality,
+} from '../../shared/generation';
 import type { MockGenerateResult, PreparedInput } from '../../shared/workerProtocol';
 import { httpFetch } from '../http';
 import type { ImageWorkerClient } from '../imageWorkerClient';
@@ -226,6 +234,167 @@ export class SiliconFlowProvider implements ImageProvider {
     if (missing.length) throw new Error(`Key 有效，但账号下没有这些模型：${missing.join('、')}`);
     return `连接正常，可以使用 ${models.join('、')}（余额请在 cloud.siliconflow.cn 控制台查看）`;
   }
+}
+
+/**
+ * NewAPI 等 OpenAI 兼容中转：Base URL + Bearer Key，走 /images/generations 或 /images/edits。
+ * 结果可能是 b64_json 或 url（url 则下载）；计费以接口 usage 为准，没有则退回粗估。
+ */
+export class NewApiProvider implements ImageProvider {
+  readonly id = 'newapi' as const;
+
+  constructor(
+    private readonly worker: ImageWorkerClient,
+    private readonly getApiKey: () => string | null,
+    private readonly getBaseUrl: () => string,
+  ) {}
+
+  async generate(request: GenerationRequest, model: string, signal: AbortSignal): Promise<ProviderResult> {
+    const apiKey = this.getApiKey();
+    if (!apiKey) throw new Error('还没有设置 NewAPI Key，请在“设置”里填写');
+    const base = normalizeOpenAICompatibleBaseUrl(this.getBaseUrl());
+    const dalle = /^dall-e/i.test(model);
+    const openAiImage = /^gpt-image/i.test(model);
+    if (dalle && request.inputs.length > 0) {
+      throw new Error('DALL·E 不支持参考图改图，请改用 gemini-*-image / gpt-image-1，或先解绑输入图做文生图');
+    }
+    if (dalle && request.settings.count > 1 && /^dall-e-3/i.test(model)) {
+      throw new Error('DALL·E 3 一次只能生成 1 张，请把数量改成 1');
+    }
+
+    const size = request.size ? `${request.size.width}x${request.size.height}` : 'auto';
+    const body: Record<string, unknown> = {
+      model,
+      prompt: request.prompt,
+      n: request.settings.count,
+      size,
+    };
+
+    // OpenAI 家族才带 quality / output_format；Gemini 等中转模型多半不认这些字段
+    if (dalle) {
+      body.response_format = 'b64_json';
+      body.quality = mapDalleQuality(request.settings.quality);
+    } else if (openAiImage) {
+      body.quality = request.settings.quality === 'xhigh' ? 'high' : request.settings.quality;
+      body.output_format = 'png';
+    }
+
+    if (request.inputs.length > 0) {
+      if (request.inputs.length > 16) throw new Error('一次最多接受 16 张输入图');
+      const prepared = await Promise.all(
+        request.inputs.map((input) =>
+          this.worker.request<PreparedInput>({ type: 'prepareInput', path: join(request.projectDir, input.file) }),
+        ),
+      );
+      body.images = prepared.map((image) => ({ image_url: `data:${image.mime};base64,${image.base64}` }));
+    }
+
+    const endpoint = request.inputs.length > 0 ? '/images/edits' : '/images/generations';
+    const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const response = await httpFetch('请求 NewAPI 生图', `${base}${endpoint}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.any([signal, timeout]),
+    });
+    const json = (await response.json().catch(() => null)) as {
+      data?: { b64_json?: string; url?: string }[];
+      usage?: ImageUsage;
+      error?: { message?: string };
+    } | null;
+    if (!response.ok) throw new Error(newApiErrorMessage(json?.error?.message, response.status));
+
+    const images: Uint8Array[] = [];
+    const urls: string[] = [];
+    for (const item of json?.data ?? []) {
+      if (item.b64_json) images.push(new Uint8Array(Buffer.from(item.b64_json, 'base64')));
+      else if (item.url) urls.push(item.url);
+    }
+    if (urls.length) {
+      try {
+        images.push(...(await downloadResults(urls, signal)));
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new DownloadFailedError(
+          `NewAPI 已生成但下载失败：${reason}`,
+          urls,
+          Date.now() + RESULT_URL_TTL_MS,
+        );
+      }
+    }
+    if (images.length === 0) throw new Error('NewAPI 没有返回图片');
+    return { images, costUsd: json?.usage ? costFromUsage(json.usage) : null };
+  }
+
+  async testConnection(model: string): Promise<string> {
+    const apiKey = this.getApiKey();
+    if (!apiKey) throw new Error('还没有设置 NewAPI Key');
+    const base = normalizeOpenAICompatibleBaseUrl(this.getBaseUrl());
+    const response = await httpFetch('连接 NewAPI', `${base}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    const json = (await response.json().catch(() => null)) as {
+      data?: { id?: string }[];
+      error?: { message?: string };
+    } | null;
+    if (!response.ok) throw new Error(json?.error?.message ?? `HTTP ${response.status}`);
+    const ids = (json?.data ?? []).map((item) => item.id).filter((id): id is string => !!id);
+    const imageish = ids.filter((id) => /image|dall-e|flux|sdxl|midjourney|imagen/i.test(id));
+    const sampleSource = imageish.length ? imageish : ids;
+    const sample = sampleSource.slice(0, 8).join('、');
+    const more = sampleSource.length > 8 ? '…' : '';
+    const quota = await this.keyQuota(base, apiKey);
+    const quotaNote = quota ? `；${quota}` : '';
+    if (ids.length && model && !ids.includes(model)) {
+      return `连接正常${quotaNote}；当前站点模型列表里没有「${model}」，请改成站点里的生图模型 id（${imageish.length ? '生图相关' : '已列出'} ${Math.min(8, sampleSource.length)} 个：${sample}${more}）`;
+    }
+    return ids.length
+      ? imageish.length
+        ? `连接正常${quotaNote}；站点约 ${ids.length} 个模型，其中生图相关 ${imageish.length} 个（如 ${sample}${more}）`
+        : `连接正常${quotaNote}；站点可用模型约 ${ids.length} 个`
+      : `连接正常${quotaNote}（未返回模型列表，仍可尝试生图）`;
+  }
+
+  /**
+   * NewAPI 的 OpenAI 兼容账单接口返回的是「这个 Key（令牌）」的额度，不是账户余额；
+   * 令牌设了额度上限时，账户有钱也会报 quota 不足。接口不存在时返回 null。
+   */
+  private async keyQuota(base: string, apiKey: string): Promise<string | null> {
+    try {
+      const headers = { Authorization: `Bearer ${apiKey}` };
+      const signal = AbortSignal.timeout(10_000);
+      const [subRes, usageRes] = await Promise.all([
+        httpFetch('查询 NewAPI 令牌额度', `${base}/dashboard/billing/subscription`, { headers, signal }),
+        httpFetch('查询 NewAPI 令牌用量', `${base}/dashboard/billing/usage`, { headers, signal }),
+      ]);
+      if (!subRes.ok) return null;
+      const sub = (await subRes.json().catch(() => null)) as { hard_limit_usd?: number } | null;
+      const usage = usageRes.ok ? ((await usageRes.json().catch(() => null)) as { total_usage?: number } | null) : null;
+      const limit = sub?.hard_limit_usd;
+      if (typeof limit !== 'number') return null;
+      if (limit >= 100_000_000) return '这个 Key 是无限额度';
+      const usedUsd = typeof usage?.total_usage === 'number' ? usage.total_usage / 100 : null;
+      return usedUsd === null
+        ? `这个 Key 的额度上限 $${limit.toFixed(2)}`
+        : `这个 Key 剩余约 $${Math.max(0, limit - usedUsd).toFixed(2)}（上限 $${limit.toFixed(2)}）`;
+    } catch {
+      return null;
+    }
+  }
+}
+
+/** 中转站的报错多是英文原文；余额不足时补一句中文说明 */
+export function newApiErrorMessage(message: string | undefined, status: number): string {
+  if (!message) return `NewAPI 返回 HTTP ${status}`;
+  const quota = /quota|insufficient|balance|credit|余额|额度/i.test(message);
+  return quota
+    ? `NewAPI：额度不足。若账户有余额，多半是这个 Key（令牌）设了额度上限——到站点「令牌」页把它改成无限额度或调高（${message}）`
+    : `NewAPI：${message}`;
+}
+
+function mapDalleQuality(quality: Quality): 'standard' | 'hd' {
+  return quality === 'high' || quality === 'xhigh' ? 'hd' : 'standard';
 }
 
 /** 本地模拟：不联网、不花钱，延迟 1–2.5 秒后返回基于输入图变换的结果，用于开发和自动验收 */

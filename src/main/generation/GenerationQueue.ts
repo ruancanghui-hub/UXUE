@@ -47,7 +47,10 @@ export class GenerationQueue {
     const providerId = this.forcedProvider ?? config.provider;
     const provider = this.providers[providerId];
     const plan = planGeneration({ ...config, provider: providerId }, request.settings, request.firstInputSize, request.inputs.length);
-    const rawEstimateUsd = providerId === 'openai' && request.size ? estimateCostUsd(request.settings, request.size) : 0;
+    const rawEstimateUsd =
+      (providerId === 'openai' || providerId === 'newapi') && request.size
+        ? estimateCostUsd(request.settings, request.size)
+        : 0;
     const model = plan.model;
     const update: JobUpdate = {
       jobId: request.jobId,

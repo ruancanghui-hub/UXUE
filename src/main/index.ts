@@ -6,9 +6,9 @@ import { BENCH_HOST, PROJECT_HOST, type BenchManifest, type BenchReport } from '
 import type { AssistantRequest } from '../shared/assistant';
 import { safeFileName, type ExportResult, type PageExportPlan } from '../shared/export';
 import type { GenerationRequest } from '../shared/generation';
-import { MockAssistant, OpenAIAssistant } from './assistant/providers';
+import { MockAssistant, NewApiAssistant, OpenAIAssistant } from './assistant/providers';
 import { GenerationQueue } from './generation/GenerationQueue';
-import { MockProvider, OpenAIProvider, SiliconFlowProvider } from './generation/providers';
+import { MockProvider, NewApiProvider, OpenAIProvider, SiliconFlowProvider } from './generation/providers';
 import { GenerationSettingsStore, type KeyProvider, type SettingsPatch } from './generation/settingsStore';
 import type { PromptSettings } from '../shared/generation';
 import type { ProjectFile } from '../shared/project';
@@ -70,14 +70,27 @@ const generationSettings = new GenerationSettingsStore(app.getPath('userData'));
 const promptTemplates = new PromptTemplatesStore(app.getPath('userData'));
 const openai = new OpenAIProvider(worker, () => generationSettings.getApiKey('openai'));
 const siliconflow = new SiliconFlowProvider(worker, () => generationSettings.getApiKey('siliconflow'));
+const newapi = new NewApiProvider(
+  worker,
+  () => generationSettings.getApiKey('newapi'),
+  () => generationSettings.config().newapiBaseUrl,
+);
 const generationQueue = new GenerationQueue(
   worker,
   generationSettings,
-  { openai, siliconflow, mock: new MockProvider(worker) },
+  { openai, siliconflow, newapi, mock: new MockProvider(worker) },
   (update) => mainWindow?.webContents.send('gen:update', update),
   forceMock ? 'mock' : null,
 );
-const assistants = { openai: new OpenAIAssistant(worker, () => generationSettings.getApiKey('openai')), mock: new MockAssistant() };
+const assistants = {
+  openai: new OpenAIAssistant(worker, () => generationSettings.getApiKey('openai')),
+  newapi: new NewApiAssistant(
+    worker,
+    () => generationSettings.getApiKey('newapi'),
+    () => generationSettings.config().newapiBaseUrl,
+  ),
+  mock: new MockAssistant(),
+};
 
 const projects = new ProjectService(
   worker,
@@ -194,11 +207,14 @@ function registerIpc(): void {
   ipcMain.handle('gen:config', () => generationSettings.config());
   ipcMain.handle('gen:update-config', (_event, patch: SettingsPatch) => generationSettings.update(patch));
   ipcMain.handle('gen:set-key', (_event, provider: KeyProvider, key: string | null) => generationSettings.setApiKey(provider, key));
-  ipcMain.handle('gen:test', (_event, provider: KeyProvider) =>
-    provider === 'siliconflow'
-      ? siliconflow.testConnection([generationSettings.config().siliconflowEditModel, generationSettings.config().siliconflowT2iModel])
-      : openai.testConnection(generationSettings.config().model),
-  );
+  ipcMain.handle('gen:test', (_event, provider: KeyProvider) => {
+    const config = generationSettings.config();
+    if (provider === 'siliconflow') {
+      return siliconflow.testConnection([config.siliconflowEditModel, config.siliconflowT2iModel]);
+    }
+    if (provider === 'newapi') return newapi.testConnection(config.newapiModel);
+    return openai.testConnection(config.model);
+  });
   ipcMain.handle('gen:submit', (_event, request: GenerationRequest) => {
     if (request.projectDir !== projects.currentDir()) throw new Error('只能为当前打开的项目生成');
     if (request.inputs.some((input) => input.file.includes('..') || input.file.startsWith('/'))) {
@@ -224,7 +240,8 @@ function registerIpc(): void {
     if (request.images.some((image) => image.file.includes('..') || image.file.startsWith('/'))) throw new Error('图片路径不合法');
     const config = generationSettings.config();
     const provider = forceMock ? 'mock' : config.assistantProvider;
-    return assistants[provider].ask(request, config.assistantModel, new AbortController().signal);
+    const model = provider === 'newapi' ? config.newapiAssistantModel : config.assistantModel;
+    return assistants[provider].ask(request, model, new AbortController().signal);
   });
 
   ipcMain.handle('project:choose-new', async () => {

@@ -8,6 +8,8 @@ import {
   type PromptDraft,
   type ThemeDraft,
 } from '../../shared/assistant';
+import { normalizeOpenAICompatibleBaseUrl } from '../../shared/generation';
+import { newApiErrorMessage } from '../generation/providers';
 import type { PreparedInput } from '../../shared/workerProtocol';
 import { httpFetch } from '../http';
 import type { ImageWorkerClient } from '../imageWorkerClient';
@@ -107,6 +109,101 @@ export class OpenAIAssistant implements AssistantProvider {
       costUsd: usage ? assistantCostUsd(model, usage.input_tokens ?? 0, usage.output_tokens ?? 0) : 0,
     };
   }
+}
+
+/**
+ * NewAPI 中转：走 OpenAI 兼容的 /chat/completions（Claude、Gemini 等由中转转换）。
+ * 各家对 json_schema 支持不一，这里只在提示里约定输出 JSON，再从回复里取出 JSON 对象。
+ */
+export class NewApiAssistant implements AssistantProvider {
+  constructor(
+    private readonly worker: ImageWorkerClient,
+    private readonly getApiKey: () => string | null,
+    private readonly getBaseUrl: () => string,
+  ) {}
+
+  async ask(request: AssistantRequest, model: string, signal: AbortSignal): Promise<AssistantResponse> {
+    const apiKey = this.getApiKey();
+    if (!apiKey) throw new Error('还没有设置 NewAPI Key，请在“设置”里填写，或切换到本地模拟');
+    const base = normalizeOpenAICompatibleBaseUrl(this.getBaseUrl());
+
+    const images = await Promise.all(
+      request.images.map((image) =>
+        this.worker.request<PreparedInput>({
+          type: 'prepareInput',
+          path: join(request.projectDir, image.file),
+          maxEdge: CONTEXT_IMAGE_EDGE,
+        }),
+      ),
+    );
+    const content: Record<string, unknown>[] = [{ type: 'text', text: describeContext(request) }];
+    request.images.forEach((image, i) => {
+      content.push({ type: 'text', text: `第 ${image.index} 张图：「${image.name}」` });
+      content.push({ type: 'image_url', image_url: { url: `data:${images[i].mime};base64,${images[i].base64}` } });
+    });
+    content.push({ type: 'text', text: `用户这次的要求：${request.message}` });
+
+    const response = await httpFetch('请求 NewAPI 助手', `${base}/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: `${INSTRUCTIONS}\n\n${JSON_OUTPUT_RULE}` },
+          { role: 'user', content },
+        ],
+        max_tokens: 6000,
+      }),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]),
+    });
+    const json = (await response.json().catch(() => null)) as ChatCompletionResponse | null;
+    if (!response.ok) throw new Error(newApiErrorMessage(json?.error?.message, response.status));
+    const choice = json?.choices?.[0];
+    if (choice?.finish_reason === 'length') {
+      throw new Error('回答没有写完（超出长度），可以把要求说得更具体一些再试');
+    }
+    const text = messageText(choice?.message?.content);
+    if (!text) throw new Error('NewAPI 没有返回内容');
+
+    const parsed = extractJsonObject(text);
+    if (parsed === null) throw new Error('NewAPI 返回的不是合法的 JSON，可以换一个对话模型再试');
+    return {
+      ...sanitizeAssistantOutput(parsed, request.images.length),
+      provider: 'newapi',
+      model,
+      costUsd: 0,
+    };
+  }
+}
+
+const JSON_OUTPUT_RULE = `只输出一个 JSON 对象，不要 Markdown 代码块，不要任何额外文字。必须符合这个 JSON Schema：
+${JSON.stringify(ASSISTANT_SCHEMA)}`;
+
+interface ChatCompletionResponse {
+  choices?: { message?: { content?: string | { type?: string; text?: string }[] | null }; finish_reason?: string }[];
+  error?: { message?: string };
+}
+
+function messageText(content: string | { type?: string; text?: string }[] | null | undefined): string {
+  if (typeof content === 'string') return content.trim();
+  if (Array.isArray(content)) return content.map((part) => part.text ?? '').join('').trim();
+  return '';
+}
+
+/** 模型偶尔会包一层 ```json 或前后带话，取第一个 { 到最后一个 } 再解析 */
+function extractJsonObject(text: string): unknown {
+  const candidates = [text, text.replace(/^```(?:json)?\s*|\s*```$/g, '')];
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start >= 0 && end > start) candidates.push(text.slice(start, end + 1));
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // 试下一个
+    }
+  }
+  return null;
 }
 
 interface OpenAIResponse {

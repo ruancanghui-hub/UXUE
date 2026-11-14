@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_PROMPT_SETTINGS, nearestSize, planGeneration, renderPrompt, validatePrompt, type GenerationConfig } from './generation';
 
-const config: Pick<GenerationConfig, 'provider' | 'model' | 'calibration' | 'siliconflowEditModel' | 'siliconflowT2iModel'> = {
+const config: Pick<
+  GenerationConfig,
+  'provider' | 'model' | 'calibration' | 'siliconflowEditModel' | 'siliconflowT2iModel' | 'newapiModel'
+> = {
   provider: 'siliconflow',
   model: 'gpt-image-2.6-flare',
   calibration: {},
   siliconflowEditModel: 'Qwen/Qwen-Image-Edit-2509',
   siliconflowT2iModel: 'Qwen/Qwen-Image',
+  newapiModel: 'gemini-2.5-flash-image',
 };
 
 describe('硅基流动', () => {
@@ -42,5 +46,37 @@ describe('OpenAI', () => {
     const plan = planGeneration({ ...config, provider: 'openai' }, DEFAULT_PROMPT_SETTINGS, { width: 2048, height: 1024 }, 1);
     expect(plan).toMatchObject({ model: 'gpt-image-2.6-flare', currency: 'USD', promptStyle: 'image', maxInputs: 16 });
     expect(plan.size).toEqual({ width: 1776, height: 880 });
+  });
+});
+
+describe('NewAPI', () => {
+  it('用 newapiModel；Gemini 走画布尺寸，DALL·E 3 吸附允许值', () => {
+    const gemini = planGeneration(
+      { ...config, provider: 'newapi', newapiModel: 'gemini-2.5-flash-image' },
+      { ...DEFAULT_PROMPT_SETTINGS, size: '1024x1024' },
+      null,
+      0,
+    );
+    expect(gemini).toMatchObject({
+      provider: 'newapi',
+      model: 'gemini-2.5-flash-image',
+      currency: 'USD',
+      size: { width: 1024, height: 1024 },
+    });
+    const dalle = planGeneration(
+      { ...config, provider: 'newapi', newapiModel: 'dall-e-3' },
+      { ...DEFAULT_PROMPT_SETTINGS, size: '1536x1024', count: 1 },
+      null,
+      0,
+    );
+    expect(dalle.size).toEqual({ width: 1792, height: 1024 });
+  });
+});
+
+describe('normalizeOpenAICompatibleBaseUrl', () => {
+  it('补全 /v1 并去掉尾斜杠', async () => {
+    const { normalizeOpenAICompatibleBaseUrl } = await import('./generation');
+    expect(normalizeOpenAICompatibleBaseUrl('https://relay.example.com')).toBe('https://relay.example.com/v1');
+    expect(normalizeOpenAICompatibleBaseUrl('https://relay.example.com/v1/')).toBe('https://relay.example.com/v1');
   });
 });

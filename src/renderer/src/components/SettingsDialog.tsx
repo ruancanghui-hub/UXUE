@@ -2,9 +2,12 @@ import { useEffect, useState } from 'react';
 import type { PromptTemplate } from '../../../shared/api';
 import { ASSISTANT_MODELS } from '../../../shared/assistant';
 import {
+  NEWAPI_ASSISTANT_MODELS,
+  NEWAPI_MODELS,
   OPENAI_MODELS,
   SILICONFLOW_EDIT_MODELS,
   SILICONFLOW_T2I_MODELS,
+  type AssistantProviderId,
   type GenerationConfig,
   type ProviderId,
 } from '../../../shared/generation';
@@ -15,7 +18,7 @@ interface SettingsDialogProps {
   onClose(): void;
 }
 
-type KeyProvider = 'openai' | 'siliconflow';
+type KeyProvider = 'openai' | 'siliconflow' | 'newapi';
 type Message = { text: string; tone: 'good' | 'bad' } | null;
 
 const cleanError = (error: unknown): string =>
@@ -50,6 +53,7 @@ export function SettingsDialog({ config, onChange, onClose }: SettingsDialogProp
 
   const providers: { id: ProviderId; label: string; note: string }[] = [
     { id: 'siliconflow', label: '硅基流动', note: '国内直连，Qwen 改图 ¥0.3/张，最多 3 张参考图' },
+    { id: 'newapi', label: 'NewAPI 中转', note: 'OpenAI 兼容中转，填 Base URL + Key' },
     { id: 'openai', label: 'OpenAI', note: 'gpt-image-2.6，按用量美元计费' },
     { id: 'mock', label: '本地模拟', note: '不联网、不花钱，用来熟悉流程' },
   ];
@@ -101,6 +105,56 @@ export function SettingsDialog({ config, onChange, onClose }: SettingsDialogProp
           </section>
         )}
 
+        {config.provider === 'newapi' && (
+          <section className="dialog-section">
+            <div className="section-title">NewAPI 中转</div>
+            <div className="field">
+              <span className="field-label">Base URL</span>
+              <input
+                type="url"
+                defaultValue={config.newapiBaseUrl}
+                placeholder="https://你的中转域名 或 …/v1"
+                onBlur={(event) => {
+                  const value = event.target.value.trim();
+                  if (value !== config.newapiBaseUrl) update({ newapiBaseUrl: value });
+                }}
+              />
+            </div>
+            <div className="field">
+              <span className="field-label">生图模型</span>
+              <select
+                value={NEWAPI_MODELS.some((m) => m.id === config.newapiModel) ? config.newapiModel : '__custom__'}
+                onChange={(event) => {
+                  if (event.target.value !== '__custom__') update({ newapiModel: event.target.value });
+                }}
+              >
+                {NEWAPI_MODELS.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.label}
+                  </option>
+                ))}
+                <option value="__custom__">自定义模型 id…</option>
+              </select>
+            </div>
+            {!NEWAPI_MODELS.some((m) => m.id === config.newapiModel) && (
+              <div className="field">
+                <span className="field-label">自定义模型 id</span>
+                <input
+                  defaultValue={config.newapiModel}
+                  placeholder="站点后台里的模型名"
+                  onBlur={(event) => {
+                    const value = event.target.value.trim();
+                    if (value && value !== config.newapiModel) update({ newapiModel: value });
+                  }}
+                />
+              </div>
+            )}
+            <p className="hint">
+              走 OpenAI 兼容的 <code>/v1/images/generations</code>（有参考图则 <code>/edits</code>）。模型 id 必须和中转站后台一致；你这边可用的生图多为 <code>gemini-*-image</code>。DALL·E 仅文生图。费用按中转返回的 usage 估算（美元显示）。
+            </p>
+          </section>
+        )}
+
         {config.provider === 'openai' && (
           <section className="dialog-section">
             <div className="section-title">OpenAI 生图模型</div>
@@ -119,7 +173,11 @@ export function SettingsDialog({ config, onChange, onClose }: SettingsDialogProp
           <div className="section-title">助手</div>
           <div className="field">
             <span className="field-label">供应商</span>
-            <select value={config.assistantProvider} onChange={(e) => update({ assistantProvider: e.target.value as 'openai' | 'mock' })}>
+            <select
+              value={config.assistantProvider}
+              onChange={(e) => update({ assistantProvider: e.target.value as AssistantProviderId })}
+            >
+              <option value="newapi">NewAPI 中转</option>
               <option value="openai">OpenAI</option>
               <option value="mock">本地模拟</option>
             </select>
@@ -133,6 +191,46 @@ export function SettingsDialog({ config, onChange, onClose }: SettingsDialogProp
               ))}
             </select>
           )}
+          {config.assistantProvider === 'newapi' && (
+            <>
+              <div className="field">
+                <span className="field-label">看图对话模型</span>
+                <select
+                  value={
+                    NEWAPI_ASSISTANT_MODELS.some((m) => m.id === config.newapiAssistantModel)
+                      ? config.newapiAssistantModel
+                      : '__custom__'
+                  }
+                  onChange={(event) => {
+                    if (event.target.value !== '__custom__') update({ newapiAssistantModel: event.target.value });
+                  }}
+                >
+                  {NEWAPI_ASSISTANT_MODELS.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.label}
+                    </option>
+                  ))}
+                  <option value="__custom__">自定义模型 id…</option>
+                </select>
+              </div>
+              {!NEWAPI_ASSISTANT_MODELS.some((m) => m.id === config.newapiAssistantModel) && (
+                <div className="field">
+                  <span className="field-label">自定义模型 id</span>
+                  <input
+                    defaultValue={config.newapiAssistantModel}
+                    placeholder="站点后台里能看图的对话模型名"
+                    onBlur={(event) => {
+                      const value = event.target.value.trim();
+                      if (value && value !== config.newapiAssistantModel) update({ newapiAssistantModel: value });
+                    }}
+                  />
+                </div>
+              )}
+              <p className="hint">
+                复用上面 NewAPI 的 Base URL 和 Key，走 <code>/v1/chat/completions</code>。要选能看图的对话模型（不要选 <code>*-image</code> 生图模型）。
+              </p>
+            </>
+          )}
         </section>
 
         <KeySection
@@ -141,6 +239,15 @@ export function SettingsDialog({ config, onChange, onClose }: SettingsDialogProp
           hasKey={config.hasSiliconflowKey}
           hint={config.siliconflowKeyHint}
           placeholder="sk-…（在 cloud.siliconflow.cn 的 API 密钥页创建）"
+          busy={busy}
+          run={run}
+        />
+        <KeySection
+          provider="newapi"
+          title="NewAPI Key"
+          hasKey={config.hasNewapiKey}
+          hint={config.newapiKeyHint}
+          placeholder="中转站发放的 API Key"
           busy={busy}
           run={run}
         />
