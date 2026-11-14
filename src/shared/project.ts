@@ -26,8 +26,10 @@ export interface GenerationRecord {
   model: string;
   quality: string;
   size: string;
-  /** 这一张分摊到的实际花费（美元） */
+  /** 这一张分摊到的实际花费（美元；硅基流动等人民币计价的供应商为 0，见 costCny） */
   costUsd: number;
+  /** 人民币计价的供应商（硅基流动）这一张的花费 */
+  costCny?: number;
   jobId: string;
   /** 生成时附加了规则的生效主题卡；没有附加时为 null */
   themeCardId: string | null;
@@ -493,6 +495,7 @@ function parseGeneration(value: unknown): GenerationRecord | null {
     quality: text('quality'),
     size: text('size'),
     costUsd: isFiniteNumber(value.costUsd) ? value.costUsd : 0,
+    ...(isFiniteNumber(value.costCny) ? { costCny: value.costCny } : {}),
     jobId: text('jobId'),
     themeCardId: typeof value.themeCardId === 'string' ? value.themeCardId : null,
   };

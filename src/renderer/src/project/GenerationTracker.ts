@@ -1,7 +1,8 @@
 import {
+  planGeneration,
   renderPrompt,
-  resolveSize,
   validatePrompt,
+  type GenerationConfig,
   type GenerationRequest,
   type JobUpdate,
   type PromptSettings,
@@ -31,7 +32,9 @@ export interface TrackedJob {
   /** 附加了规则的生效主题卡 */
   themeCardId: string | null;
   settings: PromptSettings;
+  /** 请求的尺寸；改图模型输出跟随输入图时取第一张输入图的尺寸，用于占位比例 */
   size: { width: number; height: number };
+  sizeLabel: string;
   submittedAt: number;
 }
 
@@ -71,22 +74,24 @@ export class GenerationTracker {
   }
 
   /** 提交前的检查，返回出错原因；没问题返回 null */
-  check(session: ProjectSession, promptCardId: string): string | null {
+  check(session: ProjectSession, promptCardId: string, maxInputs = 16): string | null {
     const state = session.doc.get();
     const prompt = state.cards.find((card) => card.id === promptCardId);
     if (!prompt || !isPromptCard(prompt)) return '找不到这张提示词卡';
     const inputs = prompt.inputs.map((id) => state.cards.find((card) => card.id === id)).filter((c): c is ImageCard => !!c && isImageCard(c));
     const missing = inputs.find((card) => session.missingVersionIds.has(card.currentVersionId));
     if (missing) return `输入图「${missing.name}」的原图文件不见了`;
-    return validatePrompt(prompt.text, inputs.length);
+    return validatePrompt(prompt.text, inputs.length, maxInputs);
   }
 
   async submit(session: ProjectSession, promptCardId: string): Promise<TrackedJob> {
-    const problem = this.check(session, promptCardId);
-    if (problem) throw new Error(problem);
+    const config = effectiveConfig(await window.anye.getGenerationConfig());
     const state = session.doc.get();
     const prompt = state.cards.find((card) => card.id === promptCardId);
     if (!prompt || !isPromptCard(prompt)) throw new Error('找不到这张提示词卡');
+    const plan = planGeneration(config, prompt.settings, null, prompt.inputs.length);
+    const problem = this.check(session, promptCardId, plan.maxInputs);
+    if (problem) throw new Error(problem);
 
     const inputs = prompt.inputs
       .map((id) => state.cards.find((card) => card.id === id))
@@ -100,8 +105,10 @@ export class GenerationTracker {
     }
 
     const theme = prompt.settings.useTheme ? activeTheme(state) : null;
-    const rendered = renderPrompt(prompt.text).text + (theme ? `\n\n${themeSuffix(theme)}` : '');
-    const size = resolveSize(prompt.settings.size, inputs[0] ?? null);
+    const firstInputSize = inputs[0] ? { width: inputs[0].width, height: inputs[0].height } : null;
+    const finalPlan = planGeneration(config, prompt.settings, firstInputSize, inputs.length);
+    const rendered = renderPrompt(prompt.text, finalPlan.promptStyle).text + (theme ? `\n\n${themeSuffix(theme)}` : '');
+    const size = finalPlan.size ?? firstInputSize ?? { width: 1024, height: 1024 };
     const request: GenerationRequest = {
       jobId: crypto.randomUUID(),
       projectDir: session.dir,
@@ -109,11 +116,19 @@ export class GenerationTracker {
       outputCardId,
       prompt: rendered,
       inputs: inputs.map((version) => ({ versionId: version.id, file: version.file })),
+      firstInputSize,
       settings: { ...prompt.settings },
-      size,
+      size: finalPlan.size,
     };
     const job: TrackedJob = {
-      update: { jobId: request.jobId, status: 'queued', provider: 'openai', model: '', estimateUsd: 0 },
+      update: {
+        jobId: request.jobId,
+        status: 'queued',
+        provider: finalPlan.provider,
+        model: finalPlan.model,
+        currency: finalPlan.currency,
+        estimateUsd: finalPlan.estimate,
+      },
       projectDir: session.dir,
       promptCardId,
       outputCardId,
@@ -123,6 +138,7 @@ export class GenerationTracker {
       themeCardId: theme?.id ?? null,
       settings: request.settings,
       size,
+      sizeLabel: finalPlan.size ? `${finalPlan.size.width}x${finalPlan.size.height}` : '跟随输入图',
       submittedAt: Date.now(),
     };
     this.jobs.set(request.jobId, job);
@@ -198,6 +214,7 @@ export class GenerationTracker {
     if (!session || session.dir !== job.projectDir || !job.update.versions?.length) return;
     const createdAt = new Date().toISOString();
     const share = (job.update.costUsd ?? 0) / job.update.versions.length;
+    const cny = job.update.currency === 'CNY';
     const versions: Version[] = job.update.versions.map((info) => ({
       id: info.id,
       file: info.file,
@@ -212,8 +229,9 @@ export class GenerationTracker {
         provider: job.update.provider,
         model: job.update.model,
         quality: job.settings.quality,
-        size: `${job.size.width}x${job.size.height}`,
-        costUsd: share,
+        size: job.sizeLabel,
+        costUsd: cny ? 0 : share,
+        ...(cny ? { costCny: share } : {}),
         jobId: job.update.jobId,
         themeCardId: job.themeCardId,
       },
@@ -253,4 +271,10 @@ export class GenerationTracker {
 export function activeTheme(state: DocState): ThemeCard | null {
   const card = state.cards.find((c) => c.id === state.activeThemeCardId);
   return card && isThemeCard(card) ? card : null;
+}
+
+/** 自检（M1–M4）时主进程强制用本地模拟，这里也按本地模拟来渲染提示词和估算 */
+export function effectiveConfig(config: GenerationConfig): GenerationConfig {
+  const { m1Check, m2Check, m3Check, m4Check } = window.anye.flags;
+  return m1Check || m2Check || m3Check || m4Check ? { ...config, provider: 'mock' } : config;
 }

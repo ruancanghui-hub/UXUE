@@ -102,9 +102,16 @@ export interface AnyeApi {
   readCheckFile(name: string): Promise<string | null>;
 
   getGenerationConfig(): Promise<GenerationConfig>;
-  updateGenerationConfig(patch: { provider?: ProviderId; model?: string; assistantModel?: string }): Promise<GenerationConfig>;
-  setApiKey(key: string | null): Promise<GenerationConfig>;
-  testConnection(): Promise<string>;
+  updateGenerationConfig(patch: {
+    provider?: ProviderId;
+    model?: string;
+    assistantModel?: string;
+    assistantProvider?: 'openai' | 'mock';
+    siliconflowEditModel?: string;
+    siliconflowT2iModel?: string;
+  }): Promise<GenerationConfig>;
+  setApiKey(provider: 'openai' | 'siliconflow', key: string | null): Promise<GenerationConfig>;
+  testConnection(provider: 'openai' | 'siliconflow'): Promise<string>;
   submitGeneration(request: GenerationRequest): Promise<JobUpdate>;
   cancelGeneration(jobId: string): void;
   cancelAllGenerations(): void;

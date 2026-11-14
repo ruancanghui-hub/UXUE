@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { formatUsd } from '../../../shared/generation';
+import { formatCost } from '../../../shared/generation';
 import type { TrackedJob } from '../project/GenerationTracker';
 
 interface QueuePanelProps {
@@ -29,7 +29,11 @@ export function QueuePanel({ jobs, onCancel, onDismiss, onSelectPrompt }: QueueP
   }, [active.length]);
 
   if (jobs.length === 0) return null;
-  const spent = jobs.reduce((sum, job) => sum + (job.update.costUsd ?? 0), 0);
+  const spentOf = (currency: 'USD' | 'CNY'): number =>
+    jobs.filter((job) => job.update.currency === currency).reduce((sum, job) => sum + (job.update.costUsd ?? 0), 0);
+  const spent = [spentOf('USD') > 0 ? formatCost(spentOf('USD'), 'USD') : '', spentOf('CNY') > 0 ? formatCost(spentOf('CNY'), 'CNY') : '']
+    .filter(Boolean)
+    .join(' + ') || '0';
 
   return (
     <div className={`queue-panel ${open ? 'open' : ''}`}>
@@ -37,7 +41,7 @@ export function QueuePanel({ jobs, onCancel, onDismiss, onSelectPrompt }: QueueP
         <span>
           生成队列 {active.length > 0 ? `· 进行中 ${active.length}` : '· 空闲'}
         </span>
-        <span className="dim">本次 {formatUsd(spent)} {open ? '▾' : '▸'}</span>
+        <span className="dim">本次 {spent} {open ? '▾' : '▸'}</span>
       </button>
       {open && (
         <div className="queue-list">
@@ -57,7 +61,7 @@ export function QueuePanel({ jobs, onCancel, onDismiss, onSelectPrompt }: QueueP
                   {status !== 'canceled' && ` ${elapsed}s`}
                 </span>
                 <span className="queue-cost" title={job.update.costUsd === undefined ? '估算' : '实际'}>
-                  {job.update.provider === 'mock' ? '模拟' : `${job.update.costUsd === undefined ? '≈' : ''}${formatUsd(cost)}`}
+                  {job.update.provider === 'mock' ? '模拟' : `${job.update.costUsd === undefined ? '≈' : ''}${formatCost(cost, job.update.currency)}`}
                 </span>
                 {running ? (
                   <button className="icon" onClick={() => onCancel(job.update.jobId)} title="取消">

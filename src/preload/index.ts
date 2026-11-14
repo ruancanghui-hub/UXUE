@@ -37,8 +37,8 @@ const api: AnyeApi = {
 
   getGenerationConfig: () => ipcRenderer.invoke('gen:config'),
   updateGenerationConfig: (patch) => ipcRenderer.invoke('gen:update-config', patch),
-  setApiKey: (key) => ipcRenderer.invoke('gen:set-key', key),
-  testConnection: () => ipcRenderer.invoke('gen:test'),
+  setApiKey: (provider, key) => ipcRenderer.invoke('gen:set-key', provider, key),
+  testConnection: (provider) => ipcRenderer.invoke('gen:test', provider),
   submitGeneration: (request) => ipcRenderer.invoke('gen:submit', request),
   cancelGeneration: (jobId) => ipcRenderer.send('gen:cancel', jobId),
   cancelAllGenerations: () => ipcRenderer.send('gen:cancel-all'),

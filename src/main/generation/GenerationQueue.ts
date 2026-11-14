@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   calibrationKey,
   estimateCostUsd,
+  planGeneration,
   type GeneratedVersionInfo,
   type GenerationRequest,
   type JobUpdate,
@@ -43,15 +44,16 @@ export class GenerationQueue {
     const config = this.settings.config();
     const providerId = this.forcedProvider ?? config.provider;
     const provider = this.providers[providerId];
-    const model = providerId === 'mock' ? 'local-mock' : config.model;
-    const rawEstimateUsd = providerId === 'mock' ? 0 : estimateCostUsd(request.settings, request.size);
-    const calibration = config.calibration[calibrationKey(model, request.settings.quality)] ?? 1;
+    const plan = planGeneration({ ...config, provider: providerId }, request.settings, request.firstInputSize, request.inputs.length);
+    const rawEstimateUsd = providerId === 'openai' && request.size ? estimateCostUsd(request.settings, request.size) : 0;
+    const model = plan.model;
     const update: JobUpdate = {
       jobId: request.jobId,
       status: 'queued',
       provider: providerId,
       model,
-      estimateUsd: rawEstimateUsd * calibration,
+      currency: plan.currency,
+      estimateUsd: plan.estimate,
     };
     this.jobs.set(request.jobId, { request, provider, model, rawEstimateUsd, update, controller: new AbortController() });
     this.waiting.push(request.jobId);
@@ -87,7 +89,11 @@ export class GenerationQueue {
     this.update(job, { status: 'running', startedAt: Date.now() });
     try {
       const result = await job.provider.generate(job.request, job.model, job.controller.signal);
-      const costUsd = result.costUsd ?? job.update.estimateUsd;
+      // OpenAI 按返回用量算；硅基流动按张固定计价，实际花费 = 实际张数 × 单价
+      const costUsd =
+        result.costUsd ?? (job.update.provider === 'siliconflow'
+          ? (job.update.estimateUsd / Math.max(1, job.request.settings.count)) * result.images.length
+          : job.update.estimateUsd);
       const versions: GeneratedVersionInfo[] = [];
       for (const bytes of result.images) {
         const id = randomUUID();

@@ -1,6 +1,53 @@
 /** 生成相关的规则：主进程和渲染进程共用，保证估算、校验和实际请求一致 */
 
-export type ProviderId = 'openai' | 'mock';
+export type ProviderId = 'openai' | 'siliconflow' | 'mock';
+export type Currency = 'USD' | 'CNY';
+
+/**
+ * 硅基流动（国内站，2026-11）：改图只有 Qwen-Image-Edit-2509 支持多张参考图（1–3 张）；
+ * 改图模型不接受 image_size，输出尺寸跟随输入图；文生图模型各有推荐尺寸。价格是固定的 ¥/张。
+ */
+export const SILICONFLOW_EDIT_MODELS = [
+  { id: 'Qwen/Qwen-Image-Edit-2509', label: 'Qwen-Image-Edit-2509（1–3 张参考图）', priceCny: 0.3 },
+] as const;
+export const SILICONFLOW_T2I_MODELS = [
+  {
+    id: 'Qwen/Qwen-Image',
+    label: 'Qwen-Image（中文字渲染强）',
+    priceCny: 0.3,
+    sizes: ['1328x1328', '1664x928', '928x1664', '1472x1140', '1140x1472', '1584x1056', '1056x1584'],
+  },
+  {
+    id: 'Tongyi-MAI/Z-Image-Turbo',
+    label: 'Z-Image-Turbo（便宜、快，适合试方向）',
+    priceCny: 0.1,
+    sizes: ['512x512', '768x1024', '1024x576', '576x1024'],
+  },
+] as const;
+export const DEFAULT_SILICONFLOW_EDIT_MODEL = 'Qwen/Qwen-Image-Edit-2509';
+export const DEFAULT_SILICONFLOW_T2I_MODEL = 'Qwen/Qwen-Image';
+export const SILICONFLOW_MAX_INPUTS = 3;
+
+/** 各供应商一次最多接受的输入图数量 */
+export function maxInputsFor(provider: ProviderId): number {
+  return provider === 'siliconflow' ? SILICONFLOW_MAX_INPUTS : 16;
+}
+
+/** 在模型推荐尺寸里挑比例最接近的 */
+export function nearestSize(sizes: readonly string[], aspect: number): { width: number; height: number } {
+  let best = sizes[0];
+  let bestDiff = Infinity;
+  for (const size of sizes) {
+    const [w, h] = size.split('x').map(Number);
+    const diff = Math.abs(Math.log(w / h / aspect));
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = size;
+    }
+  }
+  const [width, height] = best.split('x').map(Number);
+  return { width, height };
+}
 
 export const OPENAI_MODELS = [
   { id: 'gpt-image-2.6-flare', label: 'GPT Image 2.6 Flare（快）' },
@@ -89,20 +136,24 @@ export interface RenderedPrompt {
   maxRef: number;
 }
 
-/** 把 {{Image N}} 换成接口能理解的 "Image N"（输入图按绑定顺序发送） */
-export function renderPrompt(template: string): RenderedPrompt {
+/**
+ * 把 {{Image N}} 换成模型习惯的写法（输入图按绑定顺序发送）：
+ * OpenAI 用 "Image N"，Qwen 改图模型用 "图N"。
+ */
+export function renderPrompt(template: string, style: 'image' | 'tu' = 'image'): RenderedPrompt {
   let maxRef = 0;
   const text = template.replace(IMAGE_REF, (_match, n: string) => {
     maxRef = Math.max(maxRef, Number(n));
-    return `Image ${n}`;
+    return style === 'tu' ? `图${n}` : `Image ${n}`;
   });
   return { text: text.trim(), maxRef };
 }
 
-export function validatePrompt(template: string, inputCount: number): string | null {
+export function validatePrompt(template: string, inputCount: number, maxInputs = 16): string | null {
   const { text, maxRef } = renderPrompt(template);
   if (!text) return '提示词是空的';
   if (maxRef > inputCount) return `提示词引用了 Image ${maxRef}，但只绑定了 ${inputCount} 张输入图`;
+  if (inputCount > maxInputs) return `当前供应商一次最多接受 ${maxInputs} 张输入图，现在绑定了 ${inputCount} 张`;
   if (text.length > 32_000) return '提示词超过 32000 字，接口不接受';
   return null;
 }
@@ -146,6 +197,11 @@ export function calibrationKey(model: string, quality: Quality): string {
   return `${model}:${quality}`;
 }
 
+export function formatCost(value: number, currency: Currency): string {
+  if (currency === 'CNY') return value === 0 ? '¥0' : `¥${value.toFixed(value < 1 ? 2 : 1)}`;
+  return formatUsd(value);
+}
+
 export function formatUsd(value: number): string {
   if (value === 0) return '$0';
   if (value < 0.01) return `$${value.toFixed(4)}`;
@@ -168,8 +224,11 @@ export interface GenerationRequest {
   /** 已渲染（{{Image N}} 已替换）的提示词 */
   prompt: string;
   inputs: GenerationInput[];
+  /** 第一张输入图的原图尺寸，主进程据此按同一套规则选模型和尺寸 */
+  firstInputSize: { width: number; height: number } | null;
   settings: PromptSettings;
-  size: { width: number; height: number };
+  /** 发给接口的尺寸；硅基流动改图模型输出跟随输入图，为 null */
+  size: { width: number; height: number } | null;
 }
 
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled';
@@ -186,8 +245,10 @@ export interface JobUpdate {
   status: JobStatus;
   provider: ProviderId;
   model: string;
+  /** 估算和实际花费的币种：OpenAI 美元，硅基流动人民币 */
+  currency: Currency;
   estimateUsd: number;
-  /** 实际花费（成功后才有；本地模拟为 0） */
+  /** 实际花费（成功后才有；本地模拟为 0）；单位见 currency */
   costUsd?: number;
   versions?: GeneratedVersionInfo[];
   error?: string;
@@ -200,8 +261,79 @@ export interface GenerationConfig {
   model: string;
   /** 助手用的文本 / 看图模型 */
   assistantModel: string;
+  /** 助手走哪家：生图换成硅基流动时，助手仍可以用 OpenAI 或本地模拟 */
+  assistantProvider: 'openai' | 'mock';
   hasApiKey: boolean;
   /** 显示用的 Key 末四位 */
   apiKeyHint: string | null;
+  hasSiliconflowKey: boolean;
+  siliconflowKeyHint: string | null;
+  siliconflowEditModel: string;
+  siliconflowT2iModel: string;
   calibration: Record<string, number>;
+}
+
+// ───────────────────────── 按供应商估算 ─────────────────────────
+
+export interface ProviderPlan {
+  provider: ProviderId;
+  /** 实际调用的模型 */
+  model: string;
+  /** 发给接口的尺寸；硅基流动改图模型输出跟随输入图，这里是 null */
+  size: { width: number; height: number } | null;
+  /** 界面上显示的尺寸说明 */
+  sizeLabel: string;
+  estimate: number;
+  currency: Currency;
+  promptStyle: 'image' | 'tu';
+  maxInputs: number;
+}
+
+/** 一张提示词卡在当前设置下会怎么调用：模型、尺寸、估算花费 */
+export function planGeneration(
+  config: Pick<GenerationConfig, 'provider' | 'model' | 'calibration' | 'siliconflowEditModel' | 'siliconflowT2iModel'>,
+  settings: PromptSettings,
+  firstInput: { width: number; height: number } | null,
+  inputCount: number,
+): ProviderPlan {
+  const base = resolveSize(settings.size, firstInput);
+  if (config.provider === 'siliconflow') {
+    if (inputCount > 0) {
+      const model = SILICONFLOW_EDIT_MODELS.find((m) => m.id === config.siliconflowEditModel) ?? SILICONFLOW_EDIT_MODELS[0];
+      return {
+        provider: 'siliconflow',
+        model: model.id,
+        size: null,
+        sizeLabel: '跟随输入图（改图模型不支持指定尺寸）',
+        estimate: model.priceCny * settings.count,
+        currency: 'CNY',
+        promptStyle: 'tu',
+        maxInputs: SILICONFLOW_MAX_INPUTS,
+      };
+    }
+    const model = SILICONFLOW_T2I_MODELS.find((m) => m.id === config.siliconflowT2iModel) ?? SILICONFLOW_T2I_MODELS[0];
+    const size = nearestSize(model.sizes, base.width / base.height);
+    return {
+      provider: 'siliconflow',
+      model: model.id,
+      size,
+      sizeLabel: `${size.width} × ${size.height}`,
+      estimate: model.priceCny * settings.count,
+      currency: 'CNY',
+      promptStyle: 'image',
+      maxInputs: SILICONFLOW_MAX_INPUTS,
+    };
+  }
+  const model = config.provider === 'mock' ? 'local-mock' : config.model;
+  const calibration = config.calibration[calibrationKey(model, settings.quality)] ?? 1;
+  return {
+    provider: config.provider,
+    model,
+    size: base,
+    sizeLabel: `${base.width} × ${base.height}`,
+    estimate: config.provider === 'mock' ? 0 : estimateCostUsd(settings, base, calibration),
+    currency: 'USD',
+    promptStyle: 'image',
+    maxInputs: maxInputsFor(config.provider),
+  };
 }

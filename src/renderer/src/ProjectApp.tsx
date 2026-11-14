@@ -474,7 +474,13 @@ export function ProjectApp() {
       .finally(() => window.anye.quit());
   }, [engine, session, importInto, tracker, assistant, createPage, exportPage]);
 
-  const providerLabel = !config ? '' : config.provider === 'mock' ? '本地模拟' : config.hasApiKey ? 'OpenAI' : 'OpenAI · 未设置 Key';
+  const providerLabel = !config
+    ? ''
+    : config.provider === 'mock'
+      ? '本地模拟'
+      : config.provider === 'siliconflow'
+        ? config.hasSiliconflowKey ? '硅基流动' : '硅基流动 · 未设置 Key'
+        : config.hasApiKey ? 'OpenAI' : 'OpenAI · 未设置 Key';
 
   return (
     <div className="app">

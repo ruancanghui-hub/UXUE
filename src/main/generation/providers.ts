@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { costFromUsage, type GenerationRequest, type ImageUsage, type ProviderId } from '../../shared/generation';
+import { costFromUsage, SILICONFLOW_MAX_INPUTS, type GenerationRequest, type ImageUsage, type ProviderId } from '../../shared/generation';
 import type { MockGenerateResult, PreparedInput } from '../../shared/workerProtocol';
 import type { ImageWorkerClient } from '../imageWorkerClient';
 
@@ -38,7 +38,7 @@ export class OpenAIProvider implements ImageProvider {
       model,
       prompt: request.prompt,
       n: request.settings.count,
-      size: `${request.size.width}x${request.size.height}`,
+      size: request.size ? `${request.size.width}x${request.size.height}` : 'auto',
       quality: request.settings.quality,
       output_format: 'png',
     };
@@ -89,6 +89,92 @@ export class OpenAIProvider implements ImageProvider {
   }
 }
 
+const SILICONFLOW_BASE = 'https://api.siliconflow.cn/v1';
+/** 给硅基流动的参考图缩到长边 1536：Qwen 改图模型内部按约 1MP 处理，再大只是浪费上传 */
+const SILICONFLOW_INPUT_EDGE = 1536;
+
+/**
+ * 硅基流动（国内站）：改图和文生图都走 /images/generations。
+ * 有输入图时用 image / image2 / image3 传参考图（base64 数据地址），不传 image_size；
+ * 每次请求只出一张，要几张就发几次。结果是 1 小时内有效的链接，拿到后立刻下载。
+ * X-Enable-Watermark: 0 关掉接口加的可见水印（按平台规定，最终成品需要自己加 AI 生成标识）。
+ */
+export class SiliconFlowProvider implements ImageProvider {
+  readonly id = 'siliconflow' as const;
+
+  constructor(
+    private readonly worker: ImageWorkerClient,
+    private readonly getApiKey: () => string | null,
+  ) {}
+
+  async generate(request: GenerationRequest, model: string, signal: AbortSignal): Promise<ProviderResult> {
+    const apiKey = this.getApiKey();
+    if (!apiKey) throw new Error('还没有设置硅基流动 API Key，请在“设置”里填写');
+    if (request.inputs.length > SILICONFLOW_MAX_INPUTS) throw new Error(`硅基流动一次最多接受 ${SILICONFLOW_MAX_INPUTS} 张参考图`);
+
+    const body: Record<string, unknown> = { model, prompt: request.prompt };
+    if (request.inputs.length > 0) {
+      const prepared = await Promise.all(
+        request.inputs.map((input) =>
+          this.worker.request<PreparedInput>({ type: 'prepareInput', path: join(request.projectDir, input.file), maxEdge: SILICONFLOW_INPUT_EDGE }),
+        ),
+      );
+      prepared.forEach((image, i) => {
+        body[i === 0 ? 'image' : `image${i + 1}`] = `data:${image.mime};base64,${image.base64}`;
+      });
+    } else if (request.size) {
+      body.image_size = `${request.size.width}x${request.size.height}`;
+    }
+
+    const images: Uint8Array[] = [];
+    for (let i = 0; i < request.settings.count; i++) {
+      const response = await fetch(`${SILICONFLOW_BASE}/images/generations`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'X-Enable-Watermark': '0' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
+      });
+      const text = await response.text();
+      let json: { images?: { url?: string }[]; data?: { url?: string }[]; message?: string } | null = null;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        json = null;
+      }
+      if (!response.ok) {
+        throw new Error(`硅基流动：${json?.message ?? (text.trim().slice(0, 200) || `HTTP ${response.status}`)}`);
+      }
+      const url = (json?.images ?? json?.data ?? [])[0]?.url;
+      if (!url) throw new Error('硅基流动没有返回图片');
+      const download = await fetch(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]) });
+      if (!download.ok) throw new Error(`下载生成结果失败（HTTP ${download.status}）`);
+      images.push(new Uint8Array(await download.arrayBuffer()));
+    }
+    // 硅基流动按张固定计价，花费由队列按价目表计算
+    return { images, costUsd: null };
+  }
+
+  /** 查账户信息验证 Key，顺便显示余额，不产生费用 */
+  async testConnection(): Promise<string> {
+    const apiKey = this.getApiKey();
+    if (!apiKey) throw new Error('还没有设置硅基流动 API Key');
+    const response = await fetch(`${SILICONFLOW_BASE}/user/info`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    const text = await response.text();
+    let json: { data?: { totalBalance?: string; balance?: string; name?: string }; message?: string } | null = null;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = null;
+    }
+    if (!response.ok) throw new Error(json?.message ?? (text.trim().slice(0, 200) || `HTTP ${response.status}`));
+    const balance = json?.data?.totalBalance ?? json?.data?.balance;
+    return balance !== undefined ? `连接正常，账户余额 ¥${balance}` : '连接正常';
+  }
+}
+
 /** 本地模拟：不联网、不花钱，延迟 1–2.5 秒后返回基于输入图变换的结果，用于开发和自动验收 */
 export class MockProvider implements ImageProvider {
   readonly id = 'mock' as const;
@@ -97,12 +183,13 @@ export class MockProvider implements ImageProvider {
 
   async generate(request: GenerationRequest, _model: string, signal: AbortSignal): Promise<ProviderResult> {
     await abortableDelay(1000 + Math.random() * 1500, signal);
+    const size = request.size ?? request.firstInputSize ?? { width: 1024, height: 1024 };
     const result = await this.worker.request<MockGenerateResult>({
       type: 'mockGenerate',
       inputs: request.inputs.map((input) => join(request.projectDir, input.file)),
       prompt: request.prompt,
-      width: request.size.width,
-      height: request.size.height,
+      width: Math.min(2048, size.width),
+      height: Math.min(2048, Math.round((Math.min(2048, size.width) / size.width) * size.height)),
       count: request.settings.count,
       seed: hash(request.jobId),
     });

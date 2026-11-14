@@ -1,12 +1,11 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import {
-  calibrationKey,
-  estimateCostUsd,
+  formatCost,
   formatUsd,
+  planGeneration,
   MAX_COUNT,
   MIN_COUNT,
   QUALITIES,
-  resolveSize,
   SIZE_OPTIONS,
   validatePrompt,
   type GenerationConfig,
@@ -35,7 +34,7 @@ import {
 } from '../../../shared/project';
 import type { DocumentStore } from '../document/DocumentStore';
 import { updatePrompt, type DocState } from '../document/operations';
-import { activeTheme } from '../project/GenerationTracker';
+import { activeTheme, effectiveConfig } from '../project/GenerationTracker';
 import type { TrackedJob } from '../project/GenerationTracker';
 import { thumbnailUrl } from '../project/thumbnails';
 
@@ -126,10 +125,10 @@ function CardActions({ onDuplicate, onBringToFront, onDelete }: InspectorProps) 
 function ProjectInfo({ state, projectName, projectDir, onReveal }: InspectorProps) {
   const images = state.cards.filter(isImageCard);
   const versionCount = images.reduce((sum, card) => sum + card.versions.length, 0);
-  const spent = images.reduce(
-    (sum, card) => sum + card.versions.reduce((s, v) => s + (v.generation?.costUsd ?? 0), 0),
-    0,
-  );
+  const versions = images.flatMap((card) => card.versions);
+  const spentUsd = versions.reduce((sum, v) => sum + (v.generation?.costUsd ?? 0), 0);
+  const spentCny = versions.reduce((sum, v) => sum + (v.generation?.costCny ?? 0), 0);
+  const spent = [spentUsd > 0 ? formatUsd(spentUsd) : '', spentCny > 0 ? formatCost(spentCny, 'CNY') : ''].filter(Boolean).join(' + ') || '0';
   return (
     <section className="inspector-section">
       <div className="panel-title">项目</div>
@@ -137,7 +136,7 @@ function ProjectInfo({ state, projectName, projectDir, onReveal }: InspectorProp
       <Field label="图像卡" value={`${images.length} 张`} />
       <Field label="提示词卡" value={`${state.cards.length - images.length} 张`} />
       <Field label="版本" value={`${versionCount} 个`} />
-      <Field label="生成花费" value={formatUsd(spent)} />
+      <Field label="生成花费" value={spent} />
       <button className="link" onClick={() => onReveal(projectDir)} title={projectDir}>
         在 Finder 中显示项目目录
       </button>
@@ -166,7 +165,7 @@ function ImageInfo(props: InspectorProps & { card: ImageCard }) {
             <p className="record-prompt">{record.prompt}</p>
             <Field label="模型" value={record.model} />
             <Field label="尺寸 / 质量" value={`${record.size} · ${record.quality}`} />
-            <Field label="花费" value={formatUsd(record.costUsd)} />
+            <Field label="花费" value={record.costCny !== undefined ? formatCost(record.costCny, 'CNY') : formatUsd(record.costUsd)} />
             {props.state.cards.some((c) => c.id === record.promptCardId) && (
               <button className="link" onClick={() => props.onSelectCard(record.promptCardId)}>
                 选中来源提示词卡
@@ -230,12 +229,18 @@ function PromptInfo(props: InspectorProps & { card: PromptCard; textareaRef: Rea
     .map((id) => state.cards.find((c) => c.id === id))
     .filter((c): c is ImageCard => !!c && isImageCard(c));
   const output = card.outputCardId ? state.cards.find((c) => c.id === card.outputCardId) : undefined;
-  const problem = validatePrompt(text, inputs.length);
-  const size = resolveSize(card.settings.size, inputs[0] ? currentVersion(inputs[0]) : null);
-  const isMock = config?.provider === 'mock';
-  const model = isMock ? 'local-mock' : (config?.model ?? '');
-  const calibration = config?.calibration[calibrationKey(model, card.settings.quality)];
-  const estimate = isMock ? 0 : estimateCostUsd(card.settings, size, calibration ?? 1);
+  const plan = config
+    ? planGeneration(effectiveConfig(config), card.settings, inputs[0] ? currentVersion(inputs[0]) : null, inputs.length)
+    : null;
+  const problem = validatePrompt(text, inputs.length, plan?.maxInputs);
+  const isMock = plan?.provider === 'mock';
+  const costLabel = !plan
+    ? '—'
+    : isMock
+      ? '本地模拟 · 免费'
+      : plan.currency === 'CNY'
+        ? `${formatCost(plan.estimate, 'CNY')}（硅基流动 ${plan.model.split('/')[1]}，按张计价）`
+        : `≈ ${formatUsd(plan.estimate)}（粗估，生成后按实际用量校准）`;
   const latest = jobs.find((job) => job.promptCardId === card.id);
   const busy = latest?.update.status === 'queued' || latest?.update.status === 'running';
 
@@ -334,12 +339,10 @@ function PromptInfo(props: InspectorProps & { card: PromptCard; textareaRef: Rea
             ))}
           </select>
         </div>
-        <Field label="实际尺寸" value={`${size.width} × ${size.height}`} />
+        <Field label="实际尺寸" value={plan?.sizeLabel ?? '—'} />
+        {plan?.provider === 'siliconflow' && <p className="hint">硅基流动按模型固定质量出图，"质量"选项对它不起作用。</p>}
         <ThemeToggle card={card} state={state} onSettings={props.onSettings} />
-        <Field
-          label="费用估算"
-          value={isMock ? '本地模拟 · 免费' : `≈ ${formatUsd(estimate)}${calibration ? '（已按实际校准）' : '（粗估）'}`}
-        />
+        <Field label="费用估算" value={costLabel} />
         <button className="primary" disabled={!!problem || busy} onClick={() => props.onGenerate(card.id)}>
           {busy ? '生成中…' : `生成 ×${card.settings.count}  ⌘↩`}
         </button>

@@ -5,11 +5,11 @@ import type { CheckPhase, ImportSource, LaunchFlags, MenuCommand, StartupInfo } 
 import { BENCH_HOST, PROJECT_HOST, type BenchManifest, type BenchReport } from '../shared/bench';
 import type { AssistantRequest } from '../shared/assistant';
 import { safeFileName, type ExportResult, type PageExportPlan } from '../shared/export';
-import type { GenerationRequest, ProviderId } from '../shared/generation';
+import type { GenerationRequest } from '../shared/generation';
 import { MockAssistant, OpenAIAssistant } from './assistant/providers';
 import { GenerationQueue } from './generation/GenerationQueue';
-import { MockProvider, OpenAIProvider } from './generation/providers';
-import { GenerationSettingsStore } from './generation/settingsStore';
+import { MockProvider, OpenAIProvider, SiliconFlowProvider } from './generation/providers';
+import { GenerationSettingsStore, type KeyProvider, type SettingsPatch } from './generation/settingsStore';
 import type { ProjectFile } from '../shared/project';
 import type { PrepareBenchResult, SelfTestResult } from '../shared/workerProtocol';
 import { handleAssetProtocol, registerAssetScheme } from './assetProtocol';
@@ -60,15 +60,16 @@ const sendMenuCommand = (command: MenuCommand): void => {
 };
 
 const generationSettings = new GenerationSettingsStore(app.getPath('userData'));
-const openai = new OpenAIProvider(worker, () => generationSettings.getApiKey());
+const openai = new OpenAIProvider(worker, () => generationSettings.getApiKey('openai'));
+const siliconflow = new SiliconFlowProvider(worker, () => generationSettings.getApiKey('siliconflow'));
 const generationQueue = new GenerationQueue(
   worker,
   generationSettings,
-  { openai, mock: new MockProvider(worker) },
+  { openai, siliconflow, mock: new MockProvider(worker) },
   (update) => mainWindow?.webContents.send('gen:update', update),
   forceMock ? 'mock' : null,
 );
-const assistants = { openai: new OpenAIAssistant(worker, () => generationSettings.getApiKey()), mock: new MockAssistant() };
+const assistants = { openai: new OpenAIAssistant(worker, () => generationSettings.getApiKey('openai')), mock: new MockAssistant() };
 
 const projects = new ProjectService(
   worker,
@@ -181,11 +182,11 @@ function registerIpc(): void {
   }));
 
   ipcMain.handle('gen:config', () => generationSettings.config());
-  ipcMain.handle('gen:update-config', (_event, patch: { provider?: ProviderId; model?: string; assistantModel?: string }) =>
-    generationSettings.update(patch),
+  ipcMain.handle('gen:update-config', (_event, patch: SettingsPatch) => generationSettings.update(patch));
+  ipcMain.handle('gen:set-key', (_event, provider: KeyProvider, key: string | null) => generationSettings.setApiKey(provider, key));
+  ipcMain.handle('gen:test', (_event, provider: KeyProvider) =>
+    provider === 'siliconflow' ? siliconflow.testConnection() : openai.testConnection(generationSettings.config().model),
   );
-  ipcMain.handle('gen:set-key', (_event, key: string | null) => generationSettings.setApiKey(key));
-  ipcMain.handle('gen:test', () => openai.testConnection(generationSettings.config().model));
   ipcMain.handle('gen:submit', (_event, request: GenerationRequest) => {
     if (request.projectDir !== projects.currentDir()) throw new Error('只能为当前打开的项目生成');
     if (request.inputs.some((input) => input.file.includes('..') || input.file.startsWith('/'))) {
@@ -209,7 +210,7 @@ function registerIpc(): void {
     if (request.projectDir !== projects.currentDir()) throw new Error('只能为当前打开的项目提问');
     if (request.images.some((image) => image.file.includes('..') || image.file.startsWith('/'))) throw new Error('图片路径不合法');
     const config = generationSettings.config();
-    const provider = forceMock ? 'mock' : config.provider;
+    const provider = forceMock ? 'mock' : config.assistantProvider;
     return assistants[provider].ask(request, config.assistantModel, new AbortController().signal);
   });
 

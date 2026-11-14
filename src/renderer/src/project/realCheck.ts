@@ -1,5 +1,5 @@
 import type { ImportSource } from '../../../shared/api';
-import { formatUsd } from '../../../shared/generation';
+import { formatCost, formatUsd } from '../../../shared/generation';
 import { isImageCard, isPromptCard, isThemeCard, type ImageCard } from '../../../shared/project';
 import type { CanvasEngine } from '../canvas/CanvasEngine';
 import { updatePrompt } from '../document/operations';
@@ -34,19 +34,23 @@ export async function runRealCheck({ engine, session, tracker, assistant, import
   };
 
   const config = await window.anye.getGenerationConfig();
-  check('设置里选的是 OpenAI 并且填了 API Key', config.provider === 'openai' && config.hasApiKey, `供应商 ${config.provider}，Key ${config.hasApiKey ? `已保存（…${config.apiKeyHint}）` : '没有'}`);
-  if (config.provider !== 'openai' || !config.hasApiKey) return finish();
-
+  const imageProvider = config.provider;
+  const imageKey = imageProvider === 'siliconflow' ? config.hasSiliconflowKey : imageProvider === 'openai' ? config.hasApiKey : false;
+  check('生图供应商是真实服务并且填了 Key', imageKey, `生图供应商 ${imageProvider}`);
+  if (!imageKey || imageProvider === 'mock') return finish();
   try {
-    timings.connection = await window.anye.testConnection();
-    check('测试连接', true, String(timings.connection));
+    timings.imageConnection = await window.anye.testConnection(imageProvider);
+    check('生图供应商测试连接', true, String(timings.imageConnection));
   } catch (error) {
-    check('测试连接', false, error instanceof Error ? error.message : String(error));
+    check('生图供应商测试连接', false, error instanceof Error ? error.message : String(error));
     return finish();
   }
 
-  // 助手
   const doc = session.doc;
+  if (config.assistantProvider === 'openai' && config.hasApiKey) await checkAssistant();
+  else timings.assistant = '助手设成了本地模拟或没有 OpenAI Key，跳过';
+
+  async function checkAssistant(): Promise<void> {
   const askStart = performance.now();
   const reply = await assistant.send('为「日式寿司点餐」生成一套视觉主题');
   timings.assistantMs = Math.round(performance.now() - askStart);
@@ -60,6 +64,7 @@ export async function runRealCheck({ engine, session, tracker, assistant, import
       theme.keywords.length >= 3 && theme.palette.length >= 3 && Object.values(theme.rules).filter(Boolean).length >= 3,
       `关键词 ${theme.keywords.join('、')}；配色 ${theme.palette.map((c) => `${c.role}${c.hex}`).join(' ')}`,
     );
+  }
   }
 
   // 生图
@@ -85,8 +90,8 @@ export async function runRealCheck({ engine, session, tracker, assistant, import
     const finished = tracker.list().find((j) => j.update.jobId === job.update.jobId)!;
     timings.generateMs = Math.round(performance.now() - genStart);
     timings.imageModel = finished.update.model;
-    timings.imageEstimate = formatUsd(finished.update.estimateUsd);
-    timings.imageCost = formatUsd(finished.update.costUsd ?? 0);
+    timings.imageEstimate = formatCost(finished.update.estimateUsd, finished.update.currency);
+    timings.imageCost = formatCost(finished.update.costUsd ?? 0, finished.update.currency);
     const fresh = doc.get().cards.find((c) => c.id === prompt.id);
     const output = fresh && isPromptCard(fresh) ? doc.get().cards.find((c) => c.id === fresh.outputCardId) : undefined;
     const version = output && isImageCard(output) ? (output as ImageCard).versions[0] : undefined;
