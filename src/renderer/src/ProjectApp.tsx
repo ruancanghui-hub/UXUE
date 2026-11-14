@@ -24,6 +24,7 @@ import {
   newPageFromImageCard,
   setPageBaseFromCard,
   setStyleBenchmark,
+  updateSketchText,
   wireframeFromPage,
   layoutNewCards,
   newPageCard,
@@ -50,6 +51,7 @@ import { runM3Check } from './project/m3Check';
 import { runM4Check } from './project/m4Check';
 import { runM5Check } from './project/m5Check';
 import { runRealCheck } from './project/realCheck';
+import { startSketchWireframe } from './project/sketch';
 import { targetThemeId, themeMarkdownFor } from './project/themeMarkdown';
 import { ProjectSession, type SaveState } from './project/ProjectSession';
 
@@ -177,9 +179,12 @@ export function ProjectApp() {
     engine.setJobViews(tracker.views());
     const offViewport = engine.onViewportChange((viewport) => session.updateViewport(viewport));
     const offSave = session.onSaveState((state, error) => setSaveState({ state, error }));
-    const offEdit = engine.onEditRequest(() => {
+    const offEdit = engine.onEditRequest((cardId) => {
       setRightTab('inspector');
-      requestAnimationFrame(() => requestAnimationFrame(() => inspectorRef.current?.focusPrompt()));
+      const isBlock = session.doc.get().cards.some((card) => card.id === cardId && (card.kind === 'block' || card.kind === 'sketchText'));
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => (isBlock ? inspectorRef.current?.focusName() : inspectorRef.current?.focusPrompt())),
+      );
     });
     return () => {
       offViewport();
@@ -651,6 +656,8 @@ export function ProjectApp() {
           saveState={saveState.state}
           saveError={saveState.error}
           tool={status?.tool ?? 'select'}
+          penWidth={status?.penWidth ?? 'thin'}
+          onPenWidth={(width) => engine?.setPenWidth(width)}
           zoom={status?.zoom ?? 1}
           focusRegion={status?.focusRegion ?? null}
           onRegion={(id) => engine?.flyToRegion(id)}
@@ -731,6 +738,7 @@ export function ProjectApp() {
             onReplaceLowFi={replaceLowFi}
             onExportPage={exportPage}
             onPlaceInPage={placeInPage}
+            onToast={toast}
           />
         )}
       </div>
@@ -807,10 +815,11 @@ interface RightPanelProps extends PanelProps {
   onReplaceLowFi(pageId: string): void;
   onExportPage(pageId: string): void;
   onPlaceInPage(imageCardId: string, pageId: string): void;
+  onToast(text: string, tone?: 'info' | 'error'): void;
 }
 
 const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function RightPanel(
-  { tab, onTab, assistant, assistantLabel, session, engine, cacheBust, config, jobs, onImportVersion, onGenerate, onRegenDownstream, exports, onReplaceLowFi, onExportPage, onPlaceInPage },
+  { tab, onTab, assistant, assistantLabel, session, engine, cacheBust, config, jobs, onImportVersion, onGenerate, onRegenDownstream, exports, onReplaceLowFi, onExportPage, onPlaceInPage, onToast },
   ref,
 ) {
   const state = useCommittedDoc(session.doc);
@@ -899,6 +908,11 @@ const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function Ri
         },
         update: (id, patch) => doc.apply('编辑区块', updateBlock(doc.get(), id, patch)),
         refreshCrop: (blockId) => void assistant.refreshBlockCrop(blockId),
+        updateSketchText: (id, patch) => doc.apply('编辑草图文字', updateSketchText(doc.get(), id, patch)),
+        sketchToWireframe: (pageId) =>
+          void startSketchWireframe(session, pageId)
+            .then((promptId) => onGenerate(promptId))
+            .catch((error: unknown) => onToast(error instanceof Error ? error.message : String(error), 'error')),
       }}
       elementActions={{
         busy: assistantBusy,

@@ -8,6 +8,10 @@ import {
   isBlockCard,
   isBlockCropStale,
   isGroupCard,
+  isSketchMark,
+  isSketchTextCard,
+  isStrokeCard,
+  SKETCH_FONT_SIZES,
   isImageCard,
   isPageCard,
   isPromptCard,
@@ -19,6 +23,8 @@ import {
   type PageCard,
   type PromptCard,
   type RegionId,
+  type SketchTextCard,
+  type StrokeCard,
   type ThemeCard,
   type Version,
   type ViewportState,
@@ -28,7 +34,10 @@ import { DocumentStore, type DocChange } from '../document/DocumentStore';
 import {
   addPromptInput,
   blockHasOutput,
+  createBlockAt,
   createPromptCard,
+  createSketchText,
+  createStroke,
   displayVersion,
   duplicateCards,
   fitIntoPage,
@@ -43,6 +52,7 @@ import {
   reorderCards,
   resizeBlock,
   scaleCards,
+  strokeWorldPoints,
   ungroupCards,
   updatePrompt,
   withPageChildren,
@@ -56,10 +66,20 @@ import { ThemeNode } from './ThemeNode';
 import { TextureManager, type TextureStats } from './TextureManager';
 import { clamp, MAX_ZOOM, MIN_ZOOM, Viewport } from './Viewport';
 
-export type Tool = 'select' | 'hand';
+/** block：在页面框里拖出区块；pen / text / eraser：画布局草图的画笔、文字和橡皮 */
+export type Tool = 'select' | 'hand' | 'block' | 'pen' | 'text' | 'eraser';
+export type PenWidth = 'thin' | 'thick';
+/** 画笔粗细（画布单位）；页面框宽 480 时细线约 1 个像素宽的笔触 */
+const PEN_WIDTHS: Record<PenWidth, number> = { thin: 2, thick: 5 };
+const SKETCH_INK = 0x1d1d24;
+/** 画笔采样：屏幕上移动不到这么多像素的点丢掉 */
+const PEN_SAMPLE_PX = 1.5;
+/** 橡皮的命中半径（屏幕像素），再加上笔迹线宽的一半 */
+const ERASER_RADIUS_PX = 6;
 
 export interface EngineStatus {
   tool: Tool;
+  penWidth: PenWidth;
   zoom: number;
   itemCount: number;
   selectionCount: number;
@@ -97,7 +117,10 @@ type Interaction =
       cornerY: number;
       origins: Map<string, CanvasCard>;
     }
-  | { kind: 'link'; promptId: string; fromX: number; fromY: number; x: number; y: number; targetId: string | null };
+  | { kind: 'link'; promptId: string; fromX: number; fromY: number; x: number; y: number; targetId: string | null }
+  | { kind: 'drawBlock'; pageId: string; startWorldX: number; startWorldY: number; rect: Rect }
+  | { kind: 'drawStroke'; pageId: string; points: number[]; lastScreenX: number; lastScreenY: number }
+  | { kind: 'erase'; removed: number };
 
 interface ViewAnimation {
   from: { centerX: number; centerY: number; logZoom: number };
@@ -121,6 +144,8 @@ const MISSING_OUTLINE = 0xff6b7a;
 const ACCENT = 0x7c8cff;
 const OUTPUT_LINK = 0x5ad19a;
 const BLOCK_COLOR = 0xffb547;
+/** 拖出的框太小（多半是误点）就不建区块，画布单位 */
+const MIN_DRAWN_BLOCK = 6;
 const REGION_FILL = 0x17171c;
 const REGION_STROKE = 0x2a2a33;
 const FOCUS_DIM_ALPHA = 0.16;
@@ -183,6 +208,9 @@ export class CanvasEngine {
   private readonly pageBackgrounds = new Map<string, Graphics>();
   private readonly pageLabels = new Map<string, Text>();
   private readonly blockLabels = new Map<string, Text>();
+  /** 草图笔迹画在 Graphics 上，草图文字是 Text */
+  private readonly strokeGraphics = new Map<string, Graphics>();
+  private readonly sketchTexts = new Map<string, Text>();
   private renderedSequence: CanvasCard[] = [];
   private regionLabels = new Map<RegionId, Text>();
   private readonly slotLabels: Text[] = [];
@@ -190,6 +218,7 @@ export class CanvasEngine {
   private lastJobTick = 0;
 
   private tool: Tool = 'select';
+  private penWidth: PenWidth = 'thin';
   private spaceHeld = false;
   private interaction: Interaction = { kind: 'none' };
   private hoverId: string | null = null;
@@ -471,7 +500,16 @@ export class CanvasEngine {
 
   setTool(tool: Tool): void {
     this.tool = tool;
+    if (this.interaction.kind === 'drawBlock' || this.interaction.kind === 'drawStroke') {
+      this.interaction = { kind: 'none' };
+      this.overlayDirty = true;
+    }
     this.updateCursor();
+    this.emitStatus();
+  }
+
+  setPenWidth(width: PenWidth): void {
+    this.penWidth = width;
     this.emitStatus();
   }
 
@@ -687,6 +725,7 @@ export class CanvasEngine {
     this.textResolution = resolution;
     for (const node of this.promptNodes.values()) node.setTextResolution(resolution);
     for (const node of this.themeNodes.values()) node.setTextResolution(resolution);
+    for (const text of this.sketchTexts.values()) text.resolution = resolution;
     this.needsRender = true;
   }
 
@@ -694,7 +733,7 @@ export class CanvasEngine {
     const view = expandRect(this.viewport.visibleWorldRect(), 0.1);
     for (const card of this.doc.get().cards) {
       const node = this.nodes.get(card.id);
-      if (node) node.visible = intersects(card, view);
+      if (node) node.visible = intersects(card, view) && !this.isHiddenSketch(card);
     }
   }
 
@@ -766,6 +805,7 @@ export class CanvasEngine {
       else if (isThemeCard(card)) this.syncThemeCard(card);
       else if (isGroupCard(card)) this.ensureGroupNode(card);
       else if (isBlockCard(card)) this.ensureBlockNode(card);
+      else if (isSketchMark(card)) this.syncSketchMark(card);
       else this.ensureSpriteNode(card);
       if (keyChanged) this.rebindTexture(card.id, version);
       this.rendered.set(card.id, card);
@@ -809,6 +849,45 @@ export class CanvasEngine {
     const node = new Container();
     this.nodes.set(card.id, node);
     this.spriteLayers.set(card.id, node);
+  }
+
+  /** 草图笔迹：按外接框把归一化的点画成圆头折线；草图文字：空内容时显示灰色占位 */
+  private syncSketchMark(card: StrokeCard | SketchTextCard): void {
+    if (isStrokeCard(card)) {
+      let g = this.strokeGraphics.get(card.id);
+      if (!g) {
+        g = new Graphics();
+        const node = new Container();
+        node.addChild(g);
+        this.nodes.set(card.id, node);
+        this.strokeGraphics.set(card.id, g);
+      }
+      g.clear();
+      const pts = card.points;
+      g.moveTo(pts[0] * card.width, pts[1] * card.height);
+      for (let i = 2; i < pts.length; i += 2) g.lineTo(pts[i] * card.width, pts[i + 1] * card.height);
+      g.stroke({ color: SKETCH_INK, width: card.lineWidth, cap: 'round', join: 'round' });
+      return;
+    }
+    let text = this.sketchTexts.get(card.id);
+    if (!text) {
+      text = new Text({ text: '', style: { fontFamily: 'PingFang SC, -apple-system, sans-serif', fill: SKETCH_INK } });
+      if (this.textResolution > 0) text.resolution = this.textResolution;
+      const node = new Container();
+      node.addChild(text);
+      this.nodes.set(card.id, node);
+      this.sketchTexts.set(card.id, text);
+    }
+    text.text = card.text || '文字';
+    text.style.fontSize = SKETCH_FONT_SIZES[card.fontSize];
+    text.style.fill = card.text ? SKETCH_INK : 0x9a9aa8;
+  }
+
+  /** 页面框设了隐藏草图时，它的笔迹和文字不显示也点不到 */
+  private isHiddenSketch(card: CanvasCard): boolean {
+    if (!isSketchMark(card)) return false;
+    const page = this.rendered.get(card.pageId);
+    return !!page && isPageCard(page) && page.sketchHidden;
   }
 
   /** 区块的虚线框和标签画在覆盖层（线宽、字号不随缩放变）；世界里只留一个空节点参与排序和命中 */
@@ -950,6 +1029,8 @@ export class CanvasEngine {
     this.pageLabels.delete(id);
     this.blockLabels.get(id)?.destroy();
     this.blockLabels.delete(id);
+    this.strokeGraphics.delete(id);
+    this.sketchTexts.delete(id);
     this.spriteLayers.delete(id);
     this.pageBackgrounds.delete(id);
     this.nodes.delete(id);
@@ -1055,6 +1136,25 @@ export class CanvasEngine {
       g.rect(a.x, a.y, rect.width * this.viewport.zoom, rect.height * this.viewport.zoom)
         .fill({ color: ACCENT, alpha: 0.1 })
         .stroke({ color: ACCENT, width: 1, alpha: 0.9 });
+    }
+    if (this.interaction.kind === 'drawStroke') {
+      const pts = this.interaction.points;
+      const first = this.viewport.worldToScreen(pts[0], pts[1]);
+      g.moveTo(first.x, first.y);
+      for (let i = 2; i < pts.length; i += 2) {
+        const p = this.viewport.worldToScreen(pts[i], pts[i + 1]);
+        g.lineTo(p.x, p.y);
+      }
+      g.stroke({ color: SKETCH_INK, width: PEN_WIDTHS[this.penWidth] * this.viewport.zoom, cap: 'round', join: 'round' });
+    }
+    if (this.interaction.kind === 'drawBlock') {
+      const { rect } = this.interaction;
+      const a = this.viewport.worldToScreen(rect.x, rect.y);
+      const w = rect.width * this.viewport.zoom;
+      const h = rect.height * this.viewport.zoom;
+      g.rect(a.x, a.y, w, h).fill({ color: BLOCK_COLOR, alpha: 0.12 });
+      dashedRect(g, a.x, a.y, w, h);
+      g.stroke({ color: BLOCK_COLOR, width: 1.5, alpha: 0.95 });
     }
     if (this.interaction.kind === 'link') {
       const { fromX, fromY, x, y, targetId } = this.interaction;
@@ -1354,11 +1454,39 @@ export class CanvasEngine {
     return new Map(state.cards.filter((card) => ids.has(card.id)).map((card) => [card.id, card]));
   }
 
+  /** 橡皮：指针附近的笔迹整笔删掉，碰到的草图文字也删掉；整次拖动是一条撤销记录 */
+  private eraseAt(worldX: number, worldY: number): void {
+    if (this.interaction.kind !== 'erase') return;
+    const state = this.doc.get();
+    const slack = ERASER_RADIUS_PX / this.viewport.zoom;
+    const hit = new Set<string>();
+    for (const card of state.cards) {
+      if (!isSketchMark(card) || this.isHiddenSketch(card)) continue;
+      if (worldX < card.x - slack - 10 || worldX > card.x + card.width + slack + 10) continue;
+      if (worldY < card.y - slack - 10 || worldY > card.y + card.height + slack + 10) continue;
+      if (isSketchTextCard(card)) {
+        if (worldX >= card.x && worldX <= card.x + card.width && worldY >= card.y && worldY <= card.y + card.height) hit.add(card.id);
+        continue;
+      }
+      const pts = strokeWorldPoints(card);
+      const reach = card.lineWidth / 2 + slack;
+      for (let i = 0; i + 3 < pts.length; i += 2) {
+        if (segmentDistance(worldX, worldY, pts[i], pts[i + 1], pts[i + 2], pts[i + 3]) <= reach) {
+          hit.add(card.id);
+          break;
+        }
+      }
+    }
+    if (hit.size === 0) return;
+    this.interaction.removed += hit.size;
+    this.doc.updateGesture(removeCards(state, hit));
+  }
+
   private hitTest(worldX: number, worldY: number, filter: (card: CanvasCard) => boolean = () => true): CanvasCard | undefined {
     const cards = this.renderedSequence;
     for (let i = cards.length - 1; i >= 0; i--) {
       const card = cards[i];
-      if (!filter(card)) continue;
+      if (!filter(card) || this.isHiddenSketch(card)) continue;
       if (worldX >= card.x && worldX <= card.x + card.width && worldY >= card.y && worldY <= card.y + card.height) {
         return card;
       }
@@ -1468,6 +1596,46 @@ export class CanvasEngine {
       return;
     }
     if (event.button !== 0) return;
+
+    if (this.tool === 'pen' || this.tool === 'eraser' || this.tool === 'text') {
+      const world = this.viewport.screenToWorld(x, y);
+      if (this.tool === 'eraser') {
+        this.doc.beginGesture('擦除草图');
+        this.interaction = { kind: 'erase', removed: 0 };
+        this.eraseAt(world.x, world.y);
+        return;
+      }
+      const top = this.hitTest(world.x, world.y);
+      // 文字工具点在已有文字上：照常选中、拖动
+      if (!(this.tool === 'text' && top && isSketchTextCard(top))) {
+        const page = this.hitTest(world.x, world.y, isPageCard);
+        if (!page) return;
+        if (this.tool === 'pen') {
+          this.interaction = { kind: 'drawStroke', pageId: page.id, points: [world.x, world.y], lastScreenX: x, lastScreenY: y };
+          return;
+        }
+        const created = createSketchText(this.doc.get(), page.id, world, 'md', () => crypto.randomUUID());
+        if (created) {
+          this.doc.apply('写草图文字', created.state);
+          this.selection.set([created.textId]);
+          for (const listener of this.editListeners) listener(created.textId);
+        }
+        return;
+      }
+    }
+
+    // 区块工具：在页面框空白处拖出新框；按在已有区块或选中框的角上，照常移动 / 缩放
+    if (this.tool === 'block' && !this.hitCorner(x, y)) {
+      const world = this.viewport.screenToWorld(x, y);
+      const top = this.hitTest(world.x, world.y);
+      if (!top || !isBlockCard(top)) {
+        const page = this.hitTest(world.x, world.y, isPageCard);
+        if (page) {
+          this.interaction = { kind: 'drawBlock', pageId: page.id, startWorldX: world.x, startWorldY: world.y, rect: { x: world.x, y: world.y, width: 0, height: 0 } };
+        }
+        return;
+      }
+    }
 
     const port = this.hitAddPort(x, y);
     if (port) {
@@ -1584,7 +1752,7 @@ export class CanvasEngine {
         const world = this.viewport.screenToWorld(x, y);
         interaction.rect = rectFromPoints(interaction.startWorldX, interaction.startWorldY, world.x, world.y);
         const ids = new Set(interaction.base);
-        for (const card of this.doc.get().cards) if (intersects(card, interaction.rect)) ids.add(card.id);
+        for (const card of this.doc.get().cards) if (intersects(card, interaction.rect) && !this.isHiddenSketch(card)) ids.add(card.id);
         this.selection.set(ids);
         this.overlayDirty = true;
         return;
@@ -1601,6 +1769,35 @@ export class CanvasEngine {
         this.doc.updateGesture(
           scaleCards(this.doc.get(), interaction.origins, interaction.anchorX, interaction.anchorY, Math.max(sx, sy)),
         );
+        return;
+      }
+      case 'drawStroke': {
+        if (Math.hypot(x - interaction.lastScreenX, y - interaction.lastScreenY) < PEN_SAMPLE_PX) return;
+        const world = this.viewport.screenToWorld(x, y);
+        const page = this.rendered.get(interaction.pageId);
+        if (!page) return;
+        interaction.points.push(
+          Math.min(page.x + page.width, Math.max(page.x, world.x)),
+          Math.min(page.y + page.height, Math.max(page.y, world.y)),
+        );
+        interaction.lastScreenX = x;
+        interaction.lastScreenY = y;
+        this.overlayDirty = true;
+        return;
+      }
+      case 'erase': {
+        const world = this.viewport.screenToWorld(x, y);
+        this.eraseAt(world.x, world.y);
+        return;
+      }
+      case 'drawBlock': {
+        const world = this.viewport.screenToWorld(x, y);
+        const page = this.rendered.get(interaction.pageId);
+        if (!page) return;
+        const clampX = (v: number): number => Math.min(page.x + page.width, Math.max(page.x, v));
+        const clampY = (v: number): number => Math.min(page.y + page.height, Math.max(page.y, v));
+        interaction.rect = rectFromPoints(interaction.startWorldX, interaction.startWorldY, clampX(world.x), clampY(world.y));
+        this.overlayDirty = true;
         return;
       }
       case 'link': {
@@ -1630,6 +1827,23 @@ export class CanvasEngine {
       } else if (interaction.toggleOnClickId) this.selection.toggle(interaction.toggleOnClickId);
     }
     if (interaction.kind === 'resize') this.doc.commitGesture();
+    if (interaction.kind === 'drawStroke') {
+      const points = interaction.points.length >= 4 ? interaction.points : [...interaction.points, interaction.points[0] + 0.5, interaction.points[1] + 0.5];
+      const created = createStroke(this.doc.get(), interaction.pageId, points, PEN_WIDTHS[this.penWidth], () => crypto.randomUUID());
+      if (created) this.doc.apply('画草图', created.state);
+    }
+    if (interaction.kind === 'erase') {
+      if (interaction.removed > 0) this.doc.commitGesture();
+      else this.doc.cancelGesture();
+    }
+    if (interaction.kind === 'drawBlock' && interaction.rect.width >= MIN_DRAWN_BLOCK && interaction.rect.height >= MIN_DRAWN_BLOCK) {
+      const created = createBlockAt(this.doc.get(), interaction.pageId, interaction.rect, () => crypto.randomUUID());
+      if (created) {
+        this.doc.apply('画区块', created.state);
+        this.selection.set([created.blockId]);
+        for (const listener of this.editListeners) listener(created.blockId);
+      }
+    }
     if (interaction.kind === 'link' && interaction.targetId) {
       this.doc.apply('绑定输入图', addPromptInput(this.doc.get(), interaction.promptId, interaction.targetId));
     }
@@ -1679,6 +1893,14 @@ export class CanvasEngine {
       this.setTool('select');
     } else if (event.key.toLowerCase() === 'h') {
       this.setTool('hand');
+    } else if (event.key.toLowerCase() === 'b') {
+      this.setTool('block');
+    } else if (event.key.toLowerCase() === 'd') {
+      this.setTool('pen');
+    } else if (event.key.toLowerCase() === 't') {
+      this.setTool('text');
+    } else if (event.key.toLowerCase() === 'e') {
+      this.setTool('eraser');
     } else if (event.key.toLowerCase() === 'p') {
       event.preventDefault();
       this.createPromptFromSelection();
@@ -1691,7 +1913,8 @@ export class CanvasEngine {
     } else if (event.key === 'Backspace' || event.key === 'Delete') {
       this.deleteSelection();
     } else if (event.key === 'Escape') {
-      this.selection.set([]);
+      if (this.tool !== 'select' && this.tool !== 'hand') this.setTool('select');
+      else this.selection.set([]);
     }
   }
 
@@ -1717,6 +1940,9 @@ export class CanvasEngine {
     if (this.interaction.kind === 'pan') canvas.style.cursor = 'grabbing';
     else if (this.interaction.kind === 'link' || this.hoverPortId) canvas.style.cursor = 'crosshair';
     else if (this.tool === 'hand' || this.spaceHeld) canvas.style.cursor = 'grab';
+    else if (this.tool === 'block' || this.tool === 'pen') canvas.style.cursor = 'crosshair';
+    else if (this.tool === 'text') canvas.style.cursor = 'text';
+    else if (this.tool === 'eraser') canvas.style.cursor = 'cell';
     else if (this.hoverCorner === 'nw' || this.hoverCorner === 'se') canvas.style.cursor = 'nwse-resize';
     else if (this.hoverCorner === 'ne' || this.hoverCorner === 'sw') canvas.style.cursor = 'nesw-resize';
     else canvas.style.cursor = 'default';
@@ -1741,6 +1967,7 @@ export class CanvasEngine {
   private status(): EngineStatus {
     return {
       tool: this.tool,
+      penWidth: this.penWidth,
       zoom: this.viewport.zoom,
       itemCount: this.doc.get().cards.length,
       selectionCount: this.selection.size,
@@ -1802,6 +2029,15 @@ function sameOrder(a: readonly CanvasCard[], b: readonly CanvasCard[]): boolean 
 }
 
 /** 水平方向的三次贝塞尔曲线，两端水平进出 */
+/** 点到线段的距离 */
+function segmentDistance(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const lengthSq = dx * dx + dy * dy;
+  const t = lengthSq === 0 ? 0 : Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / lengthSq));
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
 function curve(g: Graphics, x1: number, y1: number, x2: number, y2: number): void {
   const bend = Math.max(40, Math.abs(x2 - x1) / 2);
   g.moveTo(x1, y1).bezierCurveTo(x1 + bend, y1, x2 - bend, y2, x2, y2);

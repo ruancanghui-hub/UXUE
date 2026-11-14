@@ -73,7 +73,31 @@ export type ImportSource =
   | { kind: 'path'; path: string }
   | { kind: 'bytes'; name: string; bytes: Uint8Array }
   /** 从项目里已有的原图裁一块（像素坐标），比如区块截图 */
-  | { kind: 'crop'; name: string; file: string; rect: { left: number; top: number; width: number; height: number } };
+  | { kind: 'crop'; name: string; file: string; rect: { left: number; top: number; width: number; height: number } }
+  /** 布局草图示意图：白底上按像素坐标画灰框并写上名字 */
+  | { kind: 'sketch'; name: string; width: number; height: number; boxes: SketchBox[]; strokes: SketchStroke[]; texts: SketchLabel[] };
+
+/** 示意图上的一笔：points 是像素 [x0, y0, x1, y1, …] */
+export interface SketchStroke {
+  points: number[];
+  width: number;
+}
+
+/** 示意图上的一段草图文字：x / y 是左上角像素 */
+export interface SketchLabel {
+  text: string;
+  x: number;
+  y: number;
+  fontSize: number;
+}
+
+export interface SketchBox {
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
 
 export interface ImportResult {
   versions: Version[];

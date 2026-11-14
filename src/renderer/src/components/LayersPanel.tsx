@@ -4,6 +4,9 @@ import {
   isBlockCard,
   isBlockCropStale,
   isGroupCard,
+  isSketchMark,
+  isSketchTextCard,
+  isStrokeCard,
   isImageCard,
   isPageCard,
   isPromptCard,
@@ -12,6 +15,7 @@ import {
   refDisplayVersion,
   type BlockCard,
   type CanvasCard,
+  type SketchTextCard,
   type RefCard,
   type RegionId,
 } from '../../../shared/project';
@@ -28,7 +32,7 @@ interface LayersPanelProps {
   onFocusCard(id: string): void;
 }
 
-type RowKind = 'image' | 'missing' | 'prompt' | 'theme' | 'page' | 'group' | 'ref' | 'block';
+type RowKind = 'image' | 'missing' | 'prompt' | 'theme' | 'page' | 'group' | 'ref' | 'block' | 'sketchText';
 
 interface Row {
   id: string;
@@ -43,10 +47,12 @@ interface Row {
 export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, onSelect, onFocusCard }: LayersPanelProps) {
   const groups = useMemo(() => {
     const byId = new Map(state.cards.map((card) => [card.id, card]));
-    const pageChildren = new Map<string, (RefCard | BlockCard)[]>();
+    const pageChildren = new Map<string, (RefCard | BlockCard | SketchTextCard)[]>();
+    const strokeCounts = new Map<string, number>();
     const groupChildren = new Map<string, CanvasCard[]>();
     for (const card of state.cards) {
-      if ((isRefCard(card) || isBlockCard(card)) && card.pageId && byId.has(card.pageId)) {
+      if (isStrokeCard(card)) strokeCounts.set(card.pageId, (strokeCounts.get(card.pageId) ?? 0) + 1);
+      if ((isRefCard(card) || isBlockCard(card) || isSketchTextCard(card)) && card.pageId && byId.has(card.pageId)) {
         const list = pageChildren.get(card.pageId) ?? [];
         list.unshift(card);
         pageChildren.set(card.pageId, list);
@@ -89,23 +95,33 @@ export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, 
         const stale = !!page && isPageCard(page) && isBlockCropStale(card, page);
         return { id: card.id, label: card.name, kind: 'block', badge: stale ? '过期' : undefined, indent };
       }
+      if (isSketchTextCard(card)) {
+        return { id: card.id, label: card.text.split('\n')[0] || '（空文字）', kind: 'sketchText', indent };
+      }
+      if (isStrokeCard(card)) return { id: card.id, label: '草图笔迹', kind: 'sketchText', indent };
+      if (isPageCard(card)) {
+        const refs = pageChildren.get(card.id)?.filter(isRefCard).length ?? 0;
+        const strokes = strokeCounts.get(card.id) ?? 0;
+        return {
+          id: card.id,
+          label: card.name,
+          kind: 'page',
+          badge: strokes ? `${refs ? `${refs} · ` : ''}笔迹 ${strokes}` : refs || undefined,
+          indent,
+        };
+      }
       return {
         id: card.id,
         label: card.name,
         kind: card.kind,
-        badge:
-          card.id === state.activeThemeCardId
-            ? '生效'
-            : isPageCard(card)
-              ? pageChildren.get(card.id)?.filter(isRefCard).length || undefined
-              : undefined,
+        badge: card.id === state.activeThemeCardId ? '生效' : undefined,
         indent,
       };
     };
 
     const byRegion = new Map<RegionId | null, Row[]>();
     for (const card of [...state.cards].reverse()) {
-      if ((isRefCard(card) || isBlockCard(card)) && card.pageId && byId.has(card.pageId)) continue;
+      if ((isRefCard(card) || isBlockCard(card) || isSketchMark(card)) && card.pageId && byId.has(card.pageId)) continue;
       if ((isImageCard(card) || isPromptCard(card) || isThemeCard(card)) && card.groupId && byId.has(card.groupId)) continue;
       const region = regionOf(state, card);
       const rows = byRegion.get(region) ?? [];
@@ -141,7 +157,7 @@ export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, 
   );
 }
 
-const ICONS: Partial<Record<RowKind, string>> = { prompt: '✎', theme: '◆', page: '▢', group: '⬚', block: '⬒' };
+const ICONS: Partial<Record<RowKind, string>> = { prompt: '✎', theme: '◆', page: '▢', group: '⬚', block: '⬒', sketchText: 'T' };
 
 const LayerRow = memo(function LayerRow({
   row,

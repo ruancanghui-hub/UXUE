@@ -142,6 +142,9 @@ export class ProjectService {
           if (source.kind === 'crop' && (source.file.includes('..') || source.file.startsWith('/'))) {
             throw new Error('裁剪的原图路径不合法');
           }
+          if (source.kind === 'sketch' && !(source.width > 0 && source.height > 0 && source.width <= 8000 && source.height <= 8000)) {
+            throw new Error('布局草图的尺寸不合法');
+          }
           const imported = await this.worker.request<ImportedImage>({ type: 'importImage', dir, key, source });
           versions[index] = {
             id: key,

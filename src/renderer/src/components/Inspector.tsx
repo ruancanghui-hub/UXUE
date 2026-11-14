@@ -21,6 +21,8 @@ import {
   isBlockCard,
   isBlockCropStale,
   isGroupCard,
+  isSketchTextCard,
+  isStrokeCard,
   isImageCard,
   isPageCard,
   isPromptCard,
@@ -33,6 +35,7 @@ import {
   themeSuffix,
   type BlockCard,
   type BlockType,
+  type SketchTextCard,
   type GroupCard,
   type ImageCard,
   type PageCard,
@@ -50,6 +53,7 @@ import {
   elementPrompts,
   isWireframeOutput,
   pageBlocks,
+  sketchMarks,
   updatePrompt,
   type DocState,
 } from '../document/operations';
@@ -59,6 +63,8 @@ import { thumbnailUrl } from '../project/thumbnails';
 
 export interface InspectorHandle {
   focusPrompt(): void;
+  /** 选中卡片的名字输入框获得焦点并全选，比如刚画出的区块 */
+  focusName(): void;
 }
 
 interface InspectorProps {
@@ -135,11 +141,15 @@ export interface BlockActions {
   addBlock(pageId: string): void;
   update(id: string, patch: Partial<Pick<BlockCard, 'name' | 'blockType' | 'group'>>): void;
   refreshCrop(blockId: string): void;
+  /** 空白页面框：把区块、笔迹和文字画成示意图，再由 AI 转成线框 */
+  sketchToWireframe(pageId: string): void;
+  updateSketchText(id: string, patch: Partial<Pick<SketchTextCard, 'text' | 'fontSize'>>): void;
 }
 
 export const Inspector = forwardRef<InspectorHandle, InspectorProps>(function Inspector(props, ref) {
   const selected = props.state.cards.filter((card) => props.selectedIds.has(card.id));
   const promptRef = useRef<HTMLTextAreaElement>(null);
+  const asideRef = useRef<HTMLElement>(null);
   useImperativeHandle(ref, () => ({
     focusPrompt: () => {
       const element = promptRef.current;
@@ -147,11 +157,16 @@ export const Inspector = forwardRef<InspectorHandle, InspectorProps>(function In
       element.focus();
       element.setSelectionRange(element.value.length, element.value.length);
     },
+    focusName: () => {
+      const element = asideRef.current?.querySelector<HTMLInputElement | HTMLTextAreaElement>('.sketch-text-input, .name-input');
+      element?.focus();
+      element?.select();
+    },
   }));
 
   const only = selected.length === 1 ? selected[0] : null;
   return (
-    <aside className="side-panel inspector">
+    <aside className="side-panel inspector" ref={asideRef}>
       {props.tabs}
       {selected.length === 0 && <ProjectInfo {...props} />}
       {only && isImageCard(only) && <ImageInfo card={only} {...props} />}
@@ -161,6 +176,14 @@ export const Inspector = forwardRef<InspectorHandle, InspectorProps>(function In
       {only && isRefCard(only) && <RefInfo card={only} {...props} />}
       {only && isGroupCard(only) && <GroupInfo card={only} {...props} />}
       {only && isBlockCard(only) && <BlockInfo card={only} {...props} />}
+      {only && isSketchTextCard(only) && <SketchTextInfo card={only} {...props} />}
+      {only && isStrokeCard(only) && (
+        <section className="inspector-section">
+          <div className="panel-title">草图笔迹</div>
+          <p className="hint">布局草图里手绘的一笔，只在「草图转线框」时给 AI 看，不会进入导出。橡皮（E）点一下也能删掉。</p>
+          <CardActions {...props} />
+        </section>
+      )}
       {selected.length > 1 && (
         <section className="inspector-section">
           <div className="panel-title">已选 {selected.length} 个对象</div>
@@ -669,6 +692,7 @@ function PageInfo(props: InspectorProps & { card: PageCard }) {
 function PageBlocks(props: InspectorProps & { card: PageCard }) {
   const { card, state, blockActions } = props;
   const blocks = pageBlocks(state, card.id);
+  const marks = sketchMarks(state, card.id);
   const withPrompt = blocks.filter((block) => block.promptCardId).length;
   return (
     <section className="inspector-section">
@@ -689,9 +713,34 @@ function PageBlocks(props: InspectorProps & { card: PageCard }) {
           ))}
         </div>
       </div>
-      <p className="hint">
-        「拆解」让助手看低保真原型，把要单独生成的块框出来（已经出图的区块会保留）；调整好之后点「为区块写提示词」，会裁出每块的截图并写好绑定截图的提示词卡，放在核心素材区。生成后结果自动放回区块位置。
-      </p>
+      {!card.base ? (
+        <>
+          <p className="hint">
+            布局草图：B 在页面框里拖出框并起名字（比如「Banner」「搜索框」「金刚位 ×4」）；D 画笔随手画，T 点一下写说明文字，E 橡皮整笔擦掉；V 或 Esc 退出。画好后点「草图转线框」，AI 会按名字和笔迹画成线框图，并换成这个页面框的低保真原型。
+          </p>
+          <button
+            className="primary"
+            disabled={(blocks.length === 0 && marks.length === 0) || !!card.wireframePromptId}
+            onClick={() => blockActions.sketchToWireframe(card.id)}
+          >
+            {card.wireframePromptId ? '草图转线框中…' : '草图转线框'}
+          </button>
+        </>
+      ) : (
+        <>
+          <p className="hint">
+            「拆解」让助手看低保真原型，把要单独生成的块框出来（已经出图的区块会保留）；调整好之后点「为区块写提示词」，会裁出每块的截图并写好绑定截图的提示词卡，放在核心素材区。生成后结果自动放回区块位置。
+          </p>
+          {marks.length > 0 && (
+            <label className="radio-row">
+              <input type="checkbox" checked={!card.sketchHidden} onChange={(e) => props.onUpdatePage(card.id, { sketchHidden: !e.target.checked })} />
+              <span>
+                显示草图<span className="dim">　{marks.length} 个笔迹和文字</span>
+              </span>
+            </label>
+          )}
+        </>
+      )}
       <div className="button-row tight">
         <button disabled={blockActions.busy || !card.base} onClick={() => blockActions.decompose(card.id)}>
           {blockActions.busy ? '助手忙…' : '拆解'}
@@ -722,6 +771,51 @@ function PageBlocks(props: InspectorProps & { card: PageCard }) {
         );
       })}
     </section>
+  );
+}
+
+function SketchTextInfo(props: InspectorProps & { card: SketchTextCard }) {
+  const { card, blockActions } = props;
+  const [text, setText] = useState(card.text);
+  useEffect(() => setText(card.text), [card.id, card.text]);
+  const commit = (): void => {
+    if (text !== card.text) blockActions.updateSketchText(card.id, { text });
+  };
+  return (
+    <>
+      <section className="inspector-section">
+        <div className="panel-title">草图文字</div>
+        <textarea
+          className="prompt-input sketch-text-input"
+          value={text}
+          rows={3}
+          placeholder="写一句说明，比如「这里放优惠券」「顶部要有城市切换」"
+          onChange={(event) => setText(event.target.value)}
+          onBlur={commit}
+          onKeyDown={(event) => {
+            // 回车完成；Shift + 回车换行
+            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault();
+              event.currentTarget.blur();
+            }
+          }}
+        />
+        <div className="field">
+          <span className="field-label">字号</span>
+          <div className="segmented small">
+            {(['sm', 'md', 'lg'] as const).map((size) => (
+              <button key={size} className={card.fontSize === size ? 'active' : ''} onClick={() => blockActions.updateSketchText(card.id, { fontSize: size })}>
+                {{ sm: '小', md: '中', lg: '大' }[size]}
+              </button>
+            ))}
+          </div>
+        </div>
+        <p className="hint">只在「草图转线框」时给 AI 看，不会进入导出。</p>
+      </section>
+      <section className="inspector-section">
+        <CardActions {...props} />
+      </section>
+    </>
   );
 }
 

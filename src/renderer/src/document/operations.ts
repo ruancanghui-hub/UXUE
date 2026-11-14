@@ -10,6 +10,9 @@ import {
   DEVICE_PRESETS,
   isBlockCard,
   isGroupCard,
+  isSketchMark,
+  isSketchTextCard,
+  SKETCH_FONT_SIZES,
   isImageCard,
   isPageCard,
   isPromptCard,
@@ -18,6 +21,9 @@ import {
   refDisplayVersion,
   type BlockCard,
   type CanvasCard,
+  type SketchFontSize,
+  type SketchTextCard,
+  type StrokeCard,
   type GroupCard,
   type ImageCard,
   type PageCard,
@@ -118,7 +124,7 @@ export function removeCards(state: DocState, requested: ReadonlySet<string>): Do
   const ids = new Set(requested);
   for (const card of state.cards) {
     if (isRefCard(card) && ((card.pageId && requested.has(card.pageId)) || requested.has(card.imageCardId))) ids.add(card.id);
-    if (isBlockCard(card) && requested.has(card.pageId)) ids.add(card.id);
+    if ((isBlockCard(card) || isSketchMark(card)) && requested.has(card.pageId)) ids.add(card.id);
   }
   const activeThemeCardId = state.activeThemeCardId && ids.has(state.activeThemeCardId) ? null : state.activeThemeCardId;
   const cards = state.cards
@@ -202,8 +208,8 @@ export function duplicateCards(state: DocState, ids: ReadonlySet<string>, makeId
   // 复制页面框时一起复制里面的引用和区块（单独选中的已经在上面复制过）；区块副本不带截图和提示词
   const childCopies = state.cards
     .filter(
-      (card): card is RefCard | BlockCard =>
-        (isRefCard(card) || isBlockCard(card)) && !!card.pageId && pageCopies.has(card.pageId) && !ids.has(card.id),
+      (card): card is RefCard | BlockCard | StrokeCard | SketchTextCard =>
+        (isRefCard(card) || isBlockCard(card) || isSketchMark(card)) && !!card.pageId && pageCopies.has(card.pageId) && !ids.has(card.id),
     )
     .map((card): CanvasCard => {
       const moved = { ...card, id: makeId(), x: card.x + DUPLICATE_OFFSET, y: card.y + DUPLICATE_OFFSET, pageId: pageCopies.get(card.pageId!)! };
@@ -567,6 +573,7 @@ export function newPageCard(
     baseSource: 'own',
     baseCardId: null,
     wireframePromptId: null,
+    sketchHidden: false,
   };
 }
 
@@ -618,7 +625,7 @@ export function withPageChildren(state: DocState, ids: Iterable<string>): Set<st
   const groups = new Set(state.cards.filter((card) => result.has(card.id) && isGroupCard(card)).map((card) => card.id));
   if (pages.size === 0 && groups.size === 0) return result;
   for (const card of state.cards) {
-    if ((isRefCard(card) || isBlockCard(card)) && card.pageId && pages.has(card.pageId)) result.add(card.id);
+    if ((isRefCard(card) || isBlockCard(card) || isSketchMark(card)) && card.pageId && pages.has(card.pageId)) result.add(card.id);
     const gid = cardGroupId(card);
     if (gid && groups.has(gid)) result.add(card.id);
   }
@@ -673,17 +680,19 @@ export function reassignRefPages(state: DocState, refIds: ReadonlySet<string>): 
   });
 }
 
-/** 绘制和命中顺序：页面框之后先是区块、再是引用（放好的素材盖住区块）；组成员紧跟分组框 */
+/** 绘制和命中顺序：页面框之后依次是区块、草图笔迹和文字、引用（放好的素材盖在最上面）；组成员紧跟分组框 */
 export function renderOrder(cards: readonly CanvasCard[]): CanvasCard[] {
   const pageIds = new Set(cards.filter(isPageCard).map((card) => card.id));
   const groupIds = new Set(cards.filter(isGroupCard).map((card) => card.id));
   const pageChildren = new Map<string, CanvasCard[]>();
   const groupChildren = new Map<string, CanvasCard[]>();
-  for (const card of cards) {
-    if (isBlockCard(card) && pageIds.has(card.pageId)) {
-      const list = pageChildren.get(card.pageId) ?? [];
-      list.push(card);
-      pageChildren.set(card.pageId, list);
+  for (const kindOf of [isBlockCard, isSketchMark] as const) {
+    for (const card of cards) {
+      if (kindOf(card) && pageIds.has(card.pageId)) {
+        const list = pageChildren.get(card.pageId) ?? [];
+        list.push(card);
+        pageChildren.set(card.pageId, list);
+      }
     }
   }
   for (const card of cards) {
@@ -703,7 +712,7 @@ export function renderOrder(cards: readonly CanvasCard[]): CanvasCard[] {
   const ordered: CanvasCard[] = [];
   for (const card of cards) {
     if (isRefCard(card) && card.pageId && pageIds.has(card.pageId)) continue;
-    if (isBlockCard(card) && pageIds.has(card.pageId)) continue;
+    if ((isBlockCard(card) || isSketchMark(card)) && pageIds.has(card.pageId)) continue;
     if (cardGroupId(card) && groupIds.has(cardGroupId(card)!)) continue;
     ordered.push(card);
     if (isPageCard(card)) ordered.push(...(pageChildren.get(card.id) ?? []));
@@ -793,6 +802,95 @@ export function addBlock(state: DocState, pageId: string, makeId: () => string):
     promptCardId: null,
   };
   return { state: addCards(state, [block]), blockId: block.id };
+}
+
+/** 区块工具在页面框里拖出的一个框；名字先叫「区块」，建好后让用户马上改 */
+export function createBlockAt(state: DocState, pageId: string, rect: Rect, makeId: () => string): { state: DocState; blockId: string } | null {
+  if (!state.cards.some((card) => card.id === pageId && isPageCard(card))) return null;
+  const block: BlockCard = {
+    kind: 'block',
+    id: makeId(),
+    name: '区块',
+    ...rect,
+    pageId,
+    blockType: 'other',
+    group: null,
+    cropCardId: null,
+    cropRect: null,
+    cropBaseVersionId: null,
+    promptCardId: null,
+  };
+  return { state: addCards(state, [block]), blockId: block.id };
+}
+
+/** 画笔画完的一笔：按世界坐标的点算外接框，点归一化到外接框里 */
+export function createStroke(
+  state: DocState,
+  pageId: string,
+  worldPoints: number[],
+  lineWidth: number,
+  makeId: () => string,
+): { state: DocState; strokeId: string } | null {
+  if (!state.cards.some((card) => card.id === pageId && isPageCard(card))) return null;
+  if (worldPoints.length < 4 || worldPoints.length % 2 !== 0) return null;
+  const xs = worldPoints.filter((_, i) => i % 2 === 0);
+  const ys = worldPoints.filter((_, i) => i % 2 === 1);
+  const minX = Math.min(...xs);
+  const minY = Math.min(...ys);
+  // 一笔横线或竖线的外接框有一边是 0，给个最小值免得除零
+  const width = Math.max(Math.max(...xs) - minX, 0.001);
+  const height = Math.max(Math.max(...ys) - minY, 0.001);
+  const points = worldPoints.map((v, i) => (i % 2 === 0 ? (v - minX) / width : (v - minY) / height));
+  const stroke: StrokeCard = { kind: 'stroke', id: makeId(), x: minX, y: minY, width, height, pageId, points, lineWidth };
+  return { state: addCards(state, [stroke]), strokeId: stroke.id };
+}
+
+/** 一笔在世界坐标里的点 */
+export function strokeWorldPoints(stroke: StrokeCard): number[] {
+  return stroke.points.map((v, i) => (i % 2 === 0 ? stroke.x + v * stroke.width : stroke.y + v * stroke.height));
+}
+
+/** 文字工具点出的一段草图文字；内容先空着，建好后让用户马上输入 */
+export function createSketchText(
+  state: DocState,
+  pageId: string,
+  at: { x: number; y: number },
+  fontSize: SketchFontSize,
+  makeId: () => string,
+): { state: DocState; textId: string } | null {
+  const page = state.cards.find((card): card is PageCard => card.id === pageId && isPageCard(card));
+  if (!page) return null;
+  const size = SKETCH_FONT_SIZES[fontSize];
+  const width = Math.min(size * 8, page.x + page.width - at.x);
+  const text: SketchTextCard = {
+    kind: 'sketchText',
+    id: makeId(),
+    x: at.x,
+    y: at.y,
+    width: Math.max(width, size * 2),
+    height: size * 1.4,
+    pageId,
+    text: '',
+    fontSize,
+  };
+  return { state: addCards(state, [text]), textId: text.id };
+}
+
+/** 改草图文字：外接框宽度跟着内容走，按单行估算 */
+export function updateSketchText(state: DocState, id: string, patch: Partial<Pick<SketchTextCard, 'text' | 'fontSize'>>): DocState {
+  return mapCards(state, (card) => {
+    if (card.id !== id || !isSketchTextCard(card)) return card;
+    const next = { ...card, ...patch };
+    if (next.text === card.text && next.fontSize === card.fontSize) return card;
+    const size = SKETCH_FONT_SIZES[next.fontSize];
+    const longest = Math.max(2, ...next.text.split('\n').map((line) => line.length));
+    const lines = Math.max(1, next.text.split('\n').length);
+    return { ...next, width: longest * size * 1.05, height: lines * size * 1.4 };
+  });
+}
+
+export function sketchMarks(state: DocState, pageId: string): (StrokeCard | SketchTextCard)[] {
+  return state.cards.filter((card): card is StrokeCard | SketchTextCard => isSketchMark(card) && card.pageId === pageId);
 }
 
 export function updateBlock(state: DocState, id: string, patch: Partial<Pick<BlockCard, 'name' | 'blockType' | 'group'>>): DocState {
@@ -1111,24 +1209,64 @@ export function wireframeFromPage(
 ): { state: DocState; promptId: string; sourceId: string } | null {
   const page = state.cards.find((card): card is PageCard => card.id === pageId && isPageCard(card));
   if (!page?.base) return null;
-  const size = cardSizeFor(page.base, WIREFRAME_SOURCE_EDGE);
+  return pageWireframeChain(state, page, page.base, `${page.name} · 原截图`, 'wireframe', makeId);
+}
+
+export const SKETCH_WIREFRAME_PROMPT = [
+  '{{Image 1}} 是一张页面布局草图：每个灰色方框代表页面上的一块内容，框里写着它是什么。把它画成一张黑白线框图（低保真原型）。',
+  '【布局】严格保持每个框的位置和大小，不要增加或删除区块；框之外保持留白。',
+  '【按名字画】把每个框画成对应的界面元素：Banner / 主视觉画成带占位插图的横幅；金刚位、入口、图标画成一排圆形或圆角图标加短文字（名字里写了 ×N 就画 N 个）；搜索画成输入框；列表、商品、推荐画成卡片列表；底部导航画成一排图标加文字；标题、文字画成标题文字和灰色文字条。',
+  '【手绘】手绘的线条和圆圈是大致的形状提示，手写的文字是说明，按意思画成对应的界面元素，不要照描笔迹。',
+  '【风格】背景纯白，黑色细线描，按钮和输入框浅灰填充；图标和插图都是简洁线描；不要颜色、渐变、阴影；不要把草图的灰色方框和框名原样画出来。',
+].join('\n');
+
+/**
+ * 布局草图转线框：程序画好的示意图作为图像卡放在页面框左侧，接一张「草图转线框」提示词卡，
+ * 页面框记下它，第一次出图就换成底稿（底稿来源是自己的线框）。
+ */
+export function sketchToWireframe(
+  state: DocState,
+  pageId: string,
+  sketch: Version,
+  makeId: () => string,
+): { state: DocState; promptId: string; sourceId: string } | null {
+  const page = state.cards.find((card): card is PageCard => card.id === pageId && isPageCard(card));
+  if (!page) return null;
+  return pageWireframeChain(state, page, sketch, `${page.name} · 布局草图`, 'sketch', makeId);
+}
+
+function pageWireframeChain(
+  state: DocState,
+  page: PageCard,
+  version: Version,
+  name: string,
+  purpose: 'wireframe' | 'sketch',
+  makeId: () => string,
+): { state: DocState; promptId: string; sourceId: string } | null {
+  const size = cardSizeFor(version, WIREFRAME_SOURCE_EDGE);
   const outputWidth = Math.min(800, Math.max(240, size.width));
   const chainWidth = size.width + CHAIN_GAP + PROMPT_CARD_WIDTH + CHAIN_GAP + outputWidth;
   const source: ImageCard = {
     kind: 'image',
     id: makeId(),
-    name: `${page.name} · 原截图`,
+    name,
     x: page.x - chainWidth - CHAIN_GAP,
     y: page.y,
     width: size.width,
     height: size.height,
-    versions: [page.base],
-    currentVersionId: page.base.id,
+    versions: [version],
+    currentVersionId: version.id,
     groupId: null,
   };
   const created = createWireframePrompt(addCards(state, [source]), source.id, makeId);
   if (!created) return null;
-  const next = mapCards(created.state, (card) => (card.id === pageId && isPageCard(card) ? { ...card, wireframePromptId: created.promptId } : card));
+  const next = mapCards(created.state, (card) => {
+    if (card.id === page.id && isPageCard(card)) return { ...card, wireframePromptId: created.promptId };
+    if (purpose === 'sketch' && card.id === created.promptId && isPromptCard(card)) {
+      return { ...card, name: '草图转线框', text: SKETCH_WIREFRAME_PROMPT, purpose: 'sketch' as const };
+    }
+    return card;
+  });
   return { state: next, promptId: created.promptId, sourceId: source.id };
 }
 
@@ -1137,8 +1275,8 @@ export function isWireframeOutput(state: DocState, imageCardId: string): boolean
   return state.cards.some((card) => isPromptCard(card) && card.purpose === 'wireframe' && card.outputCardId === imageCardId);
 }
 
-/** 换底稿：跟随原型尺寸的页面框高度按新比例走；来自转线框结果时底稿来源设为借鉴 */
-function withBase(page: PageCard, version: Version, baseCardId: string | null, wireframe: boolean): PageCard {
+/** 换底稿：跟随原型尺寸的页面框高度按新比例走；baseSource 为 null 时保留原来的底稿来源 */
+function withBase(page: PageCard, version: Version, baseCardId: string | null, baseSource: PageCard['baseSource'] | null): PageCard {
   const height = page.devicePreset ? page.height : page.width * (version.height / version.width);
   return {
     ...page,
@@ -1146,7 +1284,7 @@ function withBase(page: PageCard, version: Version, baseCardId: string | null, w
     baseCardId,
     height,
     wireframePromptId: null,
-    baseSource: wireframe ? 'borrowed' : page.baseSource,
+    baseSource: baseSource ?? page.baseSource,
   };
 }
 
@@ -1155,7 +1293,7 @@ export function setPageBaseFromCard(state: DocState, pageId: string, imageCardId
   const source = state.cards.find((card): card is ImageCard => card.id === imageCardId && isImageCard(card));
   if (!source) return state;
   const wireframe = isWireframeOutput(state, imageCardId);
-  return mapCards(state, (card) => (card.id === pageId && isPageCard(card) ? withBase(card, currentVersion(source), imageCardId, wireframe) : card));
+  return mapCards(state, (card) => (card.id === pageId && isPageCard(card) ? withBase(card, currentVersion(source), imageCardId, wireframe ? 'borrowed' : null) : card));
 }
 
 /** 用图像卡的当前版本新建页面框 */
@@ -1171,8 +1309,12 @@ export function newPageFromImageCard(state: DocState, imageCardId: string, makeI
 
 /** 从页面框发起的转线框第一次出图：换成底稿（幂等，可套用到撤销栈每个快照） */
 function applyWireframeBase(cards: CanvasCard[], promptCardId: string, output: ImageCard): CanvasCard[] {
+  const prompt = cards.find((card): card is PromptCard => card.id === promptCardId && isPromptCard(card));
+  const borrowed = prompt?.purpose !== 'sketch';
   return cards.map((card) =>
-    isPageCard(card) && card.wireframePromptId === promptCardId ? withBase(card, currentVersion(output), output.id, true) : card,
+    isPageCard(card) && card.wireframePromptId === promptCardId
+      ? { ...withBase(card, currentVersion(output), output.id, borrowed ? 'borrowed' : 'own'), ...(borrowed ? {} : { sketchHidden: true }) }
+      : card,
   );
 }
 

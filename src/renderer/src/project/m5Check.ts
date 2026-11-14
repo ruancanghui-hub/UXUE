@@ -16,11 +16,25 @@ import {
 } from '../../../shared/project';
 import { isImageCardStale } from '../../../shared/stale';
 import type { CanvasEngine } from '../canvas/CanvasEngine';
-import { elementPrompts, moveCards, pageBlocks, setStyleBenchmark, wireframeFromPage } from '../document/operations';
+import {
+  createBlockAt,
+  createSketchText,
+  createStroke,
+  elementPrompts,
+  moveCards,
+  pageBlocks,
+  setStyleBenchmark,
+  sketchMarks,
+  updateBlock,
+  updatePage,
+  updateSketchText,
+  wireframeFromPage,
+} from '../document/operations';
 import type { AssistantSession } from './AssistantSession';
 import type { GenerationTracker } from './GenerationTracker';
 import { stableStringify, wait, waitForJobs } from './m2Check';
 import type { ProjectSession } from './ProjectSession';
+import { startSketchWireframe } from './sketch';
 import { themeMarkdownFor } from './themeMarkdown';
 
 interface CheckContext {
@@ -198,6 +212,49 @@ async function writePhase({ engine, session, tracker, assistant, createPage, exp
     check('换底稿后缩略图可用', engine.textures.failedCount() === 0);
   }
 
+  // 9. 布局草图：空白页面框里画三个区块 → 草图转线框 → 出图后换成底稿
+  const blank = await createPage(null);
+  check('新建空白页面框', !!blank && !blank.base);
+  if (blank) {
+    const drafts = [
+      { name: 'Banner', rect: { x: 0.05, y: 0.1, width: 0.9, height: 0.22 } },
+      { name: '金刚位 ×4', rect: { x: 0.05, y: 0.36, width: 0.9, height: 0.1 } },
+      { name: '商品列表', rect: { x: 0.05, y: 0.5, width: 0.9, height: 0.4 } },
+    ];
+    for (const draft of drafts) {
+      const r = draft.rect;
+      const created = createBlockAt(doc.get(), blank.id, { x: blank.x + r.x * blank.width, y: blank.y + r.y * blank.height, width: r.width * blank.width, height: r.height * blank.height }, () => crypto.randomUUID());
+      if (created) doc.apply('画区块', updateBlock(created.state, created.blockId, { name: draft.name }));
+    }
+    check('空白页面框里画出三个草图区块', blocksOf(blank.id).length === 3);
+    const at = (rx: number, ry: number): [number, number] => [blank.x + rx * blank.width, blank.y + ry * blank.height];
+    const strokes = [
+      [...at(0.1, 0.93), ...at(0.5, 0.95), ...at(0.9, 0.93)],
+      [...at(0.8, 0.03), ...at(0.85, 0.06), ...at(0.9, 0.03)],
+    ];
+    for (const points of strokes) {
+      const created = createStroke(doc.get(), blank.id, points, 2, () => crypto.randomUUID());
+      if (created) doc.apply('画草图', created.state);
+    }
+    const textCreated = createSketchText(doc.get(), blank.id, { x: at(0.05, 0.02)[0], y: at(0.05, 0.02)[1] }, 'md', () => crypto.randomUUID());
+    if (textCreated) doc.apply('写草图文字', updateSketchText(textCreated.state, textCreated.textId, { text: '顶部要有城市切换' }));
+    check('画了两笔草图笔迹、写了一段草图文字', sketchMarks(doc.get(), blank.id).length === 3);
+    const sketchPromptId = await startSketchWireframe(session, blank.id);
+    const sketchSource = imageOf(promptOf(sketchPromptId)?.inputs[0] ?? null);
+    check('画出布局草图示意图（逻辑尺寸 3 倍）', !!sketchSource && sketchSource.versions[0].width === 1179 && sketchSource.versions[0].height === 2556);
+    const sketchJob = await tracker.submit(session, sketchPromptId);
+    await waitForJobs(tracker, [sketchJob.update.jobId], 60_000);
+    const sketched = find(blank.id) as PageCard;
+    check('草图转线框出图后换成页面框底稿，底稿来源是自己的线框', !!sketched.base && sketched.baseSource === 'own' && blocksOf(blank.id).length === 3);
+    check('出图后草图自动隐藏，笔迹和文字的数据还在', sketched.sketchHidden && sketchMarks(doc.get(), blank.id).length === 3);
+    doc.apply('显示草图', updatePage(doc.get(), blank.id, { sketchHidden: false }));
+    const shown = !(find(blank.id) as PageCard).sketchHidden;
+    doc.apply('隐藏草图', updatePage(doc.get(), blank.id, { sketchHidden: true }));
+    check('「显示草图」开关能打开再关上', shown && (find(blank.id) as PageCard).sketchHidden);
+    await engine.whenAllL0Settled();
+    check('示意图和线框缩略图可用', engine.textures.failedCount() === 0);
+  }
+
   session.selection.set([page.id]);
   engine.zoomToCard(page.id);
   await wait(1200);
@@ -212,7 +269,8 @@ async function verifyPhase({ engine, session }: CheckContext, check: Check): Pro
   check('重新打开后状态完全一致', stableStringify(session.toProjectFile()) === expected);
   const state = session.doc.get();
   const page = state.cards.find(isPageCard);
-  check('区块都还在，且都连着截图和提示词卡', !!page && state.cards.filter(isBlockCard).length === MOCK_BLOCK_COUNT && state.cards.filter(isBlockCard).every((b) => b.cropCardId && b.promptCardId));
+  const firstPageBlocks = page ? state.cards.filter(isBlockCard).filter((b) => b.pageId === page.id) : [];
+  check('区块都还在，且都连着截图和提示词卡', firstPageBlocks.length === MOCK_BLOCK_COUNT && firstPageBlocks.every((b) => b.cropCardId && b.promptCardId));
   await engine.whenAllL0Settled();
   check('全部缩略图可用', engine.textures.failedCount() === 0);
   if (!page) return;

@@ -1,7 +1,7 @@
 import { copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import sharp, { type OverlayOptions } from 'sharp';
-import type { ImportSource } from '../shared/api';
+import type { ImportSource, SketchBox, SketchLabel, SketchStroke } from '../shared/api';
 import { safeFileName, type ExportResult } from '../shared/export';
 import { CACHE_VERSION, cacheFiles, computeTiles, l2Size, tileExtent } from '../shared/textures';
 import type {
@@ -85,7 +85,9 @@ async function importImage(dir: string, key: string, source: ImportSource): Prom
       ? source.path
       : source.kind === 'bytes'
         ? Buffer.from(source.bytes)
-        : await sharp(join(dir, source.file)).extract(source.rect).png().toBuffer();
+        : source.kind === 'sketch'
+          ? await sharp(Buffer.from(sketchSvg(source.width, source.height, source.boxes, source.strokes, source.texts))).png().toBuffer()
+          : await sharp(join(dir, source.file)).extract(source.rect).png().toBuffer();
   const meta = await sharp(input).metadata();
   const name = source.kind === 'path' ? basename(source.path) : source.name;
   if (!meta.format || !meta.width || !meta.height) throw new Error(`${name} 不是能识别的图片`);
@@ -211,6 +213,32 @@ function gradientSvg(width: number, height: number, hue: number): string {
     </linearGradient></defs>
     <rect width="100%" height="100%" fill="url(#g)"/>
   </svg>`;
+}
+
+/**
+ * 布局草图示意图：白底，每个区块一个浅灰圆角框，框中央写名字（字号随框大小，放得下为止）；
+ * 草图笔迹画成黑色圆头折线，草图文字照原位置写上。
+ */
+function sketchSvg(width: number, height: number, boxes: SketchBox[], strokes: SketchStroke[], texts: SketchLabel[]): string {
+  const shapes = boxes.map((box) => {
+    const size = Math.max(18, Math.min(56, box.height * 0.32, (box.width * 0.9) / Math.max(1, box.name.length)));
+    return [
+      `<rect x="${box.x}" y="${box.y}" width="${box.width}" height="${box.height}" rx="16" fill="#EFEFF2" stroke="#8E8E99" stroke-width="4"/>`,
+      `<text x="${box.x + box.width / 2}" y="${box.y + box.height / 2}" font-family="PingFang SC, Helvetica" font-size="${size}" fill="#55555F" text-anchor="middle" dominant-baseline="middle">${escapeXml(box.name)}</text>`,
+    ].join('');
+  });
+  const lines = strokes.map((stroke) => {
+    const points = [];
+    for (let i = 0; i + 1 < stroke.points.length; i += 2) points.push(`${stroke.points[i]},${stroke.points[i + 1]}`);
+    return `<polyline points="${points.join(' ')}" fill="none" stroke="#1D1D24" stroke-width="${stroke.width}" stroke-linecap="round" stroke-linejoin="round"/>`;
+  });
+  const labels = texts.map((label) => {
+    const rows = label.text.split('\n').map(
+      (row, i) => `<tspan x="${label.x}" dy="${i === 0 ? 0 : label.fontSize * 1.3}">${escapeXml(row)}</tspan>`,
+    );
+    return `<text x="${label.x}" y="${label.y + label.fontSize}" font-family="PingFang SC, Helvetica" font-size="${label.fontSize}" fill="#1D1D24">${rows.join('')}</text>`;
+  });
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><rect width="100%" height="100%" fill="#FFFFFF"/>${shapes.join('')}${lines.join('')}${labels.join('')}</svg>`;
 }
 
 function escapeXml(text: string): string {

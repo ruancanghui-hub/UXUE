@@ -83,8 +83,8 @@ export interface PromptCard {
   outputCardId: string | null;
   settings: PromptSettings;
   groupId: string | null;
-  /** 特殊用途：wireframe 转线框；element 素材清单里的一项 */
-  purpose: 'wireframe' | 'element' | null;
+  /** 特殊用途：wireframe 转线框；sketch 布局草图转线框；element 素材清单里的一项 */
+  purpose: 'wireframe' | 'sketch' | 'element' | null;
   /** 绑定的风格基准图像卡；有值时它是第 1 个输入 */
   styleRefCardId: string | null;
 }
@@ -160,6 +160,39 @@ export interface PageCard {
   baseCardId: string | null;
   /** 从页面框发起的转线框：这张提示词卡第一次出图就换成底稿 */
   wireframePromptId: string | null;
+  /** 草图笔迹和草图文字是否隐藏；草图转线框出图后自动隐藏 */
+  sketchHidden: boolean;
+}
+
+/** 布局草图里手绘的一笔：points 归一化到外接框 [x0, y0, x1, y1, …]，缩放时不用改点 */
+export interface StrokeCard {
+  kind: 'stroke';
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  pageId: string;
+  points: number[];
+  /** 画布单位 */
+  lineWidth: number;
+}
+
+export type SketchFontSize = 'sm' | 'md' | 'lg';
+/** 草图文字的字号（画布单位） */
+export const SKETCH_FONT_SIZES: Record<SketchFontSize, number> = { sm: 12, md: 18, lg: 28 };
+
+/** 布局草图里写的一段说明文字 */
+export interface SketchTextCard {
+  kind: 'sketchText';
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  pageId: string;
+  text: string;
+  fontSize: SketchFontSize;
 }
 
 export type BaseSource = 'own' | 'borrowed';
@@ -224,7 +257,7 @@ export interface RefCard {
   lockedVersionId: string | null;
 }
 
-export type CanvasCard = ImageCard | PromptCard | ThemeCard | PageCard | RefCard | GroupCard | BlockCard;
+export type CanvasCard = ImageCard | PromptCard | ThemeCard | PageCard | RefCard | GroupCard | BlockCard | StrokeCard | SketchTextCard;
 
 export function isPageCard(card: CanvasCard): card is PageCard {
   return card.kind === 'page';
@@ -232,6 +265,19 @@ export function isPageCard(card: CanvasCard): card is PageCard {
 
 export function isBlockCard(card: CanvasCard): card is BlockCard {
   return card.kind === 'block';
+}
+
+export function isStrokeCard(card: CanvasCard): card is StrokeCard {
+  return card.kind === 'stroke';
+}
+
+export function isSketchTextCard(card: CanvasCard): card is SketchTextCard {
+  return card.kind === 'sketchText';
+}
+
+/** 草图笔迹和草图文字：只属于一个页面框的草图素材 */
+export function isSketchMark(card: CanvasCard): card is StrokeCard | SketchTextCard {
+  return card.kind === 'stroke' || card.kind === 'sketchText';
 }
 
 /** 区块现在相对页面框的位置 */
@@ -293,7 +339,10 @@ export function cardGroupId(card: CanvasCard): string | null {
 }
 
 export const DEVICE_PRESETS = [
-  { id: 'iphone', label: 'iPhone 393 × 852', width: 393, height: 852 },
+  { id: 'iphone', label: 'iPhone 16 / 16 Pro 393 × 852', width: 393, height: 852 },
+  { id: 'iphone-max', label: 'iPhone 16 Plus / Pro Max 430 × 932', width: 430, height: 932 },
+  { id: 'iphone-mini', label: 'iPhone mini 375 × 812', width: 375, height: 812 },
+  { id: 'iphone-se', label: 'iPhone SE 375 × 667', width: 375, height: 667 },
   { id: 'android', label: 'Android 360 × 800', width: 360, height: 800 },
   { id: 'ipad', label: 'iPad 820 × 1180', width: 820, height: 1180 },
   { id: 'desktop', label: '桌面 1440 × 900', width: 1440, height: 900 },
@@ -454,7 +503,11 @@ export function parseProject(raw: unknown): ParseResult {
                 ? parseGroupCard(value)
                 : value.kind === 'block'
                   ? parseBlockCard(value)
-                  : parseCard(value);
+                  : value.kind === 'stroke'
+                    ? parseStrokeCard(value)
+                    : value.kind === 'sketchText'
+                      ? parseSketchTextCard(value)
+                      : parseCard(value);
     if (!card) {
       warnings.push(`第 ${index + 1} 个对象结构不完整，已跳过`);
       continue;
@@ -500,6 +553,15 @@ export function parseProject(raw: unknown): ParseResult {
         if (!source?.versions.some((v) => v.id === card.lockedVersionId)) next = { ...next, lockedVersionId: null };
       }
       if (next !== card) cards[index] = next;
+    }
+  }
+
+  // 草图笔迹和文字：页面框不在就丢掉
+  for (let index = cards.length - 1; index >= 0; index--) {
+    const card = cards[index];
+    if (isSketchMark(card) && !pageIds.has(card.pageId)) {
+      warnings.push('一条草图笔迹或文字所在的页面框不存在，已去掉');
+      cards.splice(index, 1);
     }
   }
 
@@ -599,6 +661,40 @@ function parsePageCard(value: Record<string, unknown>): PageCard | null {
     baseSource: value.baseSource === 'borrowed' ? 'borrowed' : 'own',
     baseCardId: typeof value.baseCardId === 'string' ? value.baseCardId : null,
     wireframePromptId: typeof value.wireframePromptId === 'string' ? value.wireframePromptId : null,
+    sketchHidden: value.sketchHidden === true,
+  };
+}
+
+function parseStrokeCard(value: Record<string, unknown>): StrokeCard | null {
+  if (typeof value.id !== 'string' || typeof value.pageId !== 'string' || !isRect(value)) return null;
+  if (!Array.isArray(value.points) || value.points.length < 4 || value.points.length % 2 !== 0) return null;
+  if (!value.points.every(isFiniteNumber)) return null;
+  return {
+    kind: 'stroke',
+    id: value.id,
+    x: value.x,
+    y: value.y,
+    width: Math.max(value.width, 0.001),
+    height: Math.max(value.height, 0.001),
+    pageId: value.pageId,
+    points: value.points as number[],
+    lineWidth: isFiniteNumber(value.lineWidth) && value.lineWidth > 0 ? value.lineWidth : 2,
+  };
+}
+
+function parseSketchTextCard(value: Record<string, unknown>): SketchTextCard | null {
+  if (typeof value.id !== 'string' || typeof value.pageId !== 'string' || !isRect(value) || value.width <= 0 || value.height <= 0) return null;
+  const fontSize = value.fontSize === 'sm' || value.fontSize === 'lg' ? value.fontSize : 'md';
+  return {
+    kind: 'sketchText',
+    id: value.id,
+    x: value.x,
+    y: value.y,
+    width: value.width,
+    height: value.height,
+    pageId: value.pageId,
+    text: typeof value.text === 'string' ? value.text : '',
+    fontSize,
   };
 }
 
@@ -719,7 +815,7 @@ function parsePromptCard(value: Record<string, unknown>): PromptCard | null {
       useTheme: typeof settings.useTheme === 'boolean' ? settings.useTheme : DEFAULT_PROMPT_SETTINGS.useTheme,
     },
     groupId: parseGroupId(value.groupId),
-    purpose: value.purpose === 'wireframe' || value.purpose === 'element' ? value.purpose : null,
+    purpose: value.purpose === 'wireframe' || value.purpose === 'sketch' || value.purpose === 'element' ? value.purpose : null,
     styleRefCardId: typeof value.styleRefCardId === 'string' ? value.styleRefCardId : null,
   };
 }

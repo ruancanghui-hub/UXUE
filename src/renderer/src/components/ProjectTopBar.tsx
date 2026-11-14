@@ -1,5 +1,5 @@
 import type { RegionId } from '../../../shared/project';
-import type { Tool } from '../canvas/CanvasEngine';
+import type { PenWidth, Tool } from '../canvas/CanvasEngine';
 import type { SaveState } from '../project/ProjectSession';
 
 const REGION_TABS: { id: RegionId; label: string; key: string }[] = [
@@ -20,11 +20,13 @@ interface ProjectTopBarProps {
   saveState: SaveState;
   saveError: string | null;
   tool: Tool;
+  penWidth: PenWidth;
   zoom: number;
   focusRegion: RegionId | null;
   onRegion(id: RegionId): void;
   onToggleFocus(): void;
   onTool(tool: Tool): void;
+  onPenWidth(width: PenWidth): void;
   onFit(): void;
   onImport(): void;
   providerLabel: string;
@@ -69,7 +71,33 @@ export function ProjectTopBar(props: ProjectTopBarProps) {
         <button className={tool === 'hand' ? 'active' : ''} onClick={() => props.onTool('hand')} title="抓手（H，或按住空格）">
           抓手 <kbd>H</kbd>
         </button>
+        <button
+          className={tool === 'block' ? 'active' : ''}
+          onClick={() => props.onTool('block')}
+          title="区块（B）：在页面框里拖出框来画布局草图，可以连续画，按 V 或 Esc 退出"
+        >
+          区块 <kbd>B</kbd>
+        </button>
+        <button className={tool === 'pen' ? 'active' : ''} onClick={() => props.onTool('pen')} title="画笔（D）：在页面框里手绘布局草图">
+          画笔 <kbd>D</kbd>
+        </button>
+        <button className={tool === 'text' ? 'active' : ''} onClick={() => props.onTool('text')} title="文字（T）：在页面框里点一下写说明文字">
+          文字 <kbd>T</kbd>
+        </button>
+        <button className={tool === 'eraser' ? 'active' : ''} onClick={() => props.onTool('eraser')} title="橡皮（E）：点到或拖过的笔迹整笔删掉">
+          橡皮 <kbd>E</kbd>
+        </button>
       </div>
+      {tool === 'pen' && (
+        <div className="segmented small" role="group" aria-label="画笔粗细">
+          <button className={props.penWidth === 'thin' ? 'active' : ''} onClick={() => props.onPenWidth('thin')}>
+            细
+          </button>
+          <button className={props.penWidth === 'thick' ? 'active' : ''} onClick={() => props.onPenWidth('thick')}>
+            粗
+          </button>
+        </div>
+      )}
 
       <div className="top-bar-actions">
         <button className="ghost" onClick={props.onSettings} title="设置（⌘,）">
