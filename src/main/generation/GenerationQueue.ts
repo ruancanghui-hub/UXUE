@@ -10,7 +10,7 @@ import {
 } from '../../shared/generation';
 import type { ImportedImage } from '../../shared/workerProtocol';
 import type { ImageWorkerClient } from '../imageWorkerClient';
-import type { ImageProvider } from './providers';
+import { DownloadFailedError, downloadResults, type ImageProvider } from './providers';
 import type { GenerationSettingsStore } from './settingsStore';
 
 const CONCURRENCY = 2;
@@ -28,6 +28,8 @@ interface Job {
 /** 生成队列在主进程里：渲染进程关掉面板、切走区域都不影响任务；最多同时跑两个 */
 export class GenerationQueue {
   private readonly jobs = new Map<string, Job>();
+  /** 生成成功但下载失败的任务，1 小时内可以重新下载 */
+  private readonly pendingDownloads = new Map<string, { job: Job; urls: string[]; expiresAt: number }>();
   private readonly waiting: string[] = [];
   private running = 0;
 
@@ -89,33 +91,61 @@ export class GenerationQueue {
     this.update(job, { status: 'running', startedAt: Date.now() });
     try {
       const result = await job.provider.generate(job.request, job.model, job.controller.signal);
-      // OpenAI 按返回用量算；硅基流动按张固定计价，实际花费 = 实际张数 × 单价
-      const costUsd =
-        result.costUsd ?? (job.update.provider === 'siliconflow'
-          ? (job.update.estimateUsd / Math.max(1, job.request.settings.count)) * result.images.length
-          : job.update.estimateUsd);
-      const versions: GeneratedVersionInfo[] = [];
-      for (const bytes of result.images) {
-        const id = randomUUID();
-        const imported = await this.worker.request<ImportedImage>({
-          type: 'importImage',
-          dir: job.request.projectDir,
-          key: id,
-          source: { kind: 'bytes', name: `${id}.png`, bytes },
-        });
-        versions.push({ id, file: imported.file, width: imported.width, height: imported.height });
-      }
-      if (result.costUsd !== null && job.rawEstimateUsd > 0) {
-        await this.settings.recordCalibration(calibrationKey(job.model, job.request.settings.quality), result.costUsd / job.rawEstimateUsd);
-      }
-      this.finish(job, { status: 'succeeded', versions, costUsd });
+      await this.complete(job, result.images, result.costUsd);
     } catch (error) {
       if (job.controller.signal.aborted) this.finish(job, { status: 'canceled' });
-      else this.finish(job, { status: 'failed', error: error instanceof Error ? error.message : String(error) });
+      else if (error instanceof DownloadFailedError) {
+        this.pendingDownloads.set(job.request.jobId, { job, urls: error.urls, expiresAt: error.expiresAt });
+        this.finish(job, { status: 'failed', error: error.message, retryDownloadUntil: error.expiresAt });
+      } else this.finish(job, { status: 'failed', error: error instanceof Error ? error.message : String(error) });
     } finally {
       this.running--;
       this.pump();
     }
+  }
+
+  /** 重新下载已经生成、计过费的结果 */
+  async retryDownload(jobId: string): Promise<void> {
+    const pending = this.pendingDownloads.get(jobId);
+    if (!pending) throw new Error('这个任务没有可以重新下载的结果');
+    if (Date.now() > pending.expiresAt) {
+      this.pendingDownloads.delete(jobId);
+      throw new Error('结果链接已经过期（超过 1 小时），只能重新生成');
+    }
+    const { job } = pending;
+    this.jobs.set(jobId, job);
+    this.update(job, { status: 'running', error: undefined, retryDownloadUntil: undefined });
+    try {
+      const images = await downloadResults(pending.urls);
+      this.pendingDownloads.delete(jobId);
+      await this.complete(job, images, null);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.finish(job, { status: 'failed', error: `重新下载还是失败：${reason}`, retryDownloadUntil: pending.expiresAt });
+    }
+  }
+
+  private async complete(job: Job, images: Uint8Array[], reportedCost: number | null): Promise<void> {
+    // OpenAI 按返回用量算；硅基流动按张固定计价，实际花费 = 实际张数 × 单价
+    const costUsd =
+      reportedCost ?? (job.update.provider === 'siliconflow'
+        ? (job.update.estimateUsd / Math.max(1, job.request.settings.count)) * images.length
+        : job.update.estimateUsd);
+    const versions: GeneratedVersionInfo[] = [];
+    for (const bytes of images) {
+      const id = randomUUID();
+      const imported = await this.worker.request<ImportedImage>({
+        type: 'importImage',
+        dir: job.request.projectDir,
+        key: id,
+        source: { kind: 'bytes', name: `${id}.png`, bytes },
+      });
+      versions.push({ id, file: imported.file, width: imported.width, height: imported.height });
+    }
+    if (reportedCost !== null && job.rawEstimateUsd > 0) {
+      await this.settings.recordCalibration(calibrationKey(job.model, job.request.settings.quality), reportedCost / job.rawEstimateUsd);
+    }
+    this.finish(job, { status: 'succeeded', versions, costUsd });
   }
 
   private finish(job: Job, patch: Partial<JobUpdate>): void {

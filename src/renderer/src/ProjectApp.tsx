@@ -531,6 +531,11 @@ export function ProjectApp() {
               jobs={jobs}
               onCancel={(jobId) => tracker.cancel(jobId)}
               onDismiss={(jobId) => tracker.dismiss(jobId)}
+              onRetryDownload={(jobId) =>
+                void window.anye.retryDownload(jobId).catch((error: unknown) =>
+                  toast(error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : String(error), 'error'),
+                )
+              }
               onSelectPrompt={(id) => {
                 session.selection.set([id]);
                 engine?.zoomToCard(id);

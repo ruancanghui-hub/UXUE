@@ -42,6 +42,7 @@ const api: AnyeApi = {
   submitGeneration: (request) => ipcRenderer.invoke('gen:submit', request),
   cancelGeneration: (jobId) => ipcRenderer.send('gen:cancel', jobId),
   cancelAllGenerations: () => ipcRenderer.send('gen:cancel-all'),
+  retryDownload: (jobId) => ipcRenderer.invoke('gen:retry-download', jobId),
   onGenerationUpdate: (listener) => subscribe<JobUpdate>('gen:update', listener),
   askAssistant: (request) => ipcRenderer.invoke('assistant:ask', request),
   exportPage: (projectDir, plan) => ipcRenderer.invoke('export:page', projectDir, plan),

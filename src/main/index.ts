@@ -185,7 +185,9 @@ function registerIpc(): void {
   ipcMain.handle('gen:update-config', (_event, patch: SettingsPatch) => generationSettings.update(patch));
   ipcMain.handle('gen:set-key', (_event, provider: KeyProvider, key: string | null) => generationSettings.setApiKey(provider, key));
   ipcMain.handle('gen:test', (_event, provider: KeyProvider) =>
-    provider === 'siliconflow' ? siliconflow.testConnection() : openai.testConnection(generationSettings.config().model),
+    provider === 'siliconflow'
+      ? siliconflow.testConnection([generationSettings.config().siliconflowEditModel, generationSettings.config().siliconflowT2iModel])
+      : openai.testConnection(generationSettings.config().model),
   );
   ipcMain.handle('gen:submit', (_event, request: GenerationRequest) => {
     if (request.projectDir !== projects.currentDir()) throw new Error('只能为当前打开的项目生成');
@@ -196,6 +198,7 @@ function registerIpc(): void {
   });
   ipcMain.on('gen:cancel', (_event, jobId: string) => generationQueue.cancel(jobId));
   ipcMain.on('gen:cancel-all', () => generationQueue.cancelAll());
+  ipcMain.handle('gen:retry-download', (_event, jobId: string) => generationQueue.retryDownload(jobId));
   ipcMain.handle('export:page', async (_event, projectDir: string, plan: PageExportPlan) => {
     if (projectDir !== projects.currentDir()) throw new Error('只能导出当前打开的项目');
     const files = [plan.base?.file, ...plan.layers.map((layer) => layer.file)].filter((f): f is string => !!f);

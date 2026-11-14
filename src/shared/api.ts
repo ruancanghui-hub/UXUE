@@ -115,6 +115,7 @@ export interface AnyeApi {
   submitGeneration(request: GenerationRequest): Promise<JobUpdate>;
   cancelGeneration(jobId: string): void;
   cancelAllGenerations(): void;
+  retryDownload(jobId: string): Promise<void>;
   onGenerationUpdate(listener: (update: JobUpdate) => void): () => void;
   askAssistant(request: AssistantRequest): Promise<AssistantResponse>;
   exportPage(projectDir: string, plan: PageExportPlan): Promise<ExportResult>;

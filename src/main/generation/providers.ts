@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { costFromUsage, SILICONFLOW_MAX_INPUTS, type GenerationRequest, type ImageUsage, type ProviderId } from '../../shared/generation';
 import type { MockGenerateResult, PreparedInput } from '../../shared/workerProtocol';
+import { httpFetch } from '../http';
 import type { ImageWorkerClient } from '../imageWorkerClient';
 
 export interface ProviderResult {
@@ -12,6 +13,44 @@ export interface ProviderResult {
 export interface ImageProvider {
   readonly id: ProviderId;
   generate(request: GenerationRequest, model: string, signal: AbortSignal): Promise<ProviderResult>;
+}
+
+/** 生成成功、已经计费，但结果没下载下来：带上结果链接，1 小时内可以重新下载 */
+export class DownloadFailedError extends Error {
+  constructor(
+    message: string,
+    readonly urls: string[],
+    readonly expiresAt: number,
+  ) {
+    super(message);
+  }
+}
+
+const RESULT_URL_TTL_MS = 60 * 60 * 1000;
+const DOWNLOAD_ATTEMPTS = 3;
+
+/** 下载硅基流动的结果图，失败时退避重试 */
+export async function downloadResults(urls: string[], signal?: AbortSignal): Promise<Uint8Array[]> {
+  const images: Uint8Array[] = [];
+  for (const url of urls) {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++) {
+      try {
+        const timeout = AbortSignal.timeout(120_000);
+        const response = await httpFetch('下载硅基流动的生成结果', url, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+        if (!response.ok) throw new Error(`下载硅基流动的生成结果失败（HTTP ${response.status}）`);
+        images.push(new Uint8Array(await response.arrayBuffer()));
+        lastError = null;
+        break;
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        lastError = error;
+        if (attempt < DOWNLOAD_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+      }
+    }
+    if (lastError) throw lastError;
+  }
+  return images;
 }
 
 const OPENAI_BASE = 'https://api.openai.com/v1';
@@ -53,7 +92,7 @@ export class OpenAIProvider implements ImageProvider {
 
     const endpoint = request.inputs.length > 0 ? '/images/edits' : '/images/generations';
     const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
-    const response = await fetch(OPENAI_BASE + endpoint, {
+    const response = await httpFetch('请求 OpenAI 生图', OPENAI_BASE + endpoint, {
       method: 'POST',
       headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -79,7 +118,7 @@ export class OpenAIProvider implements ImageProvider {
   async testConnection(model: string): Promise<string> {
     const apiKey = this.getApiKey();
     if (!apiKey) throw new Error('还没有设置 API Key');
-    const response = await fetch(`${OPENAI_BASE}/models/${encodeURIComponent(model)}`, {
+    const response = await httpFetch('连接 OpenAI', `${OPENAI_BASE}/models/${encodeURIComponent(model)}`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(15_000),
     });
@@ -126,9 +165,9 @@ export class SiliconFlowProvider implements ImageProvider {
       body.image_size = `${request.size.width}x${request.size.height}`;
     }
 
-    const images: Uint8Array[] = [];
+    const urls: string[] = [];
     for (let i = 0; i < request.settings.count; i++) {
-      const response = await fetch(`${SILICONFLOW_BASE}/images/generations`, {
+      const response = await httpFetch('请求硅基流动生图', `${SILICONFLOW_BASE}/images/generations`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'X-Enable-Watermark': '0' },
         body: JSON.stringify(body),
@@ -146,32 +185,46 @@ export class SiliconFlowProvider implements ImageProvider {
       }
       const url = (json?.images ?? json?.data ?? [])[0]?.url;
       if (!url) throw new Error('硅基流动没有返回图片');
-      const download = await fetch(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]) });
-      if (!download.ok) throw new Error(`下载生成结果失败（HTTP ${download.status}）`);
-      images.push(new Uint8Array(await download.arrayBuffer()));
+      urls.push(url);
     }
-    // 硅基流动按张固定计价，花费由队列按价目表计算
-    return { images, costUsd: null };
+    const expiresAt = Date.now() + RESULT_URL_TTL_MS;
+    try {
+      // 硅基流动按张固定计价，花费由队列按价目表计算
+      return { images: await downloadResults(urls, signal), costUsd: null };
+    } catch (error) {
+      if (signal.aborted) throw error;
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new DownloadFailedError(
+        `生成成功了（已计费），但结果没下载下来：${reason}。如果开着代理软件，把 siliconflow.cn 设成直连后点"重新下载"（1 小时内有效）`,
+        urls,
+        expiresAt,
+      );
+    }
   }
 
-  /** 查账户信息验证 Key，顺便显示余额，不产生费用 */
-  async testConnection(): Promise<string> {
+  /**
+   * 用模型列表验证 Key，并确认设置里选的模型可用，不产生费用。
+   * 硅基流动 2026-08-14 停用了查余额的 /v1/user/info，目前没有替代接口，余额只能在控制台看。
+   */
+  async testConnection(models: string[]): Promise<string> {
     const apiKey = this.getApiKey();
     if (!apiKey) throw new Error('还没有设置硅基流动 API Key');
-    const response = await fetch(`${SILICONFLOW_BASE}/user/info`, {
+    const response = await httpFetch('连接硅基流动', `${SILICONFLOW_BASE}/models?type=image`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(15_000),
     });
     const text = await response.text();
-    let json: { data?: { totalBalance?: string; balance?: string; name?: string }; message?: string } | null = null;
+    let json: { data?: { id?: string }[]; message?: string } | null = null;
     try {
       json = JSON.parse(text);
     } catch {
       json = null;
     }
     if (!response.ok) throw new Error(json?.message ?? (text.trim().slice(0, 200) || `HTTP ${response.status}`));
-    const balance = json?.data?.totalBalance ?? json?.data?.balance;
-    return balance !== undefined ? `连接正常，账户余额 ¥${balance}` : '连接正常';
+    const available = new Set((json?.data ?? []).map((model) => model.id));
+    const missing = models.filter((id) => !available.has(id));
+    if (missing.length) throw new Error(`Key 有效，但账号下没有这些模型：${missing.join('、')}`);
+    return `连接正常，可以使用 ${models.join('、')}（余额请在 cloud.siliconflow.cn 控制台查看）`;
   }
 }
 

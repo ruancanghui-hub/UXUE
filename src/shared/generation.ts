@@ -252,6 +252,8 @@ export interface JobUpdate {
   costUsd?: number;
   versions?: GeneratedVersionInfo[];
   error?: string;
+  /** 生成成功但下载失败时，到这个时间之前可以重新下载（毫秒时间戳） */
+  retryDownloadUntil?: number;
   startedAt?: number;
   finishedAt?: number;
 }

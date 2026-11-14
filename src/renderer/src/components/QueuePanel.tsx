@@ -7,6 +7,7 @@ interface QueuePanelProps {
   onCancel(jobId: string): void;
   onDismiss(jobId: string): void;
   onSelectPrompt(promptCardId: string): void;
+  onRetryDownload(jobId: string): void;
 }
 
 const STATUS_LABEL: Record<TrackedJob['update']['status'], string> = {
@@ -18,7 +19,7 @@ const STATUS_LABEL: Record<TrackedJob['update']['status'], string> = {
 };
 
 /** 生成队列：有任务时出现在画布左下角，可以折叠 */
-export function QueuePanel({ jobs, onCancel, onDismiss, onSelectPrompt }: QueuePanelProps) {
+export function QueuePanel({ jobs, onCancel, onDismiss, onSelectPrompt, onRetryDownload }: QueuePanelProps) {
   const [open, setOpen] = useState(true);
   const [now, setNow] = useState(Date.now());
   const active = jobs.filter((job) => job.update.status === 'queued' || job.update.status === 'running');
@@ -73,6 +74,14 @@ export function QueuePanel({ jobs, onCancel, onDismiss, onSelectPrompt }: QueueP
                   </button>
                 )}
                 {status === 'failed' && <div className="queue-error">{job.update.error}</div>}
+                {status === 'failed' && job.update.retryDownloadUntil && job.update.retryDownloadUntil > now && (
+                  <div className="queue-retry">
+                    <button className="primary small" onClick={() => onRetryDownload(job.update.jobId)}>
+                      重新下载
+                    </button>
+                    <span className="dim">还剩 {Math.ceil((job.update.retryDownloadUntil - now) / 60000)} 分钟，不会重复计费</span>
+                  </div>
+                )}
               </div>
             );
           })}

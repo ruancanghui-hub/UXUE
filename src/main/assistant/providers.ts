@@ -9,6 +9,7 @@ import {
   type ThemeDraft,
 } from '../../shared/assistant';
 import type { PreparedInput } from '../../shared/workerProtocol';
+import { httpFetch } from '../http';
 import type { ImageWorkerClient } from '../imageWorkerClient';
 
 const OPENAI_RESPONSES = 'https://api.openai.com/v1/responses';
@@ -64,7 +65,7 @@ export class OpenAIAssistant implements AssistantProvider {
     });
     content.push({ type: 'input_text', text: `用户这次的要求：${request.message}` });
 
-    const response = await fetch(OPENAI_RESPONSES, {
+    const response = await httpFetch('请求 OpenAI 助手', OPENAI_RESPONSES, {
       method: 'POST',
       headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
