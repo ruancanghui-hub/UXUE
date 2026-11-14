@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import type { PromptTemplate } from '../../../shared/api';
 import { ASSISTANT_MODELS } from '../../../shared/assistant';
 import {
   OPENAI_MODELS,
@@ -23,6 +24,13 @@ const cleanError = (error: unknown): string =>
 export function SettingsDialog({ config, onChange, onClose }: SettingsDialogProps) {
   const [message, setMessage] = useState<Message>(null);
   const [busy, setBusy] = useState(false);
+  const [templates, setTemplates] = useState<PromptTemplate[]>([]);
+  const [draftName, setDraftName] = useState('');
+  const [draftText, setDraftText] = useState('');
+
+  useEffect(() => {
+    void window.anye.listPromptTemplates().then(setTemplates).catch(() => setTemplates([]));
+  }, []);
 
   const run = async (task: () => Promise<GenerationConfig | string>): Promise<void> => {
     setBusy(true);
@@ -146,6 +154,61 @@ export function SettingsDialog({ config, onChange, onClose }: SettingsDialogProp
           run={run}
         />
         <p className="hint">Key 用系统钥匙串加密保存在本机，只在主进程里使用，不会出现在界面或项目文件里。</p>
+
+        <section className="dialog-section">
+          <div className="section-title">提示词模板</div>
+          <p className="hint">跨项目复用。也可以在提示词卡属性里「存为模板」。</p>
+          {templates.length === 0 && <p className="dim">还没有模板</p>}
+          <ul className="template-list">
+            {templates.map((template) => (
+              <li key={template.id} className="template-row">
+                <div className="template-meta">
+                  <div className="template-name">{template.name}</div>
+                  <div className="template-preview">{template.text.trim() || '（空提示词）'}</div>
+                </div>
+                <button
+                  className="danger small"
+                  disabled={busy}
+                  onClick={() =>
+                    void run(async () => {
+                      await window.anye.removePromptTemplate(template.id);
+                      setTemplates(await window.anye.listPromptTemplates());
+                      return '已删除模板';
+                    })
+                  }
+                >
+                  删除
+                </button>
+              </li>
+            ))}
+          </ul>
+          <div className="field">
+            <span className="field-label">名称</span>
+            <input className="name-input" value={draftName} onChange={(e) => setDraftName(e.target.value)} placeholder="例如：线稿转 3D" />
+          </div>
+          <textarea
+            className="prompt-input template-draft"
+            value={draftText}
+            onChange={(e) => setDraftText(e.target.value)}
+            placeholder="模板提示词正文，可用 {{Image 1}} 指代输入图"
+            aria-label="模板正文"
+          />
+          <button
+            className="primary"
+            disabled={busy || !draftName.trim() || !draftText.trim()}
+            onClick={() =>
+              void run(async () => {
+                await window.anye.createPromptTemplate(draftName.trim(), draftText);
+                setDraftName('');
+                setDraftText('');
+                setTemplates(await window.anye.listPromptTemplates());
+                return '已添加模板';
+              })
+            }
+          >
+            添加模板
+          </button>
+        </section>
 
         {message && <p className={message.tone === 'good' ? 'good-text' : 'warning'}>{message.text}</p>}
         <div className="button-row end">

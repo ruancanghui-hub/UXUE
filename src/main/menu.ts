@@ -59,8 +59,12 @@ export function buildMenu(recent: RecentProject[], send: (command: MenuCommand) 
         item('全选', 'selectAll', 'CmdOrCtrl+A'),
         { type: 'separator' },
         item('创建副本', 'duplicate', 'CmdOrCtrl+D'),
+        item('编组', 'groupSelection', 'CmdOrCtrl+G'),
+        item('解组', 'ungroupSelection', 'CmdOrCtrl+Shift+G'),
         item('移到最前', 'bringToFront', 'CmdOrCtrl+Shift+]'),
         item('移到最后', 'sendToBack', 'CmdOrCtrl+Shift+['),
+        { type: 'separator' },
+        item('命令面板…', 'commandPalette', 'CmdOrCtrl+K'),
       ],
     },
     {

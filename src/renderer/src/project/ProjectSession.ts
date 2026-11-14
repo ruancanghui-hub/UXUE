@@ -67,6 +67,10 @@ export class ProjectSession {
     if (this.dirty) await this.saveNow();
   }
 
+  isDirty(): boolean {
+    return this.dirty || this.saveState === 'pending' || this.saveState === 'saving' || this.saveState === 'error';
+  }
+
   toProjectFile(state: DocState = this.doc.get()): ProjectFile {
     return {
       schemaVersion: PROJECT_SCHEMA_VERSION,

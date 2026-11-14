@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { watch, type FSWatcher } from 'node:fs';
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
-import type { ImportResult, ImportSource, OpenedProject, RecentProject } from '../shared/api';
+import type { ImportResult, ImportSource, OpenedProject, ProjectFsChange, RecentProject } from '../shared/api';
 import { emptyProject, isImageCard, isPageCard, parseProject, PROJECT_FILE, type ProjectFile, type Version } from '../shared/project';
 import type { EnsureCacheResult, ImportedImage } from '../shared/workerProtocol';
 import type { ImageWorkerClient } from './imageWorkerClient';
@@ -10,10 +11,13 @@ const RECENT_LIMIT = 10;
 const IMPORT_CONCURRENCY = 3;
 const CACHE_CONCURRENCY = 2;
 const PROJECT_GITIGNORE = '.cache/\n';
+/** 自己写盘后忽略一段外部 watch 事件，避免把自己的保存当成外部改动 */
+const OWN_SAVE_IGNORE_MS = 800;
 
 export interface ProjectServiceEvents {
   onCacheReady(versionId: string): void;
   onRecentChanged(recent: RecentProject[]): void;
+  onFsChange(change: ProjectFsChange): void;
 }
 
 /** 一个窗口同一时刻只打开一个项目；所有读写都限制在当前项目目录内 */
@@ -21,6 +25,8 @@ export class ProjectService {
   private current: { dir: string } | null = null;
   private writeChain: Promise<void> = Promise.resolve();
   private cacheGeneration = 0;
+  private watcher: FSWatcher | null = null;
+  private ignoreUntil = 0;
 
   constructor(
     private readonly worker: ImageWorkerClient,
@@ -62,22 +68,18 @@ export class ProjectService {
 
     this.current = { dir };
     this.onRootChanged(dir);
+    this.startWatch(dir);
     if (this.trackRecent) await this.touchRecent(dir);
 
-    const versions = [
-      ...project.cards.filter(isImageCard).flatMap((card) => card.versions),
-      ...project.cards.filter(isPageCard).flatMap((card) => (card.base ? [card.base] : [])),
-    ];
-    const missing = await Promise.all(
-      versions.map(async (version) => ((await exists(join(dir, version.file))) ? null : version.id)),
-    );
+    const versions = collectVersions(project);
+    const missing = await this.missingIds(dir, versions);
     void this.ensureCaches(dir, versions);
 
     return {
       dir,
       name: basename(dir),
       file: project,
-      missingVersionIds: missing.filter((id): id is string => id !== null),
+      missingVersionIds: missing,
       warnings,
     };
   }
@@ -85,20 +87,35 @@ export class ProjectService {
   /** 写入串行化；先写临时文件再改名，写到一半断电也不会留下半个 project.json */
   save(dir: string, project: ProjectFile): Promise<void> {
     if (this.current?.dir !== dir) return Promise.reject(new Error('只能保存当前打开的项目'));
+    this.ignoreUntil = Date.now() + OWN_SAVE_IGNORE_MS;
     const run = async (): Promise<void> => {
       const target = join(dir, PROJECT_FILE);
       const temp = `${target}.tmp`;
       await writeFile(temp, JSON.stringify(project, null, 2));
       await rename(temp, target);
+      this.ignoreUntil = Date.now() + OWN_SAVE_IGNORE_MS;
     };
     const next = this.writeChain.then(run, run);
     this.writeChain = next.catch(() => {});
     return next;
   }
 
+  /** 按当前 project.json 里的版本重新检查原图是否还在，并补缓存 */
+  async refreshMissing(): Promise<string[]> {
+    const dir = this.current?.dir;
+    if (!dir) return [];
+    const text = await readFile(join(dir, PROJECT_FILE), 'utf8');
+    const { project } = parseProject(JSON.parse(text));
+    const versions = collectVersions(project);
+    const missing = await this.missingIds(dir, versions);
+    void this.ensureCaches(dir, versions);
+    return missing;
+  }
+
   async importImages(sources: ImportSource[]): Promise<ImportResult> {
     const dir = this.current?.dir;
     if (!dir) throw new Error('还没有打开项目');
+    this.ignoreUntil = Date.now() + OWN_SAVE_IGNORE_MS;
     const versions: (Version | null)[] = new Array(sources.length).fill(null);
     const errors: ImportResult['errors'] = [];
 
@@ -120,12 +137,14 @@ export class ProjectService {
             origin: 'import',
             sourceName: name,
           };
+          this.ignoreUntil = Date.now() + OWN_SAVE_IGNORE_MS;
         } catch (error) {
           errors.push({ name, message: error instanceof Error ? error.message : String(error) });
         }
       }
     };
     await Promise.all(Array.from({ length: IMPORT_CONCURRENCY }, lane));
+    this.ignoreUntil = Date.now() + OWN_SAVE_IGNORE_MS;
     return { versions: versions.filter((v): v is Version => v !== null), errors };
   }
 
@@ -147,7 +166,43 @@ export class ProjectService {
     return null;
   }
 
+  private startWatch(dir: string): void {
+    this.stopWatch();
+    try {
+      this.watcher = watch(dir, { recursive: true }, (_event, filename) => {
+        if (!filename || Date.now() < this.ignoreUntil) return;
+        const relative = filename.replace(/\\/g, '/');
+        if (relative.startsWith('.cache/') || relative === '.cache' || relative.endsWith('.tmp') || relative.endsWith('.DS_Store')) {
+          return;
+        }
+        if (relative === PROJECT_FILE || relative.endsWith(`/${PROJECT_FILE}`)) {
+          this.events.onFsChange({ kind: 'project', path: join(dir, PROJECT_FILE) });
+          return;
+        }
+        if (relative === 'assets' || relative.startsWith('assets/')) {
+          this.events.onFsChange({ kind: 'assets', path: join(dir, relative) });
+        }
+      });
+      this.watcher.on('error', (error) => console.warn('[watch]', error));
+    } catch (error) {
+      console.warn('[watch] 无法监听项目目录', error);
+    }
+  }
+
+  private stopWatch(): void {
+    this.watcher?.close();
+    this.watcher = null;
+  }
+
+  private async missingIds(dir: string, versions: Version[]): Promise<string[]> {
+    const missing = await Promise.all(
+      versions.map(async (version) => ((await exists(join(dir, version.file))) ? null : version.id)),
+    );
+    return missing.filter((id): id is string => id !== null);
+  }
+
   private async initializeDirectory(dir: string, project: ProjectFile): Promise<void> {
+    this.ignoreUntil = Date.now() + OWN_SAVE_IGNORE_MS;
     await mkdir(join(dir, 'assets'), { recursive: true });
     await writeFile(join(dir, PROJECT_FILE), JSON.stringify(project, null, 2));
     if (!(await exists(join(dir, '.gitignore')))) await writeFile(join(dir, '.gitignore'), PROJECT_GITIGNORE);
@@ -185,6 +240,13 @@ export class ProjectService {
     };
     await Promise.all(Array.from({ length: CACHE_CONCURRENCY }, lane));
   }
+}
+
+function collectVersions(project: ProjectFile): Version[] {
+  return [
+    ...project.cards.filter(isImageCard).flatMap((card) => card.versions),
+    ...project.cards.filter(isPageCard).flatMap((card) => (card.base ? [card.base] : [])),
+  ];
 }
 
 async function exists(path: string): Promise<boolean> {

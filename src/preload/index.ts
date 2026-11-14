@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'electron';
-import type { AnyeApi, LaunchFlags, MenuCommand } from '../shared/api';
+import type { AnyeApi, LaunchFlags, MenuCommand, ProjectFsChange } from '../shared/api';
 import type { BenchProgress } from '../shared/bench';
 import type { JobUpdate } from '../shared/generation';
 
@@ -28,6 +28,7 @@ const api: AnyeApi = {
   revealInFinder: (path) => ipcRenderer.send('shell:reveal', path),
   onCacheReady: (listener) => subscribe<string>('project:cache-ready', listener),
   onMenuCommand: (listener) => subscribe<MenuCommand>('menu:command', listener),
+  onProjectFsChange: (listener) => subscribe<ProjectFsChange>('project:fs-change', listener),
   onFlushRequest: (handler) =>
     subscribe<void>('app:flush', () => {
       void handler().finally(() => ipcRenderer.send('app:flushed'));
@@ -47,6 +48,12 @@ const api: AnyeApi = {
   askAssistant: (request) => ipcRenderer.invoke('assistant:ask', request),
   exportPage: (projectDir, plan) => ipcRenderer.invoke('export:page', projectDir, plan),
   sampleLowFi: () => ipcRenderer.invoke('dev:sample-lowfi'),
+
+  listPromptTemplates: () => ipcRenderer.invoke('templates:list'),
+  createPromptTemplate: (name, text, settings) => ipcRenderer.invoke('templates:create', name, text, settings),
+  updatePromptTemplate: (id, patch) => ipcRenderer.invoke('templates:update', id, patch),
+  removePromptTemplate: (id) => ipcRenderer.invoke('templates:remove', id),
+  refreshMissingVersions: () => ipcRenderer.invoke('project:refresh-missing'),
 
   prepareBench: (count) => ipcRenderer.invoke('bench:prepare', count),
   onBenchProgress: (listener) => subscribe<BenchProgress>('bench:progress', listener),

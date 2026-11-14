@@ -1,5 +1,5 @@
 import { forwardRef, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
-import type { ImportSource, MenuCommand, StartupInfo } from '../../shared/api';
+import type { ImportSource, MenuCommand, ProjectFsChange, StartupInfo } from '../../shared/api';
 import { PROJECT_HOST } from '../../shared/bench';
 import { planPageExport, type ExportResult } from '../../shared/export';
 import type { GenerationConfig, PromptSettings } from '../../shared/generation';
@@ -7,6 +7,7 @@ import { isPageCard, type PageCard, type RegionId } from '../../shared/project';
 import { isTyping, type CanvasEngine, type EngineStatus } from './canvas/CanvasEngine';
 import { AssistantPanel } from './components/AssistantPanel';
 import { CanvasView } from './components/CanvasView';
+import { CommandPalette, type PaletteCommand } from './components/CommandPalette';
 import { Inspector, type InspectorHandle } from './components/Inspector';
 import { LayersPanel } from './components/LayersPanel';
 import { PerfPanel } from './components/PerfPanel';
@@ -28,6 +29,7 @@ import {
   renameCard,
   setActiveTheme,
   setCurrentVersion,
+  setRefLockedVersion,
   updatePrompt,
   updateTheme,
 } from './document/operations';
@@ -50,6 +52,32 @@ interface Toast {
 
 const TOAST_MS = { info: 1600, error: 7000 };
 
+const PALETTE_COMMANDS: PaletteCommand[] = [
+  { id: 'newProject', label: '新建项目…', hint: '⌘N' },
+  { id: 'openProject', label: '打开项目…', hint: '⌘O' },
+  { id: 'importImages', label: '导入图片…', hint: '⌘⇧K' },
+  { id: 'undo', label: '撤销', hint: '⌘Z' },
+  { id: 'redo', label: '重做', hint: '⌘⇧Z' },
+  { id: 'generate', label: '生成', hint: '⌘↩' },
+  { id: 'toggleAssistant', label: '助手', hint: '⌘J' },
+  { id: 'openSettings', label: '设置…', hint: '⌘,' },
+  { id: 'region:theme', label: '跳到视觉主题区', hint: '⌘1' },
+  { id: 'region:assets', label: '跳到核心素材区', hint: '⌘2' },
+  { id: 'region:pages', label: '跳到高保真页面区', hint: '⌘3' },
+  { id: 'exportPage', label: '导出选中的页面', hint: '⌘⇧E' },
+  { id: 'groupSelection', label: '编组', hint: '⌘G' },
+  { id: 'ungroupSelection', label: '解组', hint: '⌘⇧G' },
+  { id: 'newPrompt', label: '新建提示词卡', hint: 'P' },
+  { id: 'selectAll', label: '全选', hint: '⌘A' },
+  { id: 'duplicate', label: '创建副本', hint: '⌘D' },
+  { id: 'fitAll', label: '缩放到全部', hint: '⇧1' },
+  { id: 'zoomToSelection', label: '缩放到选中', hint: '⇧2' },
+  { id: 'toggleFocus', label: '只看当前区域', hint: '⌘⇧F' },
+  { id: 'newBlankPage', label: '新建空白页面框', hint: 'F' },
+  { id: 'newPageFromLowFi', label: '从低保真原型新建页面框…', hint: '⌘⇧L' },
+  { id: 'togglePerf', label: '性能面板' },
+];
+
 export function ProjectApp() {
   const [engine, setEngine] = useState<CanvasEngine | null>(null);
   const [session, setSession] = useState<ProjectSession | null>(null);
@@ -59,6 +87,7 @@ export function ProjectApp() {
   const [status, setStatus] = useState<EngineStatus | null>(null);
   const [showPerf, setShowPerf] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showPalette, setShowPalette] = useState(false);
   const [config, setConfig] = useState<GenerationConfig | null>(null);
   const [jobs, setJobs] = useState<TrackedJob[]>([]);
   const [saveState, setSaveState] = useState<{ state: SaveState; error: string | null }>({ state: 'saved', error: null });
@@ -71,6 +100,8 @@ export function ProjectApp() {
   const engineRef = useRef<CanvasEngine | null>(null);
   const inspectorRef = useRef<InspectorHandle>(null);
   const checkStarted = useRef(false);
+  const fsPrompting = useRef(false);
+  const assetsRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [tracker] = useState(() => new GenerationTracker(() => sessionRef.current));
   sessionRef.current = session;
   engineRef.current = engine;
@@ -174,6 +205,55 @@ export function ProjectApp() {
     [],
   );
 
+  const reloadFromDisk = useCallback(async () => {
+    const current = sessionRef.current;
+    if (!current) return;
+    await openDir(current.dir);
+  }, [openDir]);
+
+  const refreshAssets = useCallback(async () => {
+    const current = sessionRef.current;
+    if (!current) return;
+    try {
+      const before = current.missingVersionIds.size;
+      const missing = await window.anye.refreshMissingVersions();
+      current.missingVersionIds = new Set(missing);
+      engineRef.current?.setMissingVersionIds(current.missingVersionIds);
+      setCacheBust(new Map());
+      if (missing.length !== before) {
+        if (missing.length > 0) toast(`${missing.length} 个版本的原图文件不见了`, 'error');
+        else toast('缺失的原图已恢复');
+      }
+    } catch (error) {
+      toast(`刷新素材失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+    }
+  }, [toast]);
+
+  useEffect(
+    () =>
+      window.anye.onProjectFsChange((change: ProjectFsChange) => {
+        const current = sessionRef.current;
+        if (!current) return;
+        if (change.kind === 'assets') {
+          if (assetsRefreshTimer.current) clearTimeout(assetsRefreshTimer.current);
+          assetsRefreshTimer.current = setTimeout(() => {
+            assetsRefreshTimer.current = null;
+            void refreshAssets();
+          }, 400);
+          return;
+        }
+        if (fsPrompting.current) return;
+        fsPrompting.current = true;
+        const dirty = current.isDirty();
+        const reload = dirty
+          ? window.confirm('项目文件已在外部被修改。\n\n确定 = 丢弃本地未保存改动并重新加载\n取消 = 保留本地修改')
+          : window.confirm('项目文件已在外部被修改，是否重新加载？');
+        fsPrompting.current = false;
+        if (reload) void reloadFromDisk();
+      }),
+    [refreshAssets, reloadFromDisk],
+  );
+
   // ───────────── 导入 ─────────────
 
   const importInto = useCallback(
@@ -253,6 +333,14 @@ export function ProjectApp() {
       }
     },
     [toast, tracker],
+  );
+
+  /** 按拓扑顺序依次提交；前一个完成后再发下一个，保证下游吃到新版本 */
+  const regenDownstream = useCallback(
+    async (promptIds: string[]) => {
+      for (const id of promptIds) await generate(id);
+    },
+    [generate],
   );
 
   // ───────────── 页面 ─────────────
@@ -370,6 +458,10 @@ export function ProjectApp() {
         setShowSettings(true);
         return;
       }
+      if (command === 'commandPalette') {
+        setShowPalette(true);
+        return;
+      }
       if (command === 'toggleAssistant') {
         setRightTab((tab) => (tab === 'assistant' ? 'inspector' : 'assistant'));
         return;
@@ -396,6 +488,12 @@ export function ProjectApp() {
           break;
         case 'duplicate':
           if (!typing) canvas.duplicateSelection();
+          break;
+        case 'groupSelection':
+          if (!typing) canvas.groupSelection();
+          break;
+        case 'ungroupSelection':
+          if (!typing) canvas.ungroupSelection();
           break;
         case 'bringToFront':
           canvas.reorderSelection('front');
@@ -565,6 +663,7 @@ export function ProjectApp() {
             jobs={jobs}
             onImportVersion={importAsVersion}
             onGenerate={generate}
+            onRegenDownstream={regenDownstream}
             exports={exports}
             onReplaceLowFi={replaceLowFi}
             onExportPage={exportPage}
@@ -583,6 +682,12 @@ export function ProjectApp() {
         />
       )}
       {showSettings && config && <SettingsDialog config={config} onChange={setConfig} onClose={() => setShowSettings(false)} />}
+      <CommandPalette
+        open={showPalette}
+        commands={PALETTE_COMMANDS}
+        onClose={() => setShowPalette(false)}
+        onRun={(command) => void handleCommand(command)}
+      />
     </div>
   );
 }
@@ -634,6 +739,7 @@ interface RightPanelProps extends PanelProps {
   jobs: TrackedJob[];
   onImportVersion(cardId: string): void;
   onGenerate(promptId: string): void;
+  onRegenDownstream(promptIds: string[]): void;
   exports: ReadonlyMap<string, ExportResult | 'running' | { error: string }>;
   onReplaceLowFi(pageId: string): void;
   onExportPage(pageId: string): void;
@@ -641,7 +747,7 @@ interface RightPanelProps extends PanelProps {
 }
 
 const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function RightPanel(
-  { tab, onTab, assistant, providerLabel, session, engine, cacheBust, config, jobs, onImportVersion, onGenerate, exports, onReplaceLowFi, onExportPage, onPlaceInPage },
+  { tab, onTab, assistant, providerLabel, session, engine, cacheBust, config, jobs, onImportVersion, onGenerate, onRegenDownstream, exports, onReplaceLowFi, onExportPage, onPlaceInPage },
   ref,
 ) {
   const state = useCommittedDoc(session.doc);
@@ -693,6 +799,10 @@ const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function Ri
       onBringToFront={() => engine.reorderSelection('front')}
       onReveal={(path) => window.anye.revealInFinder(path)}
       onGenerate={onGenerate}
+      onRegenDownstream={onRegenDownstream}
+      onLockRef={(refId, lockedVersionId) =>
+        doc.apply(lockedVersionId ? '锁定版本' : '解锁版本', setRefLockedVersion(doc.get(), refId, lockedVersionId))
+      }
       onRemoveInput={(id, index) => doc.apply('解除绑定', removePromptInput(doc.get(), id, index))}
       onMoveInput={(id, index, delta) => doc.apply('调整输入顺序', movePromptInput(doc.get(), id, index, delta))}
       onSettings={(id, settings: Partial<PromptSettings>) => doc.apply('修改生成参数', updatePrompt(doc.get(), id, { settings }))}
@@ -701,6 +811,7 @@ const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function Ri
         engine.zoomToCard(id);
       }}
       onNewPrompt={() => engine.createPromptFromSelection()}
+      onCreatePromptFromTemplate={(template) => engine.createPromptFromTemplate(template)}
       onUpdateTheme={(id, patch) => doc.apply('编辑主题卡', updateTheme(doc.get(), id, patch))}
       onSetActiveTheme={(id) => doc.apply(id ? '设为生效主题卡' : '取消生效主题卡', setActiveTheme(doc.get(), id))}
       onUpdatePage={(id, patch) => doc.apply('编辑页面框', updatePage(doc.get(), id, patch))}

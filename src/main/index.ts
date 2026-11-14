@@ -10,11 +10,13 @@ import { MockAssistant, OpenAIAssistant } from './assistant/providers';
 import { GenerationQueue } from './generation/GenerationQueue';
 import { MockProvider, OpenAIProvider, SiliconFlowProvider } from './generation/providers';
 import { GenerationSettingsStore, type KeyProvider, type SettingsPatch } from './generation/settingsStore';
+import type { PromptSettings } from '../shared/generation';
 import type { ProjectFile } from '../shared/project';
 import type { PrepareBenchResult, SelfTestResult } from '../shared/workerProtocol';
 import { handleAssetProtocol, registerAssetScheme } from './assetProtocol';
 import { ImageWorkerClient } from './imageWorkerClient';
 import { buildMenu } from './menu';
+import { PromptTemplatesStore } from './promptTemplatesStore';
 import { ProjectService } from './projectService';
 
 const hasFlag = (flag: string, env: string): boolean =>
@@ -65,6 +67,7 @@ const sendMenuCommand = (command: MenuCommand): void => {
 };
 
 const generationSettings = new GenerationSettingsStore(app.getPath('userData'));
+const promptTemplates = new PromptTemplatesStore(app.getPath('userData'));
 const openai = new OpenAIProvider(worker, () => generationSettings.getApiKey('openai'));
 const siliconflow = new SiliconFlowProvider(worker, () => generationSettings.getApiKey('siliconflow'));
 const generationQueue = new GenerationQueue(
@@ -82,6 +85,7 @@ const projects = new ProjectService(
   {
     onCacheReady: (versionId) => mainWindow?.webContents.send('project:cache-ready', versionId),
     onRecentChanged: (recent) => buildMenu(recent, sendMenuCommand),
+    onFsChange: (change) => mainWindow?.webContents.send('project:fs-change', change),
   },
   (dir) => assetRoots.set(PROJECT_HOST, dir),
   !automated,
@@ -95,6 +99,7 @@ app.whenReady().then(async () => {
 
   await mkdir(benchDir(), { recursive: true });
   await generationSettings.load();
+  await promptTemplates.load();
   assetRoots.set(BENCH_HOST, benchDir());
   if (checkPhaseValue === 'write') await rm(checkRoot(), { recursive: true, force: true });
   if (checkName) await mkdir(join(checkRoot(), '项目'), { recursive: true });
@@ -243,6 +248,18 @@ function registerIpc(): void {
 
   ipcMain.handle('project:open', (_event, dir: string) => projects.open(dir));
   ipcMain.handle('project:save', (_event, dir: string, file: ProjectFile) => projects.save(dir, file));
+  ipcMain.handle('project:refresh-missing', () => projects.refreshMissing());
+
+  ipcMain.handle('templates:list', () => promptTemplates.list());
+  ipcMain.handle('templates:create', (_event, name: string, text: string, settings?: PromptSettings) =>
+    promptTemplates.create(name, text, settings),
+  );
+  ipcMain.handle(
+    'templates:update',
+    (_event, id: string, patch: Partial<{ name: string; text: string; defaultSettings: PromptSettings }>) =>
+      promptTemplates.update(id, patch),
+  );
+  ipcMain.handle('templates:remove', (_event, id: string) => promptTemplates.remove(id));
 
   ipcMain.handle('images:pick', async () => {
     const result = await dialog.showOpenDialog({

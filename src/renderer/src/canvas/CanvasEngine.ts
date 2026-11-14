@@ -1,8 +1,11 @@
 import 'pixi.js/unsafe-eval';
 import { Application, Container, Graphics, Sprite, Text, Texture, TilingSprite } from 'pixi.js';
 import { BENCH_HOST, type BenchImage, type FrameSummary, type TextureLevel } from '../../../shared/bench';
+import type { PromptTemplate } from '../../../shared/api';
 import {
+  cardGroupId,
   defaultRegions,
+  isGroupCard,
   isImageCard,
   isPageCard,
   isPromptCard,
@@ -26,6 +29,7 @@ import {
   displayVersion,
   duplicateCards,
   fitIntoPage,
+  groupCards,
   moveCards,
   outputPlacement,
   placeIntoPage,
@@ -35,6 +39,8 @@ import {
   renderOrder,
   reorderCards,
   scaleCards,
+  ungroupCards,
+  updatePrompt,
   withPageChildren,
   type DocState,
 } from '../document/operations';
@@ -252,6 +258,11 @@ export class CanvasEngine {
   // ───────────────────────── 文档 ─────────────────────────
 
   /** 换一份文档来显示（打开项目、进入性能测试） */
+  setMissingVersionIds(ids: ReadonlySet<string>): void {
+    this.missingVersionIds = ids;
+    this.syncFromDoc(this.doc.get(), true);
+  }
+
   attach(doc: DocumentStore, selection: Selection, options: AttachOptions): void {
     this.detachDoc?.();
     for (const id of [...this.nodes.keys()]) this.removeNode(id);
@@ -343,6 +354,7 @@ export class CanvasEngine {
         y: row * BENCH_CELL + (BENCH_ITEM_MAX - height) / 2,
         versions: [{ id: image.key, file: '', width: image.width, height: image.height, createdAt: '', origin: 'import' }],
         currentVersionId: image.key,
+        groupId: null,
       };
     });
     const bounds = unionRects(cards) ?? { x: 0, y: 0, width: 1, height: 1 };
@@ -402,6 +414,45 @@ export class CanvasEngine {
     this.selection.set([card.id]);
     for (const listener of this.editListeners) listener(card.id);
     return card;
+  }
+
+  /** 从全局模板新建提示词卡；若当前选中了图像卡则自动绑定 */
+  createPromptFromTemplate(template: PromptTemplate): PromptCard {
+    const imageIds = this.selectedCards().filter(isImageCard).map((card) => card.id);
+    const { state: created, card } = createPromptCard(this.doc.get(), imageIds, this.viewCenterWorld(), () => crypto.randomUUID());
+    const state = updatePrompt(created, card.id, {
+      name: template.name,
+      text: template.text,
+      settings: template.defaultSettings,
+    });
+    this.doc.apply('从模板新建提示词卡', state);
+    this.selection.set([card.id]);
+    for (const listener of this.editListeners) listener(card.id);
+    return card;
+  }
+
+  groupSelection(): void {
+    const result = groupCards(this.doc.get(), new Set(this.selection.get()), () => crypto.randomUUID());
+    if (!result) return;
+    this.doc.apply('编组', result.state);
+    this.selection.set([result.groupId]);
+  }
+
+  ungroupSelection(): void {
+    const state = this.doc.get();
+    const groupIds = new Set<string>();
+    for (const id of this.selection.get()) {
+      const card = state.cards.find((item) => item.id === id);
+      if (!card) continue;
+      if (isGroupCard(card)) groupIds.add(card.id);
+      else {
+        const gid = cardGroupId(card);
+        if (gid) groupIds.add(gid);
+      }
+    }
+    const next = ungroupCards(state, groupIds);
+    if (next === state) return;
+    this.doc.apply('解组', next);
   }
 
   /** 双击提示词卡、或新建提示词卡后通知面板开始编辑 */
@@ -707,10 +758,12 @@ export class CanvasEngine {
 
       if (isPromptCard(card)) this.syncPromptCard(card);
       else if (isThemeCard(card)) this.syncThemeCard(card);
+      else if (isGroupCard(card)) this.ensureGroupNode(card);
       else this.ensureSpriteNode(card);
       if (keyChanged) this.rebindTexture(card.id, version);
       this.rendered.set(card.id, card);
       if (isPageCard(card)) this.drawPageBackground(card);
+      if (isGroupCard(card)) this.drawGroupFrame(card);
       if (this.spriteLayers.has(card.id)) this.refreshNodeTexture(card.id);
       this.nodes.get(card.id)!.position.set(card.x, card.y);
     }
@@ -749,6 +802,24 @@ export class CanvasEngine {
     const node = new Container();
     this.nodes.set(card.id, node);
     this.spriteLayers.set(card.id, node);
+  }
+
+  private ensureGroupNode(card: CanvasCard): void {
+    if (this.nodes.has(card.id)) return;
+    const node = new Container();
+    const frame = new Graphics();
+    node.addChild(frame);
+    this.nodes.set(card.id, node);
+    this.pageBackgrounds.set(card.id, frame);
+  }
+
+  private drawGroupFrame(card: CanvasCard): void {
+    if (!isGroupCard(card)) return;
+    const g = this.pageBackgrounds.get(card.id);
+    if (!g) return;
+    g.clear();
+    g.roundRect(0, 0, card.width, card.height, 8).stroke({ width: 2, color: 0x6b7cff, alpha: 0.85 });
+    g.roundRect(0, 0, card.width, card.height, 8).fill({ color: 0x6b7cff, alpha: 0.06 });
   }
 
   private drawPageBackground(page: PageCard): void {
@@ -1198,10 +1269,25 @@ export class CanvasEngine {
     return this.doc.get().cards.filter((card) => selection.has(card.id));
   }
 
-  /** withChildren：选中的页面框连同它里面的引用一起 */
-  private selectedOrigins(withChildren = false): Map<string, CanvasCard> {
+  /**
+   * withChildren：选中的页面框连同引用、分组框连同成员一起（用于移动）。
+   * forScale：缩放时排除分组成员，只改分组框本身。
+   */
+  private selectedOrigins(withChildren = false, forScale = false): Map<string, CanvasCard> {
     const state = this.doc.get();
-    const ids = withChildren ? withPageChildren(state, this.selection.get()) : this.selection.get();
+    let ids: ReadonlySet<string> = withChildren ? withPageChildren(state, this.selection.get()) : this.selection.get();
+    if (forScale) {
+      const groups = new Set(state.cards.filter((c) => ids.has(c.id) && isGroupCard(c)).map((c) => c.id));
+      if (groups.size > 0) {
+        ids = new Set(
+          [...ids].filter((id) => {
+            const card = state.cards.find((c) => c.id === id);
+            const gid = card ? cardGroupId(card) : null;
+            return !gid || !groups.has(gid);
+          }),
+        );
+      }
+    }
     return new Map(state.cards.filter((card) => ids.has(card.id)).map((card) => [card.id, card]));
   }
 
@@ -1345,7 +1431,7 @@ export class CanvasEngine {
         anchorY: anchor.y,
         cornerX: cornerPoint.x,
         cornerY: cornerPoint.y,
-        origins: this.selectedOrigins(true),
+        origins: this.selectedOrigins(true, true),
       };
       return;
     }

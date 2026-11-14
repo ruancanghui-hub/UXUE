@@ -1,5 +1,18 @@
 import { memo, useMemo } from 'react';
-import { currentVersion, isImageCard, isPageCard, isRefCard, type CanvasCard, type RefCard, type RegionId } from '../../../shared/project';
+import {
+  currentVersion,
+  isGroupCard,
+  isImageCard,
+  isPageCard,
+  isPromptCard,
+  isRefCard,
+  isThemeCard,
+  refDisplayVersion,
+  type CanvasCard,
+  type RefCard,
+  type RegionId,
+} from '../../../shared/project';
+import { isImageCardStale } from '../../../shared/stale';
 import { regionOf, type DocState } from '../document/operations';
 import { thumbnailUrl } from '../project/thumbnails';
 
@@ -12,7 +25,7 @@ interface LayersPanelProps {
   onFocusCard(id: string): void;
 }
 
-type RowKind = 'image' | 'missing' | 'prompt' | 'theme' | 'page';
+type RowKind = 'image' | 'missing' | 'prompt' | 'theme' | 'page' | 'group' | 'ref';
 
 interface Row {
   id: string;
@@ -23,16 +36,22 @@ interface Row {
   indent: boolean;
 }
 
-/** 按区域分组列出画布对象，最上层的排在最前面；页面框里的引用缩进列在页面下面 */
+/** 按区域分组列出画布对象，最上层的排在最前面；页面引用与分组成员缩进显示 */
 export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, onSelect, onFocusCard }: LayersPanelProps) {
   const groups = useMemo(() => {
     const byId = new Map(state.cards.map((card) => [card.id, card]));
-    const children = new Map<string, RefCard[]>();
+    const pageChildren = new Map<string, RefCard[]>();
+    const groupChildren = new Map<string, CanvasCard[]>();
     for (const card of state.cards) {
       if (isRefCard(card) && card.pageId && byId.has(card.pageId)) {
-        const list = children.get(card.pageId) ?? [];
+        const list = pageChildren.get(card.pageId) ?? [];
         list.unshift(card);
-        children.set(card.pageId, list);
+        pageChildren.set(card.pageId, list);
+      }
+      if ((isImageCard(card) || isPromptCard(card) || isThemeCard(card)) && card.groupId && byId.has(card.groupId)) {
+        const list = groupChildren.get(card.groupId) ?? [];
+        list.unshift(card);
+        groupChildren.set(card.groupId, list);
       }
     }
 
@@ -40,13 +59,25 @@ export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, 
       if (isImageCard(card) || isRefCard(card)) {
         const source = isRefCard(card) ? byId.get(card.imageCardId) : card;
         if (!source || !isImageCard(source)) return { id: card.id, label: '引用丢失', kind: 'missing', indent };
-        const version = currentVersion(source);
+        const version = isRefCard(card) ? refDisplayVersion(card, source) : currentVersion(source);
+        if (!version) return { id: card.id, label: '引用丢失', kind: 'missing', indent };
+        const stale = !isRefCard(card) && isImageCardStale(source, state);
+        const locked = isRefCard(card) && !!card.lockedVersionId;
         return {
           id: card.id,
           label: isRefCard(card) ? `↳ ${source.name}` : source.name,
           kind: missingVersionIds.has(version.id) ? 'missing' : 'image',
           thumbnail: thumbnailUrl(version, cacheBust.get(version.id)),
-          badge: !isRefCard(card) && source.versions.length > 1 ? source.versions.length : undefined,
+          badge: stale ? '过期' : locked ? '锁' : !isRefCard(card) && source.versions.length > 1 ? source.versions.length : undefined,
+          indent,
+        };
+      }
+      if (isGroupCard(card)) {
+        return {
+          id: card.id,
+          label: card.name,
+          kind: 'group',
+          badge: groupChildren.get(card.id)?.length || undefined,
           indent,
         };
       }
@@ -54,7 +85,7 @@ export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, 
         id: card.id,
         label: card.name,
         kind: card.kind,
-        badge: card.id === state.activeThemeCardId ? '生效' : isPageCard(card) ? (children.get(card.id)?.length ?? 0) || undefined : undefined,
+        badge: card.id === state.activeThemeCardId ? '生效' : isPageCard(card) ? (pageChildren.get(card.id)?.length ?? 0) || undefined : undefined,
         indent,
       };
     };
@@ -62,10 +93,12 @@ export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, 
     const byRegion = new Map<RegionId | null, Row[]>();
     for (const card of [...state.cards].reverse()) {
       if (isRefCard(card) && card.pageId && byId.has(card.pageId)) continue;
+      if ((isImageCard(card) || isPromptCard(card) || isThemeCard(card)) && card.groupId && byId.has(card.groupId)) continue;
       const region = regionOf(state, card);
       const rows = byRegion.get(region) ?? [];
       rows.push(rowFor(card, false));
-      if (isPageCard(card)) for (const child of children.get(card.id) ?? []) rows.push(rowFor(child, true));
+      if (isPageCard(card)) for (const child of pageChildren.get(card.id) ?? []) rows.push(rowFor(child, true));
+      if (isGroupCard(card)) for (const child of groupChildren.get(card.id) ?? []) rows.push(rowFor(child, true));
       byRegion.set(region, rows);
     }
     const ordered = state.regions.map((region) => ({ id: region.id as string, name: region.name, rows: byRegion.get(region.id) ?? [] }));
@@ -95,7 +128,7 @@ export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, 
   );
 }
 
-const ICONS: Partial<Record<RowKind, string>> = { prompt: '✎', theme: '◆', page: '▢' };
+const ICONS: Partial<Record<RowKind, string>> = { prompt: '✎', theme: '◆', page: '▢', group: '⬚' };
 
 const LayerRow = memo(function LayerRow({
   row,
@@ -119,7 +152,7 @@ const LayerRow = memo(function LayerRow({
       {row.kind === 'missing' && <span className="layer-thumb missing">缺失</span>}
       {ICONS[row.kind] && <span className={`layer-thumb ${row.kind}`}>{ICONS[row.kind]}</span>}
       <span className="layer-name">{row.label}</span>
-      {row.badge !== undefined && <span className="layer-badge">{row.badge}</span>}
+      {row.badge !== undefined && <span className={`layer-badge ${row.badge === '过期' ? 'stale' : ''}`}>{row.badge}</span>}
     </button>
   );
 });

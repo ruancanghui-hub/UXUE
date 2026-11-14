@@ -1,4 +1,4 @@
-import { currentVersion, isImageCard, isRefCard, pageLogicalSize, type CanvasCard, type PageCard } from './project';
+import { isImageCard, isRefCard, pageLogicalSize, refDisplayVersion, type CanvasCard, type PageCard } from './project';
 
 export interface ExportLayer {
   /** 图层名：引用的图像卡名字，重名时加序号 */
@@ -43,7 +43,8 @@ export function planPageExport(page: PageCard, cards: readonly CanvasCard[]): Pa
     if (!isRefCard(card) || card.pageId !== page.id) continue;
     const source = byId.get(card.imageCardId);
     if (!source || !isImageCard(source)) continue;
-    const version = currentVersion(source);
+    const version = refDisplayVersion(card, source);
+    if (!version) continue;
     const count = (used.get(source.name) ?? 0) + 1;
     used.set(source.name, count);
     layers.push({

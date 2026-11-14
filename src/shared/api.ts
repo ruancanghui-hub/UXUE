@@ -1,8 +1,20 @@
 import type { AssistantRequest, AssistantResponse } from './assistant';
 import type { BenchManifest, BenchProgress, BenchReport } from './bench';
 import type { ExportResult, PageExportPlan } from './export';
-import type { GenerationConfig, GenerationRequest, JobUpdate, ProviderId } from './generation';
+import type { GenerationConfig, GenerationRequest, JobUpdate, PromptSettings, ProviderId } from './generation';
 import type { ProjectFile, Version } from './project';
+
+export interface PromptTemplate {
+  id: string;
+  name: string;
+  text: string;
+  defaultSettings?: PromptSettings;
+}
+
+export interface ProjectFsChange {
+  kind: 'project' | 'assets';
+  path: string;
+}
 
 export type CheckPhase = 'write' | 'verify';
 
@@ -63,6 +75,8 @@ export type MenuCommand =
   | 'duplicate'
   | 'bringToFront'
   | 'sendToBack'
+  | 'groupSelection'
+  | 'ungroupSelection'
   | 'fitAll'
   | 'zoomToSelection'
   | 'zoomIn'
@@ -80,6 +94,7 @@ export type MenuCommand =
   | 'newPageFromLowFi'
   | 'newBlankPage'
   | 'exportPage'
+  | 'commandPalette'
   | `openRecent:${string}`;
 
 export interface AnyeApi {
@@ -96,6 +111,8 @@ export interface AnyeApi {
   revealInFinder(path: string): void;
   onCacheReady(listener: (versionId: string) => void): () => void;
   onMenuCommand(listener: (command: MenuCommand) => void): () => void;
+  /** 项目目录被外部改动时（忽略自己保存后的短窗口） */
+  onProjectFsChange(listener: (change: ProjectFsChange) => void): () => void;
   /** 窗口关闭前主进程会要求把未保存的改动写盘 */
   onFlushRequest(handler: () => Promise<void>): () => void;
   writeCheckFile(name: string, content: string): Promise<string>;
@@ -121,6 +138,16 @@ export interface AnyeApi {
   exportPage(projectDir: string, plan: PageExportPlan): Promise<ExportResult>;
   /** 开发和验收用：生成一张首页低保真线框图，返回它的路径 */
   sampleLowFi(): Promise<string>;
+
+  listPromptTemplates(): Promise<PromptTemplate[]>;
+  createPromptTemplate(name: string, text: string, settings?: PromptSettings): Promise<PromptTemplate>;
+  updatePromptTemplate(
+    id: string,
+    patch: Partial<Pick<PromptTemplate, 'name' | 'text' | 'defaultSettings'>>,
+  ): Promise<PromptTemplate | null>;
+  removePromptTemplate(id: string): Promise<boolean>;
+  /** 重新检查当前项目里原图是否还在，返回缺失的 version id */
+  refreshMissingVersions(): Promise<string[]>;
 
   prepareBench(count: number): Promise<BenchManifest>;
   onBenchProgress(listener: (progress: BenchProgress) => void): () => void;

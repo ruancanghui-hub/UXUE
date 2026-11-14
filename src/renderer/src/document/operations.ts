@@ -1,15 +1,20 @@
 import type { PromptDraft, ThemeDraft } from '../../../shared/assistant';
 import { DEFAULT_PROMPT_SETTINGS, type PromptSettings } from '../../../shared/generation';
 import {
+  canJoinGroup,
+  cardGroupId,
   currentVersion,
   detectPreset,
   DEVICE_PRESETS,
+  isGroupCard,
   isImageCard,
   isPageCard,
   isPromptCard,
   isRefCard,
   isThemeCard,
+  refDisplayVersion,
   type CanvasCard,
+  type GroupCard,
   type ImageCard,
   type PageCard,
   type PromptCard,
@@ -85,6 +90,7 @@ export function layoutNewCards(
         height: sizes[i].height,
         versions: [version],
         currentVersionId: version.id,
+        groupId: null,
       });
       x += sizes[i].width + NEW_CARD_GAP;
     }
@@ -104,7 +110,7 @@ export function addCards(state: DocState, cards: CanvasCard[]): DocState {
 
 /** 删除卡片时一并去掉提示词卡对它们的引用和生效主题卡，撤销时整体恢复 */
 export function removeCards(state: DocState, requested: ReadonlySet<string>): DocState {
-  // 页面框带走它里面的引用；图像卡带走指向它的引用
+  // 页面框带走它里面的引用；图像卡带走指向它的引用；分组框只删框，子卡脱离分组
   const ids = new Set(requested);
   for (const card of state.cards) {
     if (isRefCard(card) && ((card.pageId && requested.has(card.pageId)) || requested.has(card.imageCardId))) ids.add(card.id);
@@ -113,10 +119,12 @@ export function removeCards(state: DocState, requested: ReadonlySet<string>): Do
   const cards = state.cards
     .filter((card) => !ids.has(card.id))
     .map((card) => {
-      if (!isPromptCard(card)) return card;
-      const inputs = card.inputs.filter((id) => !ids.has(id));
-      const outputCardId = card.outputCardId && ids.has(card.outputCardId) ? null : card.outputCardId;
-      return inputs.length === card.inputs.length && outputCardId === card.outputCardId ? card : { ...card, inputs, outputCardId };
+      let next: CanvasCard = card;
+      if (canJoinGroup(card) && card.groupId && ids.has(card.groupId)) next = { ...card, groupId: null };
+      if (!isPromptCard(next)) return next;
+      const inputs = next.inputs.filter((id) => !ids.has(id));
+      const outputCardId = next.outputCardId && ids.has(next.outputCardId) ? null : next.outputCardId;
+      return inputs.length === next.inputs.length && outputCardId === next.outputCardId ? next : { ...next, inputs, outputCardId };
     });
   return { ...state, cards, activeThemeCardId };
 }
@@ -160,15 +168,24 @@ export function duplicateCards(state: DocState, ids: ReadonlySet<string>, makeId
   const copies = state.cards
     .filter((card) => ids.has(card.id))
     .map((card): CanvasCard => {
-      const moved = { ...card, id: makeId(), x: card.x + DUPLICATE_OFFSET, y: card.y + DUPLICATE_OFFSET };
+      let moved: CanvasCard = { ...card, id: makeId(), x: card.x + DUPLICATE_OFFSET, y: card.y + DUPLICATE_OFFSET };
       newIds.push(moved.id);
       if (isPageCard(card)) pageCopies.set(card.id, moved.id);
-      return isPromptCard(moved) ? { ...moved, outputCardId: null } : moved;
+      if (isPromptCard(moved)) moved = { ...moved, outputCardId: null };
+      if (canJoinGroup(moved)) moved = { ...moved, groupId: null };
+      if (isRefCard(moved)) moved = { ...moved, lockedVersionId: moved.lockedVersionId };
+      return moved;
     });
   // 复制页面框时一起复制里面的引用（单独选中的引用已经在上面复制过）
   const childCopies = state.cards
     .filter((card): card is RefCard => isRefCard(card) && !!card.pageId && pageCopies.has(card.pageId) && !ids.has(card.id))
-    .map((card) => ({ ...card, id: makeId(), x: card.x + DUPLICATE_OFFSET, y: card.y + DUPLICATE_OFFSET, pageId: pageCopies.get(card.pageId!)! }));
+    .map((card) => ({
+      ...card,
+      id: makeId(),
+      x: card.x + DUPLICATE_OFFSET,
+      y: card.y + DUPLICATE_OFFSET,
+      pageId: pageCopies.get(card.pageId!)!,
+    }));
   return { state: { ...state, cards: [...state.cards, ...copies, ...childCopies] }, newIds };
 }
 
@@ -188,11 +205,25 @@ export function setCurrentVersion(state: DocState, id: string, versionId: string
   const version = target && isImageCard(target) ? target.versions.find((v) => v.id === versionId) : undefined;
   if (!version || !target || !isImageCard(target) || target.currentVersionId === versionId) return state;
   const aspect = version.height / version.width;
-  // 页面里的引用跟着当前版本走：宽度不变，高度按新比例
+  // 未锁定的页面引用跟着当前版本走：宽度不变，高度按新比例
   return mapCards(state, (card) => {
     if (card.id === id && isImageCard(card)) return { ...card, currentVersionId: versionId, height: card.width * aspect };
-    if (isRefCard(card) && card.imageCardId === id) return { ...card, height: card.width * aspect };
+    if (isRefCard(card) && card.imageCardId === id && !card.lockedVersionId) return { ...card, height: card.width * aspect };
     return card;
+  });
+}
+
+/** 锁定 / 解锁页面引用的显示版本 */
+export function setRefLockedVersion(state: DocState, refId: string, lockedVersionId: string | null): DocState {
+  return mapCards(state, (card) => {
+    if (!isRefCard(card) || card.id !== refId) return card;
+    if (card.lockedVersionId === lockedVersionId) return card;
+    const source = state.cards.find((c) => c.id === card.imageCardId);
+    if (lockedVersionId && (!source || !isImageCard(source) || !source.versions.some((v) => v.id === lockedVersionId))) return card;
+    const version = source && isImageCard(source) ? (lockedVersionId ? source.versions.find((v) => v.id === lockedVersionId) : currentVersion(source)) : null;
+    if (!version) return { ...card, lockedVersionId };
+    const aspect = version.height / version.width;
+    return { ...card, lockedVersionId, height: card.width * aspect };
   });
 }
 
@@ -232,6 +263,7 @@ export function createPromptCard(
     inputs: inputs.map((input) => input.id),
     outputCardId: null,
     settings: { ...DEFAULT_PROMPT_SETTINGS },
+    groupId: null,
   };
   return { state: addCards(state, [card]), card };
 }
@@ -314,6 +346,7 @@ export function applyGenerationResult(state: DocState, result: GenerationResult)
       height: result.placement.width * (first.height / first.width),
       versions: result.versions,
       currentVersionId: first.id,
+      groupId: null,
     };
     cards = [...state.cards, output];
   }
@@ -355,7 +388,7 @@ function themePlacement(state: DocState): Rect {
 }
 
 export function themeFromDraft(state: DocState, draft: ThemeDraft, id: string): ThemeCard {
-  return { kind: 'theme', id, ...themePlacement(state), ...draft };
+  return { kind: 'theme', id, ...themePlacement(state), ...draft, groupId: null };
 }
 
 export function setActiveTheme(state: DocState, id: string | null): DocState {
@@ -421,6 +454,7 @@ export function applyAssistantDrafts(
       inputs: image ? [image.id] : [],
       outputCardId: null,
       settings: { ...DEFAULT_PROMPT_SETTINGS },
+      groupId: null,
     };
     y += PROMPT_CARD_HEIGHT + DRAFT_COLUMN_GAP;
     promptIds.push(card.id);
@@ -488,7 +522,14 @@ export function placeIntoPage(
   items: { imageCardId: string; rect: Rect }[],
   makeId: () => string,
 ): { state: DocState; refIds: string[] } {
-  const refs: RefCard[] = items.map(({ imageCardId, rect }) => ({ kind: 'ref', id: makeId(), ...rect, imageCardId, pageId }));
+  const refs: RefCard[] = items.map(({ imageCardId, rect }) => ({
+    kind: 'ref',
+    id: makeId(),
+    ...rect,
+    imageCardId,
+    pageId,
+    lockedVersionId: null,
+  }));
   return { state: addCards(state, refs), refIds: refs.map((ref) => ref.id) };
 }
 
@@ -500,13 +541,53 @@ export function fitIntoPage(page: Rect, card: Rect, centerX: number, centerY: nu
   return { x: centerX - width / 2, y: centerY - height / 2, width, height };
 }
 
-/** 页面框连同它里面的引用：拖动、缩放、微调页面时一起动 */
+/** 页面框连同它里面的引用；分组框连同组成员：拖动、微调时一起动 */
 export function withPageChildren(state: DocState, ids: Iterable<string>): Set<string> {
   const result = new Set(ids);
   const pages = new Set(state.cards.filter((card) => result.has(card.id) && isPageCard(card)).map((card) => card.id));
-  if (pages.size === 0) return result;
-  for (const card of state.cards) if (isRefCard(card) && card.pageId && pages.has(card.pageId)) result.add(card.id);
+  const groups = new Set(state.cards.filter((card) => result.has(card.id) && isGroupCard(card)).map((card) => card.id));
+  if (pages.size === 0 && groups.size === 0) return result;
+  for (const card of state.cards) {
+    if (isRefCard(card) && card.pageId && pages.has(card.pageId)) result.add(card.id);
+    const gid = cardGroupId(card);
+    if (gid && groups.has(gid)) result.add(card.id);
+  }
   return result;
+}
+
+const GROUP_PAD = 24;
+
+/** 把可进组的选中卡编成一组；至少 2 张 */
+export function groupCards(state: DocState, ids: ReadonlySet<string>, makeId: () => string): { state: DocState; groupId: string } | null {
+  const members = state.cards.filter((card) => ids.has(card.id) && canJoinGroup(card));
+  if (members.length < 2) return null;
+  const bounds = unionRects(members);
+  if (!bounds) return null;
+  const groupId = makeId();
+  const group: GroupCard = {
+    kind: 'group',
+    id: groupId,
+    name: '分组',
+    x: bounds.x - GROUP_PAD,
+    y: bounds.y - GROUP_PAD,
+    width: bounds.width + GROUP_PAD * 2,
+    height: bounds.height + GROUP_PAD * 2,
+  };
+  const memberIds = new Set(members.map((m) => m.id));
+  const cards = state.cards.map((card) =>
+    memberIds.has(card.id) && canJoinGroup(card) ? { ...card, groupId } : card,
+  );
+  return { state: { ...state, cards: [...cards, group] }, groupId };
+}
+
+/** 解组：去掉分组框，子卡脱离 */
+export function ungroupCards(state: DocState, groupIds: ReadonlySet<string>): DocState {
+  const ids = new Set([...groupIds].filter((id) => state.cards.some((c) => c.id === id && isGroupCard(c))));
+  if (ids.size === 0) return state;
+  const cards = state.cards
+    .filter((card) => !(isGroupCard(card) && ids.has(card.id)))
+    .map((card) => (canJoinGroup(card) && card.groupId && ids.has(card.groupId) ? { ...card, groupId: null } : card));
+  return { ...state, cards };
 }
 
 /** 引用按中心点重新认页面：落在哪个页面框里就属于哪个，都不在就脱离页面 */
@@ -522,34 +603,44 @@ export function reassignRefPages(state: DocState, refIds: ReadonlySet<string>): 
   });
 }
 
-/** 绘制和命中顺序：引用总是紧跟在它所在的页面框后面，页面挪到最前或最后时引用一起走 */
+/** 绘制和命中顺序：页面引用紧跟页面；组成员紧跟分组框 */
 export function renderOrder(cards: readonly CanvasCard[]): CanvasCard[] {
   const pageIds = new Set(cards.filter(isPageCard).map((card) => card.id));
-  const children = new Map<string, RefCard[]>();
+  const groupIds = new Set(cards.filter(isGroupCard).map((card) => card.id));
+  const pageChildren = new Map<string, RefCard[]>();
+  const groupChildren = new Map<string, CanvasCard[]>();
   for (const card of cards) {
     if (isRefCard(card) && card.pageId && pageIds.has(card.pageId)) {
-      const list = children.get(card.pageId) ?? [];
+      const list = pageChildren.get(card.pageId) ?? [];
       list.push(card);
-      children.set(card.pageId, list);
+      pageChildren.set(card.pageId, list);
+    }
+    const gid = cardGroupId(card);
+    if (gid && groupIds.has(gid)) {
+      const list = groupChildren.get(gid) ?? [];
+      list.push(card);
+      groupChildren.set(gid, list);
     }
   }
-  if (children.size === 0) return [...cards];
+  if (pageChildren.size === 0 && groupChildren.size === 0) return [...cards];
   const ordered: CanvasCard[] = [];
   for (const card of cards) {
     if (isRefCard(card) && card.pageId && pageIds.has(card.pageId)) continue;
+    if (cardGroupId(card) && groupIds.has(cardGroupId(card)!)) continue;
     ordered.push(card);
-    if (isPageCard(card)) ordered.push(...(children.get(card.id) ?? []));
+    if (isPageCard(card)) ordered.push(...(pageChildren.get(card.id) ?? []));
+    if (isGroupCard(card)) ordered.push(...(groupChildren.get(card.id) ?? []));
   }
   return ordered;
 }
 
-/** 画布上显示这张卡片需要的版本：图像卡是当前版本，引用是被引用图像卡的当前版本，页面框是低保真原型 */
+/** 画布上显示这张卡片需要的版本：图像卡当前版；引用跟锁定或当前版；页面框是低保真原型 */
 export function displayVersion(card: CanvasCard, byId: ReadonlyMap<string, CanvasCard>): Version | null {
   if (isImageCard(card)) return currentVersion(card);
   if (isPageCard(card)) return card.base;
   if (isRefCard(card)) {
     const source = byId.get(card.imageCardId);
-    return source && isImageCard(source) ? currentVersion(source) : null;
+    return source && isImageCard(source) ? refDisplayVersion(card, source) : null;
   }
   return null;
 }

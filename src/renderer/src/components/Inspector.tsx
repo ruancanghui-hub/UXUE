@@ -1,4 +1,5 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import type { PromptTemplate } from '../../../shared/api';
 import {
   formatCost,
   formatUsd,
@@ -15,6 +16,7 @@ import type { ExportResult } from '../../../shared/export';
 import {
   currentVersion,
   DEVICE_PRESETS,
+  isGroupCard,
   isImageCard,
   isPageCard,
   isPromptCard,
@@ -22,8 +24,10 @@ import {
   isThemeCard,
   pageLogicalSize,
   normalizeHex,
+  refDisplayVersion,
   RULE_LABELS,
   themeSuffix,
+  type GroupCard,
   type ImageCard,
   type PageCard,
   type PromptCard,
@@ -32,6 +36,7 @@ import {
   type ThemeColor,
   type ThemeRules,
 } from '../../../shared/project';
+import { isImageCardStale, regenPromptIdsForSelection } from '../../../shared/stale';
 import type { DocumentStore } from '../document/DocumentStore';
 import { updatePrompt, type DocState } from '../document/operations';
 import { activeTheme, effectiveConfig } from '../project/GenerationTracker';
@@ -67,6 +72,7 @@ interface InspectorProps {
   onSettings(promptId: string, settings: Partial<PromptSettings>): void;
   onSelectCard(id: string): void;
   onNewPrompt(): void;
+  onCreatePromptFromTemplate(template: PromptTemplate): void;
   onUpdateTheme(id: string, patch: Partial<Omit<ThemeCard, 'kind' | 'id'>>): void;
   onSetActiveTheme(id: string | null): void;
   onUpdatePage(id: string, patch: Partial<Omit<PageCard, 'kind' | 'id'>>): void;
@@ -74,6 +80,8 @@ interface InspectorProps {
   onReplaceLowFi(pageId: string): void;
   onExportPage(pageId: string): void;
   onPlaceInPage(imageCardId: string, pageId: string): void;
+  onLockRef(refId: string, lockedVersionId: string | null): void;
+  onRegenDownstream(promptIds: string[]): void;
   exports: ReadonlyMap<string, ExportResult | 'running' | { error: string }>;
 }
 
@@ -99,10 +107,16 @@ export const Inspector = forwardRef<InspectorHandle, InspectorProps>(function In
       {only && isThemeCard(only) && <ThemeInfo card={only} {...props} />}
       {only && isPageCard(only) && <PageInfo card={only} {...props} />}
       {only && isRefCard(only) && <RefInfo card={only} {...props} />}
+      {only && isGroupCard(only) && <GroupInfo card={only} {...props} />}
       {selected.length > 1 && (
         <section className="inspector-section">
           <div className="panel-title">已选 {selected.length} 个对象</div>
           {selected.every(isImageCard) && <button onClick={props.onNewPrompt}>用这些图新建提示词卡（P）</button>}
+          {regenPromptIdsForSelection(props.state, props.selectedIds).length > 0 && (
+            <button onClick={() => props.onRegenDownstream(regenPromptIdsForSelection(props.state, props.selectedIds))}>
+              重新生成全部下游
+            </button>
+          )}
           <CardActions {...props} />
         </section>
       )}
@@ -122,7 +136,7 @@ function CardActions({ onDuplicate, onBringToFront, onDelete }: InspectorProps) 
   );
 }
 
-function ProjectInfo({ state, projectName, projectDir, onReveal }: InspectorProps) {
+function ProjectInfo({ state, projectName, projectDir, onReveal, onCreatePromptFromTemplate }: InspectorProps) {
   const images = state.cards.filter(isImageCard);
   const versionCount = images.reduce((sum, card) => sum + card.versions.length, 0);
   const versions = images.flatMap((card) => card.versions);
@@ -137,11 +151,12 @@ function ProjectInfo({ state, projectName, projectDir, onReveal }: InspectorProp
       <Field label="提示词卡" value={`${state.cards.length - images.length} 张`} />
       <Field label="版本" value={`${versionCount} 个`} />
       <Field label="生成花费" value={spent} />
+      <TemplateCreateSelect onPick={onCreatePromptFromTemplate} />
       <button className="link" onClick={() => onReveal(projectDir)} title={projectDir}>
         在 Finder 中显示项目目录
       </button>
       <p className="hint">
-        把图片拖进画布、粘贴或按 ⌘⇧K 导入。选中图片按 P 新建提示词卡，写好后按 ⌘↩ 生成。
+        把图片拖进画布、粘贴或按 ⌘⇧K 导入。选中图片按 P 新建提示词卡，写好后按 ⌘↩ 生成。⌘K 打开命令面板。
       </p>
     </section>
   );
@@ -151,13 +166,21 @@ function ImageInfo(props: InspectorProps & { card: ImageCard }) {
   const { card, missingVersionIds, cacheBust } = props;
   const version = currentVersion(card);
   const record = version.generation;
+  const stale = isImageCardStale(card, props.state);
   return (
     <>
       <section className="inspector-section">
-        <div className="panel-title">图像卡</div>
+        <div className="panel-title">
+          图像卡 {stale && <span className="stale-badge">已过期</span>}
+        </div>
         <NameInput id={card.id} name={card.name} onRename={props.onRename} label="图像卡名称" />
         <Field label="画布尺寸" value={`${Math.round(card.width)} × ${Math.round(card.height)}`} />
         <Field label="原图" value={`${version.width} × ${version.height} px`} />
+        {stale && (
+          <p className="warning">
+            上游（输入图、提示词或生效主题）在生成之后变了。不会自动重跑；可点下面重新生成。
+          </p>
+        )}
         {missingVersionIds.has(version.id) && <p className="warning">原图文件不见了：{version.file}</p>}
         {record && (
           <div className="generation-record">
@@ -169,6 +192,16 @@ function ImageInfo(props: InspectorProps & { card: ImageCard }) {
             {props.state.cards.some((c) => c.id === record.promptCardId) && (
               <button className="link" onClick={() => props.onSelectCard(record.promptCardId)}>
                 选中来源提示词卡
+              </button>
+            )}
+            {stale && (
+              <button className="primary" onClick={() => props.onRegenDownstream([record.promptCardId])}>
+                重新生成
+              </button>
+            )}
+            {stale && (
+              <button onClick={() => props.onRegenDownstream(regenPromptIdsForSelection(props.state, new Set([card.id])))}>
+                重新生成全部下游
               </button>
             )}
           </div>
@@ -271,6 +304,7 @@ function PromptInfo(props: InspectorProps & { card: PromptCard; textareaRef: Rea
           aria-label="提示词"
         />
         {problem && text.trim() && <p className="warning">{problem}</p>}
+        <TemplateActions card={card} onCreateFromTemplate={props.onCreatePromptFromTemplate} />
       </section>
 
       <section className="inspector-section">
@@ -346,10 +380,16 @@ function PromptInfo(props: InspectorProps & { card: PromptCard; textareaRef: Rea
         <button className="primary" disabled={!!problem || busy} onClick={() => props.onGenerate(card.id)}>
           {busy ? '生成中…' : `生成 ×${card.settings.count}  ⌘↩`}
         </button>
+        {output && isImageCard(output) && isImageCardStale(output, state) && (
+          <button disabled={busy} onClick={() => props.onRegenDownstream(regenPromptIdsForSelection(state, new Set([card.id])))}>
+            重新生成全部下游
+          </button>
+        )}
         {latest?.update.status === 'failed' && <p className="warning">上次失败：{latest.update.error}</p>}
         {output && isImageCard(output) && (
           <button className="link" onClick={() => props.onSelectCard(output.id)}>
             结果：{output.name}（{output.versions.length} 个版本）
+            {isImageCardStale(output, state) ? ' · 已过期' : ''}
           </button>
         )}
       </section>
@@ -486,27 +526,59 @@ function RefInfo(props: InspectorProps & { card: RefCard }) {
   const { card, state, cacheBust } = props;
   const source = state.cards.find((c) => c.id === card.imageCardId);
   const page = card.pageId ? state.cards.find((c) => c.id === card.pageId) : undefined;
+  const shown = source && isImageCard(source) ? refDisplayVersion(card, source) : null;
+  const locked = !!card.lockedVersionId;
   return (
     <>
       <section className="inspector-section">
-        <div className="panel-title">素材引用</div>
-        {source && isImageCard(source) ? (
+        <div className="panel-title">素材引用 {locked && <span className="lock-badge">已锁定</span>}</div>
+        {source && isImageCard(source) && shown ? (
           <>
             <div className="ref-source">
-              <img className="lowfi-thumb" src={thumbnailUrl(currentVersion(source), cacheBust.get(source.currentVersionId))} alt="" />
+              <img className="lowfi-thumb" src={thumbnailUrl(shown, cacheBust.get(shown.id))} alt="" />
               <div>
                 <div className="field-value">{source.name}</div>
-                <div className="hint">版本 {source.versions.indexOf(currentVersion(source)) + 1} / {source.versions.length}</div>
+                <div className="hint">
+                  版本 {source.versions.indexOf(shown) + 1} / {source.versions.length}
+                  {locked ? ' · 锁定' : ' · 跟随当前'}
+                </div>
               </div>
             </div>
-            <p className="hint">显示的是原图像卡的当前版本；在原图像卡的版本栈里换版本，这里会跟着变。</p>
+            <p className="hint">
+              {locked
+                ? '已锁定到指定版本，原图像卡换当前版本时这里不会跟着变。'
+                : '显示的是原图像卡的当前版本；在原图像卡的版本栈里换版本，这里会跟着变。'}
+            </p>
+            {locked ? (
+              <button onClick={() => props.onLockRef(card.id, null)}>解锁，跟随当前版本</button>
+            ) : (
+              <button onClick={() => props.onLockRef(card.id, source.currentVersionId)}>锁定为当前显示版本</button>
+            )}
             <button onClick={() => props.onSelectCard(source.id)}>选中原图像卡</button>
           </>
         ) : (
-          <p className="warning">引用的图像卡已经不在了</p>
+          <p className="warning">引用的图像卡已经不在了{card.lockedVersionId ? '，或锁定的版本已丢失' : ''}</p>
         )}
         <Field label="所在页面" value={page && isPageCard(page) ? page.name : '不在任何页面里'} />
         <Field label="画布尺寸" value={`${Math.round(card.width)} × ${Math.round(card.height)}`} />
+      </section>
+      <section className="inspector-section">
+        <CardActions {...props} />
+      </section>
+    </>
+  );
+}
+
+function GroupInfo(props: InspectorProps & { card: GroupCard }) {
+  const members = props.state.cards.filter((c) => isImageCard(c) || isPromptCard(c) || isThemeCard(c)).filter((c) => c.groupId === props.card.id);
+  return (
+    <>
+      <section className="inspector-section">
+        <div className="panel-title">分组框</div>
+        <NameInput id={props.card.id} name={props.card.name} onRename={props.onRename} label="分组名称" />
+        <Field label="成员" value={`${members.length} 个`} />
+        <Field label="画布尺寸" value={`${Math.round(props.card.width)} × ${Math.round(props.card.height)}`} />
+        <p className="hint">拖动分组框会带着成员一起走；缩放只改框的大小。⌘⇧G 解组。</p>
       </section>
       <section className="inspector-section">
         <CardActions {...props} />
@@ -530,6 +602,98 @@ function ThemeToggle({ card, state, onSettings }: { card: PromptCard; state: Doc
           <pre>{themeSuffix(theme)}</pre>
         </details>
       )}
+    </div>
+  );
+}
+
+function TemplateActions({
+  card,
+  onCreateFromTemplate,
+}: {
+  card: PromptCard;
+  onCreateFromTemplate(template: PromptTemplate): void;
+}) {
+  const [templates, setTemplates] = useState<PromptTemplate[]>([]);
+  const [picking, setPicking] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!picking) return;
+    void window.anye.listPromptTemplates().then(setTemplates).catch(() => setTemplates([]));
+  }, [picking]);
+
+  return (
+    <div className="template-actions">
+      <div className="button-row tight">
+        <button
+          className="small"
+          onClick={() =>
+            void window.anye
+              .createPromptTemplate(card.name, card.text, card.settings)
+              .then(() => setMessage('已存为模板'))
+              .catch((error: unknown) => setMessage(error instanceof Error ? error.message : String(error)))
+          }
+        >
+          存为模板
+        </button>
+        <button className="small" onClick={() => setPicking((value) => !value)}>
+          从模板新建
+        </button>
+      </div>
+      {picking && (
+        <select
+          defaultValue=""
+          onChange={(event) => {
+            const id = event.target.value;
+            const template = templates.find((item) => item.id === id);
+            if (template) {
+              onCreateFromTemplate(template);
+              setPicking(false);
+            }
+            event.target.value = '';
+          }}
+        >
+          <option value="" disabled>
+            {templates.length === 0 ? '还没有模板' : '选择模板…'}
+          </option>
+          {templates.map((template) => (
+            <option key={template.id} value={template.id}>
+              {template.name}
+            </option>
+          ))}
+        </select>
+      )}
+      {message && <p className="hint">{message}</p>}
+    </div>
+  );
+}
+
+function TemplateCreateSelect({ onPick }: { onPick(template: PromptTemplate): void }) {
+  const [templates, setTemplates] = useState<PromptTemplate[]>([]);
+  useEffect(() => {
+    void window.anye.listPromptTemplates().then(setTemplates).catch(() => setTemplates([]));
+  }, []);
+  if (templates.length === 0) return null;
+  return (
+    <div className="field">
+      <span className="field-label">从模板新建提示词卡</span>
+      <select
+        defaultValue=""
+        onChange={(event) => {
+          const template = templates.find((item) => item.id === event.target.value);
+          if (template) onPick(template);
+          event.target.value = '';
+        }}
+      >
+        <option value="" disabled>
+          选择模板…
+        </option>
+        {templates.map((template) => (
+          <option key={template.id} value={template.id}>
+            {template.name}
+          </option>
+        ))}
+      </select>
     </div>
   );
 }

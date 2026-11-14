@@ -3,7 +3,7 @@ import { emptyProject, parseProject, PROJECT_SCHEMA_VERSION } from './project';
 import { computeTiles, l2Size, L2_TILE_GUTTER, L2_TILE_SIZE, tileExtent } from './textures';
 
 const validCard = {
-  kind: 'image',
+  kind: 'image' as const,
   id: 'c1',
   name: '热门寿司',
   x: 10,
@@ -11,9 +11,10 @@ const validCard = {
   width: 400,
   height: 200,
   currentVersionId: 'v2',
+  groupId: null as string | null,
   versions: [
-    { id: 'v1', file: 'assets/v1.png', width: 2000, height: 1000, createdAt: '2026-01-01T00:00:00.000Z', origin: 'import' },
-    { id: 'v2', file: 'assets/v2.png', width: 2000, height: 1000, createdAt: '2026-01-02T00:00:00.000Z', origin: 'import' },
+    { id: 'v1', file: 'assets/v1.png', width: 2000, height: 1000, createdAt: '2026-01-01T00:00:00.000Z', origin: 'import' as const },
+    { id: 'v2', file: 'assets/v2.png', width: 2000, height: 1000, createdAt: '2026-01-02T00:00:00.000Z', origin: 'import' as const },
   ],
 };
 
@@ -53,9 +54,16 @@ describe('parseProject', () => {
       inputs: ['c1', 'gone'],
       outputCardId: 'gone-too',
       settings: { count: 9, size: 'match', quality: 'high' },
+      groupId: null,
     };
     const { project } = parseProject({ ...emptyProject(), cards: [validCard, prompt] });
-    expect(project.cards[1]).toEqual({ ...prompt, inputs: ['c1'], outputCardId: null, settings: { count: 4, size: 'match', quality: 'high', useTheme: true } });
+    expect(project.cards[1]).toEqual({
+      ...prompt,
+      inputs: ['c1'],
+      outputCardId: null,
+      settings: { count: 4, size: 'match', quality: 'high', useTheme: true },
+      groupId: null,
+    });
   });
 
   it('生成得到的版本保留来源记录', () => {
@@ -102,11 +110,18 @@ describe('parseProject', () => {
         { role: '坏的', name: '', hex: 'red', note: '' },
       ],
       rules: { shape: '圆润', material: '哑光', lighting: '柔光', color: '偏暖' },
+      groupId: null,
     };
     const { project } = parseProject({ ...emptyProject(), cards: [theme], activeThemeCardId: 't1' });
-    expect(project.cards[0]).toEqual({ ...theme, palette: [theme.palette[0]] });
+    expect(project.cards[0]).toEqual({ ...theme, palette: [theme.palette[0]], groupId: null });
     expect(project.activeThemeCardId).toBe('t1');
     expect(parseProject({ ...emptyProject(), cards: [theme], activeThemeCardId: 'nope' }).project.activeThemeCardId).toBeNull();
+  });
+
+  it('能打开 schema 1 的项目并升到当前版本', () => {
+    const { project } = parseProject({ schemaVersion: 1, cards: [validCard] });
+    expect(project.schemaVersion).toBe(PROJECT_SCHEMA_VERSION);
+    expect(project.cards[0]).toMatchObject({ id: 'c1', groupId: null });
   });
 
   it('版本号不对时直接报错，不去猜结构', () => {

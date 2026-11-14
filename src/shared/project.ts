@@ -1,7 +1,9 @@
 import { DEFAULT_PROMPT_SETTINGS, MAX_COUNT, MIN_COUNT, QUALITIES, SIZE_OPTIONS, type PromptSettings } from './generation';
 
 export const PROJECT_FILE = 'project.json';
-export const PROJECT_SCHEMA_VERSION = 1;
+/** 当前写入版本；打开时兼容 schema 1 */
+export const PROJECT_SCHEMA_VERSION = 2;
+export const PROJECT_SCHEMA_MIN = 1;
 
 export type RegionId = 'theme' | 'assets' | 'pages';
 
@@ -61,6 +63,8 @@ export interface ImageCard {
   height: number;
   versions: Version[];
   currentVersionId: string;
+  /** 所属分组框；不在组内为 null */
+  groupId: string | null;
 }
 
 /** 画布上的一段结构化提示词；inputs 依次对应 {{Image 1}}、{{Image 2}}… */
@@ -78,6 +82,7 @@ export interface PromptCard {
   /** 生成结果所在的图像卡；第一次生成前为 null */
   outputCardId: string | null;
   settings: PromptSettings;
+  groupId: string | null;
 }
 
 export interface ThemeColor {
@@ -111,6 +116,18 @@ export interface ThemeCard {
   cues: string[];
   palette: ThemeColor[];
   rules: ThemeRules;
+  groupId: string | null;
+}
+
+/** 把若干卡片框成一组的容器；page/ref 不进组 */
+export interface GroupCard {
+  kind: 'group';
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 /** 以低保真原型为底、摆放核心素材的框；导出时就是一张高保真页面 */
@@ -131,7 +148,7 @@ export interface PageCard {
   exportScale: number;
 }
 
-/** 页面框里对某张核心素材的引用：显示它的当前版本 */
+/** 页面框里对某张核心素材的引用：默认跟当前版本；可锁定到指定版本 */
 export interface RefCard {
   kind: 'ref';
   id: string;
@@ -142,9 +159,11 @@ export interface RefCard {
   imageCardId: string;
   /** 所在页面框；拖出页面后为 null */
   pageId: string | null;
+  /** 钉死的版本；有值则不再跟随图像卡的当前版本 */
+  lockedVersionId: string | null;
 }
 
-export type CanvasCard = ImageCard | PromptCard | ThemeCard | PageCard | RefCard;
+export type CanvasCard = ImageCard | PromptCard | ThemeCard | PageCard | RefCard | GroupCard;
 
 export function isPageCard(card: CanvasCard): card is PageCard {
   return card.kind === 'page';
@@ -152,6 +171,19 @@ export function isPageCard(card: CanvasCard): card is PageCard {
 
 export function isRefCard(card: CanvasCard): card is RefCard {
   return card.kind === 'ref';
+}
+
+export function isGroupCard(card: CanvasCard): card is GroupCard {
+  return card.kind === 'group';
+}
+
+/** 可以放进分组框的卡片 */
+export function canJoinGroup(card: CanvasCard): card is ImageCard | PromptCard | ThemeCard {
+  return card.kind === 'image' || card.kind === 'prompt' || card.kind === 'theme';
+}
+
+export function cardGroupId(card: CanvasCard): string | null {
+  return canJoinGroup(card) ? card.groupId : null;
 }
 
 export const DEVICE_PRESETS = [
@@ -268,6 +300,14 @@ export function currentVersion(card: ImageCard): Version {
   return card.versions.find((version) => version.id === card.currentVersionId) ?? card.versions[card.versions.length - 1];
 }
 
+/** 引用显示的版本：锁定版优先，否则当前版 */
+export function refDisplayVersion(ref: RefCard, source: ImageCard): Version | null {
+  if (ref.lockedVersionId) {
+    return source.versions.find((v) => v.id === ref.lockedVersionId) ?? null;
+  }
+  return currentVersion(source);
+}
+
 export interface ParseResult {
   project: ProjectFile;
   /** 被跳过的无效内容，打开项目时提示给用户 */
@@ -278,8 +318,8 @@ export interface ParseResult {
 export function parseProject(raw: unknown): ParseResult {
   const warnings: string[] = [];
   if (!isObject(raw)) throw new Error('project.json 不是一个 JSON 对象');
-  if (raw.schemaVersion !== PROJECT_SCHEMA_VERSION) {
-    throw new Error(`project.json 的版本是 ${String(raw.schemaVersion)}，这个版本的暗夜精灵只认识 ${PROJECT_SCHEMA_VERSION}`);
+  if (typeof raw.schemaVersion !== 'number' || raw.schemaVersion < PROJECT_SCHEMA_MIN || raw.schemaVersion > PROJECT_SCHEMA_VERSION) {
+    throw new Error(`project.json 的版本是 ${String(raw.schemaVersion)}，这个版本的暗夜精灵只认识 ${PROJECT_SCHEMA_MIN}–${PROJECT_SCHEMA_VERSION}`);
   }
 
   const defaults = defaultRegions();
@@ -304,7 +344,9 @@ export function parseProject(raw: unknown): ParseResult {
             ? parsePageCard(value)
             : value.kind === 'ref'
               ? parseRefCard(value)
-              : parseCard(value);
+              : value.kind === 'group'
+                ? parseGroupCard(value)
+                : parseCard(value);
     if (!card) {
       warnings.push(`第 ${index + 1} 个对象结构不完整，已跳过`);
       continue;
@@ -341,8 +383,24 @@ export function parseProject(raw: unknown): ParseResult {
     if (!imageIds.has(card.imageCardId)) {
       warnings.push('一个素材引用指向的图像卡不存在，已去掉');
       cards.splice(index, 1);
-    } else if (card.pageId && !pageIds.has(card.pageId)) {
-      cards[index] = { ...card, pageId: null };
+    } else {
+      let next = card;
+      if (card.pageId && !pageIds.has(card.pageId)) next = { ...next, pageId: null };
+      if (card.lockedVersionId) {
+        const source = cards.find((c): c is ImageCard => isImageCard(c) && c.id === card.imageCardId);
+        if (!source?.versions.some((v) => v.id === card.lockedVersionId)) next = { ...next, lockedVersionId: null };
+      }
+      if (next !== card) cards[index] = next;
+    }
+  }
+
+  // 分组：组不存在则子卡脱离；page/ref 不应带 groupId（解析时已忽略）
+  const groupIds = new Set(cards.filter(isGroupCard).map((card) => card.id));
+  for (let index = 0; index < cards.length; index++) {
+    const card = cards[index];
+    const gid = cardGroupId(card);
+    if (gid && !groupIds.has(gid)) {
+      if (canJoinGroup(card)) cards[index] = { ...card, groupId: null };
     }
   }
 
@@ -352,6 +410,23 @@ export function parseProject(raw: unknown): ParseResult {
       : null;
 
   return { project: { schemaVersion: PROJECT_SCHEMA_VERSION, regions, cards, activeThemeCardId, viewport }, warnings };
+}
+
+function parseGroupId(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+function parseGroupCard(value: Record<string, unknown>): GroupCard | null {
+  if (typeof value.id !== 'string' || !isRect(value) || value.width <= 0 || value.height <= 0) return null;
+  return {
+    kind: 'group',
+    id: value.id,
+    name: typeof value.name === 'string' ? value.name : '分组',
+    x: value.x,
+    y: value.y,
+    width: value.width,
+    height: value.height,
+  };
 }
 
 function parsePageCard(value: Record<string, unknown>): PageCard | null {
@@ -385,6 +460,7 @@ function parseRefCard(value: Record<string, unknown>): RefCard | null {
     height: value.height,
     imageCardId: value.imageCardId,
     pageId: typeof value.pageId === 'string' ? value.pageId : null,
+    lockedVersionId: typeof value.lockedVersionId === 'string' ? value.lockedVersionId : null,
   };
 }
 
@@ -414,6 +490,7 @@ function parseThemeCard(value: Record<string, unknown>): ThemeCard | null {
     cues: strings(value.cues),
     palette,
     rules: { shape: text(rules.shape), material: text(rules.material), lighting: text(rules.lighting), color: text(rules.color) },
+    groupId: parseGroupId(value.groupId),
   };
 }
 
@@ -435,6 +512,7 @@ function parseCard(value: unknown): ImageCard | null {
     height: value.height,
     versions,
     currentVersionId,
+    groupId: parseGroupId(value.groupId),
   };
 }
 
@@ -461,6 +539,7 @@ function parsePromptCard(value: Record<string, unknown>): PromptCard | null {
         : DEFAULT_PROMPT_SETTINGS.quality,
       useTheme: typeof settings.useTheme === 'boolean' ? settings.useTheme : DEFAULT_PROMPT_SETTINGS.useTheme,
     },
+    groupId: parseGroupId(value.groupId),
   };
 }
 
