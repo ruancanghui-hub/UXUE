@@ -1066,7 +1066,7 @@ function DecorInfo(props: InspectorProps & { card: DecorCard }) {
     <>
       <section className="inspector-section">
         <div className="panel-title">页面装饰</div>
-        <p className="hint">圆角填充矩形，垫在素材引用下面；导出 SVG 时是矢量层。</p>
+        <p className="hint">圆角填充矩形；可与素材引用互压调层；导出 SVG 时是矢量层。</p>
         <Field label="所在页面" value={page?.name ?? '（页面已不在）'} />
         <div className="field">
           <span className="field-label">填充色</span>

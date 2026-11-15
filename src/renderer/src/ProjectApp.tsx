@@ -38,6 +38,7 @@ import {
   setCurrentVersion,
   setRefLockedVersion,
   nudgeSiblingOrder,
+  setPageStackOrder,
   resizeRefLogical,
   updateBlock,
   updateDecor,
@@ -810,6 +811,12 @@ const LeftPanel = memo(function LeftPanel({ session, engine, cacheBust }: PanelP
     },
     [session, engine],
   );
+  const onReorderPageStack = useCallback(
+    (pageId: string, orderedIds: string[]) => {
+      session.doc.apply('调整层序', setPageStackOrder(session.doc.get(), pageId, orderedIds));
+    },
+    [session],
+  );
   return (
     <LayersPanel
       state={state}
@@ -818,6 +825,7 @@ const LeftPanel = memo(function LeftPanel({ session, engine, cacheBust }: PanelP
       cacheBust={cacheBust}
       onSelect={onSelect}
       onFocusCard={onFocusCard}
+      onReorderPageStack={onReorderPageStack}
     />
   );
 });

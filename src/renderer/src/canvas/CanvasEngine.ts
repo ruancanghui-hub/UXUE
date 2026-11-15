@@ -56,6 +56,7 @@ import {
   removeCards,
   renderOrder,
   reorderCards,
+  reorderPageStackables,
   resizeBlock,
   scaleCards,
   strokeWorldPoints,
@@ -441,7 +442,12 @@ export class CanvasEngine {
 
   reorderSelection(to: 'front' | 'back'): void {
     if (this.selection.size === 0) return;
-    this.doc.apply(to === 'front' ? '移到最前' : '移到最后', reorderCards(this.doc.get(), this.selection.get(), to));
+    const ids = this.selection.get();
+    const stacked = reorderPageStackables(this.doc.get(), ids, to);
+    this.doc.apply(
+      to === 'front' ? '移到最前' : '移到最后',
+      stacked ?? reorderCards(this.doc.get(), ids, to),
+    );
   }
 
   nudgeSelection(dx: number, dy: number): void {

@@ -257,30 +257,43 @@ async function exportPage({ dir, folder, plan }: ExportRequest): Promise<ExportR
   const base = plan.base
     ? await sharp(join(dir, plan.base.file)).rotate().resize(width, height, { fit: 'fill' }).png().toBuffer()
     : null;
-  const layers = await Promise.all(
-    plan.layers.map(async (layer) => ({
-      layer,
-      png: await sharp(join(dir, layer.file)).rotate().resize(layer.width, layer.height, { fit: 'fill' }).png().toBuffer(),
-    })),
+  const stack = plan.stack ?? [
+    ...(plan.shapes ?? []).map((shape) => ({ kind: 'shape' as const, shape })),
+    ...plan.layers.map((layer) => ({ kind: 'image' as const, layer })),
+  ];
+  const layerPngs = new Map<string, Buffer>();
+  await Promise.all(
+    stack
+      .filter((item): item is { kind: 'image'; layer: (typeof plan.layers)[number] } => item.kind === 'image')
+      .map(async ({ layer }) => {
+        const png = await sharp(join(dir, layer.file)).rotate().resize(layer.width, layer.height, { fit: 'fill' }).png().toBuffer();
+        layerPngs.set(layer.versionId + layer.file + layer.x + layer.y, png);
+      }),
   );
+  const layerKey = (layer: (typeof plan.layers)[number]) => layer.versionId + layer.file + layer.x + layer.y;
 
-  // 整页 PNG：超出页面的部分裁掉（sharp 不允许叠加图超出底图）
+  // 整页 PNG：按可叠层栈从下到上；超出页面的部分裁掉
   const composites: OverlayOptions[] = [];
   if (base) composites.push({ input: base, left: 0, top: 0 });
-  for (const shape of plan.shapes ?? []) {
-    const shapePng = await roundedRectPng(shape.width, shape.height, shape.fill, shape.cornerRadius);
-    const left = Math.max(0, -shape.x);
-    const top = Math.max(0, -shape.y);
-    const visibleWidth = Math.min(shape.width, width - shape.x) - left;
-    const visibleHeight = Math.min(shape.height, height - shape.y) - top;
-    if (visibleWidth <= 0 || visibleHeight <= 0) continue;
-    const input =
-      left === 0 && top === 0 && visibleWidth === shape.width && visibleHeight === shape.height
-        ? shapePng
-        : await sharp(shapePng).extract({ left, top, width: visibleWidth, height: visibleHeight }).toBuffer();
-    composites.push({ input, left: shape.x + left, top: shape.y + top });
-  }
-  for (const { layer, png } of layers) {
+  for (const item of stack) {
+    if (item.kind === 'shape') {
+      const shape = item.shape;
+      const shapePng = await roundedRectPng(shape.width, shape.height, shape.fill, shape.cornerRadius);
+      const left = Math.max(0, -shape.x);
+      const top = Math.max(0, -shape.y);
+      const visibleWidth = Math.min(shape.width, width - shape.x) - left;
+      const visibleHeight = Math.min(shape.height, height - shape.y) - top;
+      if (visibleWidth <= 0 || visibleHeight <= 0) continue;
+      const input =
+        left === 0 && top === 0 && visibleWidth === shape.width && visibleHeight === shape.height
+          ? shapePng
+          : await sharp(shapePng).extract({ left, top, width: visibleWidth, height: visibleHeight }).toBuffer();
+      composites.push({ input, left: shape.x + left, top: shape.y + top });
+      continue;
+    }
+    const { layer } = item;
+    const png = layerPngs.get(layerKey(layer));
+    if (!png) continue;
     const left = Math.max(0, -layer.x);
     const top = Math.max(0, -layer.y);
     const visibleWidth = Math.min(layer.width, width - layer.x) - left;
@@ -298,26 +311,31 @@ async function exportPage({ dir, folder, plan }: ExportRequest): Promise<ExportR
     .png()
     .toFile(join(out, pagePng));
 
-  // 分层 SVG：装饰是矢量 rect；每个素材一个 <image>，id 就是 Figma 里的图层名
+  // 分层 SVG：按可叠层栈交错写 rect / image
   const dataUrl = (buffer: Buffer): string => `data:image/png;base64,${buffer.toString('base64')}`;
-  const svgShapes = (plan.shapes ?? []).map(
-    (shape) =>
-      `      <rect id="${xmlAttr(shape.name)}" x="${shape.x}" y="${shape.y}" width="${shape.width}" height="${shape.height}" rx="${shape.cornerRadius}" ry="${shape.cornerRadius}" fill="${xmlAttr(shape.fill)}"/>`,
-  );
-  const svgLayers = layers.map(
-    ({ layer, png }) =>
+  const svgStack: string[] = [];
+  for (const item of stack) {
+    if (item.kind === 'shape') {
+      const shape = item.shape;
+      svgStack.push(
+        `      <rect id="${xmlAttr(shape.name)}" x="${shape.x}" y="${shape.y}" width="${shape.width}" height="${shape.height}" rx="${shape.cornerRadius}" ry="${shape.cornerRadius}" fill="${xmlAttr(shape.fill)}"/>`,
+      );
+      continue;
+    }
+    const { layer } = item;
+    const png = layerPngs.get(layerKey(layer));
+    if (!png) continue;
+    svgStack.push(
       `      <image id="${xmlAttr(layer.name)}" x="${layer.x}" y="${layer.y}" width="${layer.width}" height="${layer.height}" preserveAspectRatio="none" href="${dataUrl(png)}"/>`,
-  );
+    );
+  }
   const svg = [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
     `  <g id="${xmlAttr(plan.pageName)}">`,
     `    <rect id="背景" width="${width}" height="${height}" fill="${plan.background}"/>`,
     base ? `    <image id="低保真原型" width="${width}" height="${height}" preserveAspectRatio="none" href="${dataUrl(base)}"/>` : '',
-    svgShapes.length ? `    <g id="装饰">` : '',
-    ...svgShapes,
-    svgShapes.length ? `    </g>` : '',
-    `    <g id="素材">`,
-    ...svgLayers,
+    `    <g id="内容">`,
+    ...svgStack,
     `    </g>`,
     `  </g>`,
     `</svg>`,
@@ -330,7 +348,8 @@ async function exportPage({ dir, folder, plan }: ExportRequest): Promise<ExportR
   // 素材包：每个素材按逻辑尺寸导出 @1x/@2x/@3x，超过原图分辨率的倍数跳过
   const files = [pagePng, pageSvg];
   const manifest: { name: string; x: number; y: number; width: number; height: number; files: string[] }[] = [];
-  for (const { layer } of layers) {
+  const imageLayers = stack.filter((item): item is { kind: 'image'; layer: (typeof plan.layers)[number] } => item.kind === 'image').map((item) => item.layer);
+  for (const layer of imageLayers) {
     const logicalWidth = layer.width / plan.exportScale;
     const logicalHeight = layer.height / plan.exportScale;
     const meta = await sharp(join(dir, layer.file)).metadata();
@@ -386,7 +405,7 @@ async function exportPage({ dir, folder, plan }: ExportRequest): Promise<ExportR
     folder,
     files,
     png: { width, height },
-    svg: { layers: layers.map(({ layer }) => layer.name), bytes: Buffer.byteLength(svg) },
+    svg: { layers: imageLayers.map((layer) => layer.name), bytes: Buffer.byteLength(svg) },
   };
 }
 

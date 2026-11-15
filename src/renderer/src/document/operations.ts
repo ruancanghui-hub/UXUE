@@ -11,9 +11,11 @@ import {
   fitRegionHeights,
   regionColumnOf,
   isBlockCard,
+  applyPageStackOrder,
   isDecorCard,
   isGroupCard,
   isPageBoundChild,
+  isPageStackable,
   isSketchMark,
   isSketchTextCard,
   SKETCH_FONT_SIZES,
@@ -688,13 +690,13 @@ export function reassignRefPages(state: DocState, refIds: ReadonlySet<string>): 
   });
 }
 
-/** 绘制和命中顺序：页面框之后依次是区块、草图、页面装饰、引用（素材盖在最上面）；组成员紧跟分组框 */
+/** 绘制和命中顺序：页面框之后是区块 → 草图 → 可叠层栈（装饰与引用按数组序混排，更后=更上）；组成员紧跟分组框 */
 export function renderOrder(cards: readonly CanvasCard[]): CanvasCard[] {
   const pageIds = new Set(cards.filter(isPageCard).map((card) => card.id));
   const groupIds = new Set(cards.filter(isGroupCard).map((card) => card.id));
   const pageChildren = new Map<string, CanvasCard[]>();
   const groupChildren = new Map<string, CanvasCard[]>();
-  for (const kindOf of [isBlockCard, isSketchMark, isDecorCard] as const) {
+  for (const kindOf of [isBlockCard, isSketchMark] as const) {
     for (const card of cards) {
       if (kindOf(card) && pageIds.has(card.pageId)) {
         const list = pageChildren.get(card.pageId) ?? [];
@@ -704,10 +706,10 @@ export function renderOrder(cards: readonly CanvasCard[]): CanvasCard[] {
     }
   }
   for (const card of cards) {
-    if (isRefCard(card) && card.pageId && pageIds.has(card.pageId)) {
-      const list = pageChildren.get(card.pageId) ?? [];
+    if (isPageStackable(card) && pageIds.has(card.pageId!)) {
+      const list = pageChildren.get(card.pageId!) ?? [];
       list.push(card);
-      pageChildren.set(card.pageId, list);
+      pageChildren.set(card.pageId!, list);
     }
     const gid = cardGroupId(card);
     if (gid && groupIds.has(gid)) {
@@ -727,6 +729,21 @@ export function renderOrder(cards: readonly CanvasCard[]): CanvasCard[] {
     if (isGroupCard(card)) ordered.push(...(groupChildren.get(card.id) ?? []));
   }
   return ordered;
+}
+
+/** 某页可叠层对象 id，从下到上（与 cards 数组中该页栈槽顺序一致） */
+export function pageStackableIds(cards: readonly CanvasCard[], pageId: string): string[] {
+  return cards.filter((card) => isPageStackable(card) && card.pageId === pageId).map((card) => card.id);
+}
+
+/** 把某页可叠层改成 orderedIds（从下到上）；须为当前栈的一个排列 */
+export function setPageStackOrder(state: DocState, pageId: string, orderedIds: readonly string[]): DocState {
+  const current = pageStackableIds(state.cards, pageId);
+  if (orderedIds.length !== current.length) return state;
+  const set = new Set(orderedIds);
+  if (set.size !== orderedIds.length || !current.every((id) => set.has(id))) return state;
+  if (orderedIds.every((id, index) => id === current[index])) return state;
+  return { ...state, cards: applyPageStackOrder(state.cards, pageId, orderedIds) };
 }
 
 /** 画布上显示这张卡片需要的版本：图像卡当前版；引用跟锁定或当前版；页面框是低保真原型 */
@@ -892,27 +909,36 @@ export function pageDecors(state: DocState, pageId: string): DecorCard[] {
   return state.cards.filter((card): card is DecorCard => isDecorCard(card) && card.pageId === pageId);
 }
 
-/** 同类同页里上移 / 下移一层（数组里往后 = 画在上面） */
+/** 同页可叠层栈里上移 / 下移一层（数组里往后 = 画在上面；装饰可越过素材） */
 export function nudgeSiblingOrder(state: DocState, id: string, direction: 'forward' | 'backward'): DocState {
   const card = state.cards.find((c) => c.id === id);
-  if (!card || (!isDecorCard(card) && !isRefCard(card))) return state;
-  const pageId = card.pageId;
-  if (!pageId) return state;
-  const sameKind = (c: CanvasCard): boolean =>
-    isDecorCard(card) ? isDecorCard(c) && c.pageId === pageId : isRefCard(c) && c.pageId === pageId;
-  const siblingIds = state.cards.filter(sameKind).map((c) => c.id);
+  if (!card || !isPageStackable(card) || !card.pageId) return state;
+  const siblingIds = pageStackableIds(state.cards, card.pageId);
   const index = siblingIds.indexOf(id);
   if (index < 0) return state;
   const swapWith = direction === 'forward' ? index + 1 : index - 1;
   if (swapWith < 0 || swapWith >= siblingIds.length) return state;
-  const a = siblingIds[index];
-  const b = siblingIds[swapWith];
-  const cards = [...state.cards];
-  const ia = cards.findIndex((c) => c.id === a);
-  const ib = cards.findIndex((c) => c.id === b);
-  if (ia < 0 || ib < 0) return state;
-  [cards[ia], cards[ib]] = [cards[ib], cards[ia]];
-  return { ...state, cards };
+  const next = [...siblingIds];
+  [next[index], next[swapWith]] = [next[swapWith], next[index]];
+  return setPageStackOrder(state, card.pageId, next);
+}
+
+/** 同页可叠层栈内置顶 / 置底；多选时保持相对序。非同页栈对象返回 null 以便走全局 reorderCards */
+export function reorderPageStackables(
+  state: DocState,
+  ids: ReadonlySet<string>,
+  to: 'front' | 'back',
+): DocState | null {
+  if (ids.size === 0) return null;
+  const picked = state.cards.filter((card) => ids.has(card.id));
+  if (picked.length !== ids.size || !picked.every(isPageStackable)) return null;
+  const pageId = picked[0].pageId;
+  if (!pageId || !picked.every((card) => card.pageId === pageId)) return null;
+  const stack = pageStackableIds(state.cards, pageId);
+  const moving = stack.filter((id) => ids.has(id));
+  const rest = stack.filter((id) => !ids.has(id));
+  const next = to === 'front' ? [...rest, ...moving] : [...moving, ...rest];
+  return setPageStackOrder(state, pageId, next);
 }
 
 /** 素材引用按逻辑像素改宽高；默认左上角不动；lockAspect 时以宽为准改高 */

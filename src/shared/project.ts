@@ -1,8 +1,8 @@
 import { DEFAULT_PROMPT_SETTINGS, MAX_COUNT, MIN_COUNT, QUALITIES, SIZE_OPTIONS, type PromptSettings } from './generation';
 
 export const PROJECT_FILE = 'project.json';
-/** 当前写入版本；打开时兼容 schema 1 */
-export const PROJECT_SCHEMA_VERSION = 2;
+/** 当前写入版本；打开时兼容 schema 1–3（3 = 页面可叠层栈混排） */
+export const PROJECT_SCHEMA_VERSION = 3;
 export const PROJECT_SCHEMA_MIN = 1;
 
 export type RegionId = 'theme' | 'assets' | 'pages';
@@ -701,7 +701,45 @@ export function parseProject(raw: unknown): ParseResult {
       ? raw.activeThemeCardId
       : null;
 
-  return { project: { schemaVersion: PROJECT_SCHEMA_VERSION, regions, cards, activeThemeCardId, viewport }, warnings };
+  // schema < 3：可叠层仍按「先装饰后引用」画；把该视觉序写回数组，之后靠数组顺序混排
+  const orderedCards = raw.schemaVersion < 3 ? migrateLegacyPageStackOrder(cards) : cards;
+
+  return { project: { schemaVersion: PROJECT_SCHEMA_VERSION, regions, cards: orderedCards, activeThemeCardId, viewport }, warnings };
+}
+
+/** 旧视觉序（每页全部装饰 → 全部引用）写进 cards 里可叠层槽位的相对顺序 */
+export function migrateLegacyPageStackOrder(cards: CanvasCard[]): CanvasCard[] {
+  const pageIds = cards.filter(isPageCard).map((card) => card.id);
+  let next: CanvasCard[] = cards;
+  let changed = false;
+  for (const pageId of pageIds) {
+    const stackIds = next.filter((card) => isPageStackable(card) && card.pageId === pageId).map((card) => card.id);
+    if (stackIds.length === 0) continue;
+    const desired = [
+      ...next.filter((card) => isDecorCard(card) && card.pageId === pageId).map((card) => card.id),
+      ...next.filter((card) => isRefCard(card) && card.pageId === pageId).map((card) => card.id),
+    ];
+    if (desired.every((id, index) => id === stackIds[index])) continue;
+    next = applyPageStackOrder(next, pageId, desired);
+    changed = true;
+  }
+  return changed ? next : cards;
+}
+
+/** 页面装饰或带 pageId 的素材引用：同一页共用可叠层栈 */
+export function isPageStackable(card: CanvasCard): card is DecorCard | RefCard {
+  return (isDecorCard(card) || isRefCard(card)) && !!card.pageId;
+}
+
+/** 把某页可叠层对象按 orderedIds（从下到上）填回它们在数组里原有的槽位 */
+export function applyPageStackOrder(cards: readonly CanvasCard[], pageId: string, orderedIds: readonly string[]): CanvasCard[] {
+  const byId = new Map(cards.map((card) => [card.id, card]));
+  let index = 0;
+  return cards.map((card) => {
+    if (!isPageStackable(card) || card.pageId !== pageId) return card;
+    const id = orderedIds[index++];
+    return byId.get(id) ?? card;
+  });
 }
 
 /**
