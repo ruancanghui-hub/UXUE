@@ -3,17 +3,20 @@ import { watch, type FSWatcher } from 'node:fs';
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type { ImportResult, ImportSource, OpenedProject, ProjectFsChange, RecentProject } from '../shared/api';
-import { emptyProject, isImageCard, isPageCard, parseProject, PROJECT_FILE, type ProjectFile, type Version } from '../shared/project';
 import { safeFileName } from '../shared/export';
+import { emptyProject, isImageCard, isPageCard, parseProject, PROJECT_FILE, type ProjectFile, type Version } from '../shared/project';
 import type { EnsureCacheResult, ImportedImage } from '../shared/workerProtocol';
 import type { ImageWorkerClient } from './imageWorkerClient';
+import { hashProjectText } from './projectHash';
 
 const RECENT_LIMIT = 10;
 const IMPORT_CONCURRENCY = 3;
 const CACHE_CONCURRENCY = 2;
 const PROJECT_GITIGNORE = '.cache/\n';
 /** 自己写盘后忽略一段外部 watch 事件，避免把自己的保存当成外部改动 */
-const OWN_SAVE_IGNORE_MS = 800;
+const OWN_SAVE_IGNORE_MS = 2000;
+/** project.json 变动防抖：等 rename / 同步盘写完再读 */
+const PROJECT_WATCH_DEBOUNCE_MS = 1000;
 /** 主题说明放在项目目录的这个子目录里 */
 export const THEMES_DIR = 'themes';
 
@@ -30,6 +33,9 @@ export class ProjectService {
   private cacheGeneration = 0;
   private watcher: FSWatcher | null = null;
   private ignoreUntil = 0;
+  /** 最近一次自己写入（或打开时读到）的 project.json 内容指纹 */
+  private lastSavedHash: string | null = null;
+  private projectWatchTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly worker: ImageWorkerClient,
@@ -67,6 +73,7 @@ export class ProjectService {
         throw new Error('project.json 已损坏，不是合法的 JSON');
       }
       ({ project, warnings } = parseProject(raw));
+      this.lastSavedHash = hashProjectText(text);
     }
 
     this.current = { dir };
@@ -94,8 +101,10 @@ export class ProjectService {
     const run = async (): Promise<void> => {
       const target = join(dir, PROJECT_FILE);
       const temp = `${target}.tmp`;
-      await writeFile(temp, JSON.stringify(project, null, 2));
+      const text = JSON.stringify(project, null, 2);
+      await writeFile(temp, text);
       await rename(temp, target);
+      this.lastSavedHash = hashProjectText(text);
       this.ignoreUntil = Date.now() + OWN_SAVE_IGNORE_MS;
     };
     const next = this.writeChain.then(run, run);
@@ -194,7 +203,7 @@ export class ProjectService {
           return;
         }
         if (relative === PROJECT_FILE || relative.endsWith(`/${PROJECT_FILE}`)) {
-          this.events.onFsChange({ kind: 'project', path: join(dir, PROJECT_FILE) });
+          this.scheduleProjectChangeCheck(dir);
           return;
         }
         if (relative === 'assets' || relative.startsWith('assets/')) {
@@ -207,7 +216,33 @@ export class ProjectService {
     }
   }
 
+  /** 防抖后读盘：内容与自己上次写入相同则忽略（同步盘原样回写） */
+  private scheduleProjectChangeCheck(dir: string): void {
+    if (this.projectWatchTimer) clearTimeout(this.projectWatchTimer);
+    this.projectWatchTimer = setTimeout(() => {
+      this.projectWatchTimer = null;
+      void this.emitProjectChangeIfExternal(dir);
+    }, PROJECT_WATCH_DEBOUNCE_MS);
+  }
+
+  private async emitProjectChangeIfExternal(dir: string): Promise<void> {
+    if (this.current?.dir !== dir) return;
+    if (Date.now() < this.ignoreUntil) return;
+    try {
+      const text = await readFile(join(dir, PROJECT_FILE), 'utf8');
+      const hash = hashProjectText(text);
+      if (this.lastSavedHash && hash === this.lastSavedHash) return;
+      this.events.onFsChange({ kind: 'project', path: join(dir, PROJECT_FILE) });
+    } catch (error) {
+      console.warn('[watch] 读取 project.json 失败', error);
+    }
+  }
+
   private stopWatch(): void {
+    if (this.projectWatchTimer) {
+      clearTimeout(this.projectWatchTimer);
+      this.projectWatchTimer = null;
+    }
     this.watcher?.close();
     this.watcher = null;
   }
@@ -222,7 +257,9 @@ export class ProjectService {
   private async initializeDirectory(dir: string, project: ProjectFile): Promise<void> {
     this.ignoreUntil = Date.now() + OWN_SAVE_IGNORE_MS;
     await mkdir(join(dir, 'assets'), { recursive: true });
-    await writeFile(join(dir, PROJECT_FILE), JSON.stringify(project, null, 2));
+    const text = JSON.stringify(project, null, 2);
+    await writeFile(join(dir, PROJECT_FILE), text);
+    this.lastSavedHash = hashProjectText(text);
     if (!(await exists(join(dir, '.gitignore')))) await writeFile(join(dir, '.gitignore'), PROJECT_GITIGNORE);
   }
 

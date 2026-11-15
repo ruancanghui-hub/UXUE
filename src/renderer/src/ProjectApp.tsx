@@ -117,7 +117,7 @@ export function ProjectApp() {
   const engineRef = useRef<CanvasEngine | null>(null);
   const inspectorRef = useRef<InspectorHandle>(null);
   const checkStarted = useRef(false);
-  const fsPrompting = useRef(false);
+  const [externalProjectDirty, setExternalProjectDirty] = useState(false);
   const assetsRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [tracker] = useState(() => new GenerationTracker(() => sessionRef.current));
   sessionRef.current = session;
@@ -147,6 +147,7 @@ export function ProjectApp() {
         const next = new ProjectSession(opened);
         sessionRef.current?.dispose();
         setSession(next);
+        setExternalProjectDirty(false);
         setCacheBust(new Map());
         for (const warning of opened.warnings) toast(warning, 'error');
         if (opened.missingVersionIds.length > 0) {
@@ -228,8 +229,13 @@ export function ProjectApp() {
   const reloadFromDisk = useCallback(async () => {
     const current = sessionRef.current;
     if (!current) return;
-    await openDir(current.dir);
-  }, [openDir]);
+    setExternalProjectDirty(false);
+    try {
+      await openDir(current.dir);
+    } catch (error) {
+      toast(`重新加载失败：${error instanceof Error ? error.message : String(error)}`, 'error');
+    }
+  }, [openDir, toast]);
 
   const refreshAssets = useCallback(async () => {
     const current = sessionRef.current;
@@ -262,14 +268,12 @@ export function ProjectApp() {
           }, 400);
           return;
         }
-        if (fsPrompting.current) return;
-        fsPrompting.current = true;
-        const dirty = current.isDirty();
-        const reload = dirty
-          ? window.confirm('项目文件已在外部被修改。\n\n确定 = 丢弃本地未保存改动并重新加载\n取消 = 保留本地修改')
-          : window.confirm('项目文件已在外部被修改，是否重新加载？');
-        fsPrompting.current = false;
-        if (reload) void reloadFromDisk();
+        // project.json：无未保存则静默重载；有未保存则顶栏横幅，不再用阻塞弹框
+        if (!current.isDirty()) {
+          void reloadFromDisk();
+          return;
+        }
+        setExternalProjectDirty(true);
       }),
     [refreshAssets, reloadFromDisk],
   );
@@ -688,6 +692,22 @@ export function ProjectApp() {
           onDragLeave={() => setDropActive(false)}
           onDrop={onDrop}
         >
+          {externalProjectDirty && (
+            <div className="external-reload-banner" role="status">
+              <span>磁盘上的项目已更新</span>
+              <div className="external-reload-actions">
+                <button type="button" className="primary small" onClick={() => void reloadFromDisk()}>
+                  重载
+                </button>
+                <button type="button" className="small" onClick={() => setExternalProjectDirty(false)}>
+                  保留本地
+                </button>
+                <button type="button" className="icon-close" aria-label="关闭" onClick={() => setExternalProjectDirty(false)}>
+                  ×
+                </button>
+              </div>
+            </div>
+          )}
           <CanvasView onEngine={handleEngine} />
           {showPerf && status && <PerfPanel status={status} uncapped={false} firstPaintMs={null} />}
           {session && status?.itemCount === 0 && importing === 0 && (

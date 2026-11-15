@@ -367,7 +367,7 @@ OpenAI 供应商（API Key 存钥匙串）；提示词卡、来源连线、`{{Im
 
 `project.json` schema **2**：兼容打开 schema 1；写入为 2。`RefCard.lockedVersionId`；`GroupCard` + 子卡 `groupId`。
 
-**怎么用（补充）**：属性面板看「已过期」并重新生成 / 全部下游；素材引用可「锁定版本」；多选 ⌘G 编组、⌘⇧G 解组；设置里管提示词模板；⌘K 命令面板；外部改了项目目录会提示重载。
+**怎么用（补充）**：属性面板看「已过期」并重新生成 / 全部下游；素材引用可「锁定版本」；多选 ⌘G 编组、⌘⇧G 解组；设置里管提示词模板；⌘K 命令面板；外部改了 `project.json` 时：已保存则静默重载，有未保存改动则顶栏横幅选择重载或保留本地（不再弹阻塞框）。
 
 **验证**：`npm test`（60）；`npm run typecheck`。
 
@@ -430,6 +430,12 @@ OpenAI 供应商（API Key 存钥匙串）；提示词卡、来源连线、`{{Im
 规格见 `docs/specs/assistant-chat-ui.md`。助手栏默认约 420px（可拖 320–560，本机记住），属性仍 272；Cursor/Codex 风布局（列表吃满、底栏大输入、建议芯片）；助手消息基础 Markdown；上翻不抢滚、「跳到最新」。不改助手能力。
 
 **验收**：`simpleMarkdown.test.ts`；`npm test` / `typecheck` 通过。
+
+### 外部 project.json 改动不再弹框打断 ✅
+
+规格见 `docs/specs/external-project-reload.md`。自己写入指纹忽略同步盘原样回写；watch 防抖 1s、忽略窗 2s；无未保存静默重载；有未保存时画布顶横幅（重载 / 保留本地），废除 `window.confirm`。
+
+**验收**：`projectHash.test.ts`；`npm test` / `typecheck` 通过。
 
 ### 后置（G）
 
