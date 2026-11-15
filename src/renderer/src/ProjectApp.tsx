@@ -1,4 +1,4 @@
-import { forwardRef, memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type DragEvent } from 'react';
+import { forwardRef, memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type DragEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import type { ImportSource, MenuCommand, ProjectFsChange, StartupInfo } from '../../shared/api';
 import { PROJECT_HOST } from '../../shared/bench';
 import { planPageExport, type ExportResult } from '../../shared/export';
@@ -821,12 +821,24 @@ interface RightPanelProps extends PanelProps {
   onToast(text: string, tone?: 'info' | 'error'): void;
 }
 
+const ASSISTANT_WIDTH_KEY = 'anye.assistantWidth';
+const ASSISTANT_WIDTH_DEFAULT = 420;
+const ASSISTANT_WIDTH_MIN = 320;
+const ASSISTANT_WIDTH_MAX = 560;
+
+function readAssistantWidth(): number {
+  const raw = Number(localStorage.getItem(ASSISTANT_WIDTH_KEY));
+  if (!Number.isFinite(raw)) return ASSISTANT_WIDTH_DEFAULT;
+  return Math.min(ASSISTANT_WIDTH_MAX, Math.max(ASSISTANT_WIDTH_MIN, Math.round(raw)));
+}
+
 const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function RightPanel(
   { tab, onTab, assistant, assistantLabel, session, engine, cacheBust, config, jobs, onImportVersion, onGenerate, onRegenDownstream, exports, onReplaceLowFi, onExportPage, onPlaceInPage, onToast },
   ref,
 ) {
   const state = useCommittedDoc(session.doc);
   const selectedIds = useSelectionIds(session.selection);
+  const [assistantWidth, setAssistantWidth] = useState(readAssistantWidth);
   const assistantBusy = useSyncExternalStore(
     (listener) => assistant.subscribe(listener),
     () => assistant.isBusy(),
@@ -842,9 +854,34 @@ const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function Ri
       </button>
     </div>
   );
+
+  const onResizePointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    event.preventDefault();
+    const handle = event.currentTarget;
+    handle.setPointerCapture(event.pointerId);
+    const startX = event.clientX;
+    const startWidth = assistantWidth;
+    const onMove = (move: PointerEvent): void => {
+      const next = Math.min(ASSISTANT_WIDTH_MAX, Math.max(ASSISTANT_WIDTH_MIN, Math.round(startWidth - (move.clientX - startX))));
+      setAssistantWidth(next);
+    };
+    const onUp = (up: PointerEvent): void => {
+      handle.releasePointerCapture(up.pointerId);
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onUp);
+      setAssistantWidth((width) => {
+        localStorage.setItem(ASSISTANT_WIDTH_KEY, String(width));
+        return width;
+      });
+    };
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+  };
+
   if (tab === 'assistant') {
     return (
-      <aside className="side-panel inspector assistant-side">
+      <aside className="side-panel assistant-side" style={{ width: assistantWidth }}>
+        <div className="assistant-resize" onPointerDown={onResizePointerDown} title="拖拽调整助手宽度" />
         {tabs}
         <AssistantPanel
           assistant={assistant}

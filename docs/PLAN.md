@@ -425,6 +425,12 @@ OpenAI 供应商（API Key 存钥匙串）；提示词卡、来源连线、`{{Im
 
 **验收**：`decor.test.ts` / `snap.test.ts`；`npm test` / `typecheck` 通过。
 
+### 助手会话区 UI ✅
+
+规格见 `docs/specs/assistant-chat-ui.md`。助手栏默认约 420px（可拖 320–560，本机记住），属性仍 272；Cursor/Codex 风布局（列表吃满、底栏大输入、建议芯片）；助手消息基础 Markdown；上翻不抢滚、「跳到最新」。不改助手能力。
+
+**验收**：`simpleMarkdown.test.ts`；`npm test` / `typecheck` 通过。
+
 ### 后置（G）
 
 - 更多模型供应商（Gemini、本地 ComfyUI 等；硅基流动 / NewAPI 已接入生图）
