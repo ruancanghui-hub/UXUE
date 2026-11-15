@@ -1,4 +1,4 @@
-import { memo, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   currentVersion,
   isBlockCard,
@@ -25,9 +25,11 @@ import {
 import { isImageCardStale } from '../../../shared/stale';
 import { regionOf, type DocState } from '../document/operations';
 import { thumbnailUrl } from '../project/thumbnails';
+import { LayerIcons } from './LayerIcons';
 
 interface LayersPanelProps {
   state: DocState;
+  projectDir: string;
   selectedIds: ReadonlySet<string>;
   missingVersionIds: ReadonlySet<string>;
   cacheBust: ReadonlyMap<string, number>;
@@ -37,7 +39,7 @@ interface LayersPanelProps {
   onReorderPageStack?(pageId: string, orderedIds: string[]): void;
 }
 
-type RowKind = 'image' | 'missing' | 'prompt' | 'theme' | 'page' | 'group' | 'ref' | 'block' | 'sketchText' | 'decor';
+type RowKind = 'image' | 'missing' | 'prompt' | 'theme' | 'page' | 'group' | 'ref' | 'block' | 'sketchText' | 'stroke' | 'decor';
 
 interface Row {
   id: string;
@@ -48,11 +50,36 @@ interface Row {
   indent: boolean;
   /** 可拖重排时所属页面 */
   stackPageId?: string;
+  /** 折叠子行所属的页面/分组 */
+  parentId?: string;
+  childCount?: number;
+  fill?: string;
+  isRef?: boolean;
 }
 
-/** 按区域分组列出画布对象；页面子行：可叠层（上=更上）→ 草图 → 区块；可叠层可拖 */
+function collapseStorageKey(projectDir: string): string {
+  return `anye.layers.collapsed:${projectDir}`;
+}
+
+function readCollapsed(projectDir: string): Set<string> {
+  try {
+    const raw = localStorage.getItem(collapseStorageKey(projectDir));
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? new Set(parsed.filter((id): id is string => typeof id === 'string')) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function writeCollapsed(projectDir: string, ids: Set<string>): void {
+  localStorage.setItem(collapseStorageKey(projectDir), JSON.stringify([...ids]));
+}
+
+/** 按区域分组列出画布对象；图标 + 树线 + 折叠；页面子行可叠层可拖 */
 export function LayersPanel({
   state,
+  projectDir,
   selectedIds,
   missingVersionIds,
   cacheBust,
@@ -62,6 +89,24 @@ export function LayersPanel({
 }: LayersPanelProps) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; place: 'before' | 'after' } | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => readCollapsed(projectDir));
+
+  useEffect(() => {
+    setCollapsed(readCollapsed(projectDir));
+  }, [projectDir]);
+
+  const toggleCollapsed = useCallback(
+    (key: string) => {
+      setCollapsed((prev) => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        writeCollapsed(projectDir, next);
+        return next;
+      });
+    },
+    [projectDir],
+  );
 
   const groups = useMemo(() => {
     const byId = new Map(state.cards.map((card) => [card.id, card]));
@@ -93,44 +138,58 @@ export function LayersPanel({
       }
     }
 
-    const rowFor = (card: CanvasCard, indent: boolean, stackPageId?: string): Row => {
+    const rowFor = (card: CanvasCard, indent: boolean, parentId?: string, stackPageId?: string): Row => {
       if (isImageCard(card) || isRefCard(card)) {
         const source = isRefCard(card) ? byId.get(card.imageCardId) : card;
-        if (!source || !isImageCard(source)) return { id: card.id, label: '引用丢失', kind: 'missing', indent, stackPageId };
+        if (!source || !isImageCard(source)) {
+          return { id: card.id, label: '引用丢失', kind: 'missing', indent, parentId, stackPageId, isRef: isRefCard(card) };
+        }
         const version = isRefCard(card) ? refDisplayVersion(card, source) : currentVersion(source);
-        if (!version) return { id: card.id, label: '引用丢失', kind: 'missing', indent, stackPageId };
+        if (!version) {
+          return { id: card.id, label: '引用丢失', kind: 'missing', indent, parentId, stackPageId, isRef: isRefCard(card) };
+        }
         const stale = !isRefCard(card) && isImageCardStale(source, state);
         const locked = isRefCard(card) && !!card.lockedVersionId;
         return {
           id: card.id,
-          label: isRefCard(card) ? `↳ ${source.name}` : source.name,
+          label: source.name,
           kind: missingVersionIds.has(version.id) ? 'missing' : 'image',
           thumbnail: thumbnailUrl(version, cacheBust.get(version.id)),
           badge: stale ? '过期' : locked ? '锁' : !isRefCard(card) && source.versions.length > 1 ? source.versions.length : undefined,
           indent,
+          parentId,
           stackPageId,
+          isRef: isRefCard(card),
         };
       }
       if (isGroupCard(card)) {
+        const childCount = groupChildren.get(card.id)?.length ?? 0;
         return {
           id: card.id,
           label: card.name,
           kind: 'group',
-          badge: groupChildren.get(card.id)?.length || undefined,
+          badge: childCount || undefined,
           indent,
+          childCount,
         };
       }
       if (isBlockCard(card)) {
         const page = byId.get(card.pageId);
         const stale = !!page && isPageCard(page) && isBlockCropStale(card, page);
-        return { id: card.id, label: card.name, kind: 'block', badge: stale ? '过期' : undefined, indent };
+        return { id: card.id, label: card.name, kind: 'block', badge: stale ? '过期' : undefined, indent, parentId };
       }
       if (isSketchTextCard(card)) {
-        return { id: card.id, label: card.text.split('\n')[0] || '（空文字）', kind: 'sketchText', indent };
+        return { id: card.id, label: card.text.split('\n')[0] || '（空文字）', kind: 'sketchText', indent, parentId };
       }
-      if (isDecorCard(card)) return { id: card.id, label: '页面装饰', kind: 'decor', indent, stackPageId };
-      if (isStrokeCard(card)) return { id: card.id, label: '草图笔迹', kind: 'sketchText', indent };
+      if (isDecorCard(card)) {
+        return { id: card.id, label: '页面装饰', kind: 'decor', indent, parentId, stackPageId, fill: card.fill };
+      }
+      if (isStrokeCard(card)) return { id: card.id, label: '草图笔迹', kind: 'stroke', indent, parentId };
       if (isPageCard(card)) {
+        const stackLen = pageStack.get(card.id)?.length ?? 0;
+        const sketchLen = pageSketches.get(card.id)?.length ?? 0;
+        const blockLen = pageBlocks.get(card.id)?.length ?? 0;
+        const childCount = stackLen + sketchLen + blockLen;
         const refs = pageStack.get(card.id)?.filter(isRefCard).length ?? 0;
         const strokes = strokeCounts.get(card.id) ?? 0;
         return {
@@ -139,6 +198,7 @@ export function LayersPanel({
           kind: 'page',
           badge: strokes ? `${refs ? `${refs} · ` : ''}笔迹 ${strokes}` : refs || undefined,
           indent,
+          childCount,
         };
       }
       return {
@@ -161,14 +221,20 @@ export function LayersPanel({
         const stack = [...(pageStack.get(card.id) ?? [])].reverse();
         const sketches = [...(pageSketches.get(card.id) ?? [])].reverse();
         const blocks = [...(pageBlocks.get(card.id) ?? [])].reverse();
-        for (const child of stack) rows.push(rowFor(child, true, card.id));
-        for (const child of sketches) rows.push(rowFor(child, true));
-        for (const child of blocks) rows.push(rowFor(child, true));
+        for (const child of stack) rows.push(rowFor(child, true, card.id, card.id));
+        for (const child of sketches) rows.push(rowFor(child, true, card.id));
+        for (const child of blocks) rows.push(rowFor(child, true, card.id));
       }
-      if (isGroupCard(card)) for (const child of groupChildren.get(card.id) ?? []) rows.push(rowFor(child, true));
+      if (isGroupCard(card)) {
+        for (const child of groupChildren.get(card.id) ?? []) rows.push(rowFor(child, true, card.id));
+      }
       byRegion.set(region, rows);
     }
-    const ordered = state.regions.map((region) => ({ id: region.id as string, name: region.name, rows: byRegion.get(region.id) ?? [] }));
+    const ordered = state.regions.map((region) => ({
+      id: region.id as string,
+      name: region.name,
+      rows: byRegion.get(region.id) ?? [],
+    }));
     const outside = byRegion.get(null);
     if (outside?.length) ordered.push({ id: 'outside', name: '区域外', rows: outside });
     return ordered;
@@ -210,45 +276,65 @@ export function LayersPanel({
     <aside className="side-panel layers-panel">
       <div className="panel-title">图层</div>
       <div className="layers-scroll">
-        {groups.map((group) => (
-          <section key={group.id} className="layer-group">
-            <div className="layer-group-title">
-              <span>{group.name}</span>
-              <span className="dim">{group.rows.filter((row) => !row.indent).length}</span>
-            </div>
-            {group.rows.length === 0 && <div className="layer-empty">还没有内容</div>}
-            {group.rows.map((row) => (
-              <LayerRow
-                key={row.id}
-                row={row}
-                selected={selectedIds.has(row.id)}
-                dragging={dragId === row.id}
-                dropPlace={dropTarget?.id === row.id ? dropTarget.place : null}
-                canDrag={!!row.stackPageId && !!onReorderPageStack}
-                onSelect={onSelect}
-                onFocusCard={onFocusCard}
-                onDragStart={() => setDragId(row.id)}
-                onDragEnd={() => {
-                  setDragId(null);
-                  setDropTarget(null);
-                }}
-                onDragOver={(place) => {
-                  if (!dragId || dragId === row.id || !row.stackPageId) return;
-                  const dragRow = groups.flatMap((g) => g.rows).find((r) => r.id === dragId);
-                  if (!dragRow?.stackPageId || dragRow.stackPageId !== row.stackPageId) return;
-                  setDropTarget({ id: row.id, place });
-                }}
-                onDrop={(place) => finishDrop(row.id, place)}
-              />
-            ))}
-          </section>
-        ))}
+        {groups.map((group) => {
+          const regionKey = `region:${group.id}`;
+          const regionOpen = !collapsed.has(regionKey);
+          const topCount = group.rows.filter((row) => !row.indent).length;
+          const visibleRows = regionOpen
+            ? group.rows.filter((row) => {
+                if (!row.parentId) return true;
+                return !collapsed.has(row.parentId);
+              })
+            : [];
+          return (
+            <section key={group.id} className="layer-group">
+              <div className="layer-group-title">
+                <button
+                  type="button"
+                  className="layer-chevron"
+                  aria-label={regionOpen ? '折叠区域' : '展开区域'}
+                  aria-expanded={regionOpen}
+                  onClick={() => toggleCollapsed(regionKey)}
+                >
+                  <LayerIcons.chevron className="layer-chevron-icon" expanded={regionOpen} />
+                </button>
+                <span className="layer-group-name">{group.name}</span>
+                <span className="dim">{topCount}</span>
+              </div>
+              {regionOpen && group.rows.length === 0 && <div className="layer-empty">还没有内容</div>}
+              {visibleRows.map((row) => (
+                <LayerRow
+                  key={row.id}
+                  row={row}
+                  selected={selectedIds.has(row.id)}
+                  dragging={dragId === row.id}
+                  dropPlace={dropTarget?.id === row.id ? dropTarget.place : null}
+                  canDrag={!!row.stackPageId && !!onReorderPageStack}
+                  expanded={!collapsed.has(row.id)}
+                  onToggle={() => toggleCollapsed(row.id)}
+                  onSelect={onSelect}
+                  onFocusCard={onFocusCard}
+                  onDragStart={() => setDragId(row.id)}
+                  onDragEnd={() => {
+                    setDragId(null);
+                    setDropTarget(null);
+                  }}
+                  onDragOver={(place) => {
+                    if (!dragId || dragId === row.id || !row.stackPageId) return;
+                    const dragRow = groups.flatMap((g) => g.rows).find((r) => r.id === dragId);
+                    if (!dragRow?.stackPageId || dragRow.stackPageId !== row.stackPageId) return;
+                    setDropTarget({ id: row.id, place });
+                  }}
+                  onDrop={(place) => finishDrop(row.id, place)}
+                />
+              ))}
+            </section>
+          );
+        })}
       </div>
     </aside>
   );
 }
-
-const ICONS: Partial<Record<RowKind, string>> = { prompt: '✎', theme: '◆', page: '▢', group: '⬚', block: '⬒', sketchText: 'T', decor: '▭' };
 
 const LayerRow = memo(function LayerRow({
   row,
@@ -256,6 +342,8 @@ const LayerRow = memo(function LayerRow({
   dragging,
   dropPlace,
   canDrag,
+  expanded,
+  onToggle,
   onSelect,
   onFocusCard,
   onDragStart,
@@ -268,6 +356,8 @@ const LayerRow = memo(function LayerRow({
   dragging: boolean;
   dropPlace: 'before' | 'after' | null;
   canDrag: boolean;
+  expanded: boolean;
+  onToggle(): void;
   onSelect(id: string, additive: boolean): void;
   onFocusCard(id: string): void;
   onDragStart(): void;
@@ -275,9 +365,10 @@ const LayerRow = memo(function LayerRow({
   onDragOver(place: 'before' | 'after'): void;
   onDrop(place: 'before' | 'after'): void;
 }) {
+  const canCollapse = (row.kind === 'page' || row.kind === 'group') && (row.childCount ?? 0) > 0;
   return (
-    <button
-      className={`layer-row ${selected ? 'selected' : ''} ${row.indent ? 'indent' : ''} ${dragging ? 'dragging' : ''} ${dropPlace === 'before' ? 'drop-before' : ''} ${dropPlace === 'after' ? 'drop-after' : ''}`}
+    <div
+      className={`layer-row ${selected ? 'selected' : ''} ${row.indent ? 'indent' : ''} ${dragging ? 'dragging' : ''} ${dropPlace === 'before' ? 'drop-before' : ''} ${dropPlace === 'after' ? 'drop-after' : ''} ${canDrag ? 'draggable' : ''}`}
       draggable={canDrag}
       onClick={(event) => onSelect(row.id, event.shiftKey || event.metaKey)}
       onDoubleClick={() => onFocusCard(row.id)}
@@ -301,12 +392,85 @@ const LayerRow = memo(function LayerRow({
         onDrop(event.clientY < rect.top + rect.height / 2 ? 'before' : 'after');
       }}
       title={canDrag ? '拖拽调整上下层；单击选中，双击定位' : '单击选中，双击定位到画布'}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onSelect(row.id, event.shiftKey || event.metaKey);
+        }
+      }}
     >
-      {row.kind === 'image' && <img className="layer-thumb" src={row.thumbnail} alt="" loading="lazy" />}
-      {row.kind === 'missing' && <span className="layer-thumb missing">缺失</span>}
-      {ICONS[row.kind] && <span className={`layer-thumb ${row.kind}`}>{ICONS[row.kind]}</span>}
+      {row.indent && <span className="layer-tree" aria-hidden />}
+      {!row.indent && (
+        <span className="layer-chevron-slot">
+          {canCollapse ? (
+            <button
+              type="button"
+              className="layer-chevron"
+              aria-label={expanded ? '折叠' : '展开'}
+              aria-expanded={expanded}
+              onClick={(event) => {
+                event.stopPropagation();
+                onToggle();
+              }}
+            >
+              <LayerIcons.chevron className="layer-chevron-icon" expanded={expanded} />
+            </button>
+          ) : (
+            <span className="layer-chevron-spacer" />
+          )}
+        </span>
+      )}
+      <LayerLeading row={row} />
       <span className="layer-name">{row.label}</span>
       {row.badge !== undefined && <span className={`layer-badge ${row.badge === '过期' ? 'stale' : ''}`}>{row.badge}</span>}
-    </button>
+    </div>
   );
 });
+
+function LayerLeading({ row }: { row: Row }) {
+  if (row.kind === 'image' && row.thumbnail) {
+    return (
+      <span className={`layer-thumb-wrap ${row.isRef ? 'is-ref' : ''}`}>
+        <img className="layer-thumb" src={row.thumbnail} alt="" loading="lazy" />
+        {row.isRef && (
+          <span className="layer-ref-badge" title="素材引用">
+            <LayerIcons.ref className="layer-ref-badge-icon" />
+          </span>
+        )}
+      </span>
+    );
+  }
+  if (row.kind === 'missing') {
+    return (
+      <span className="layer-icon-slot kind-missing">
+        <LayerIcons.missing />
+      </span>
+    );
+  }
+  if (row.kind === 'decor') {
+    return <span className="layer-swatch" style={{ background: row.fill ?? '#E8E8ED' }} title={row.fill} />;
+  }
+  const Icon =
+    row.kind === 'page'
+      ? LayerIcons.page
+      : row.kind === 'group'
+        ? LayerIcons.group
+        : row.kind === 'block'
+          ? LayerIcons.block
+          : row.kind === 'stroke'
+            ? LayerIcons.stroke
+            : row.kind === 'sketchText'
+              ? LayerIcons.sketchText
+              : row.kind === 'prompt'
+                ? LayerIcons.prompt
+                : row.kind === 'theme'
+                  ? LayerIcons.theme
+                  : LayerIcons.image;
+  return (
+    <span className={`layer-icon-slot kind-${row.kind}`}>
+      <Icon />
+    </span>
+  );
+}

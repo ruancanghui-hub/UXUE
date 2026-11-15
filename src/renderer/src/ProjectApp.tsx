@@ -820,6 +820,7 @@ const LeftPanel = memo(function LeftPanel({ session, engine, cacheBust }: PanelP
   return (
     <LayersPanel
       state={state}
+      projectDir={session.dir}
       selectedIds={selectedIds}
       missingVersionIds={session.missingVersionIds}
       cacheBust={cacheBust}

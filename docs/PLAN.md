@@ -431,6 +431,12 @@ ADR-0009：页面内固定带为区块 → 草图 → 可叠层栈；装饰与�
 
 **验收**：`decor.test.ts` 混排 / 迁移；`npm test` / `typecheck` 通过。
 
+### 图层面板可读性（图标 · 树线 · 折叠） ✅
+
+规格见 `docs/specs/layers-panel-ui.md`。内嵌 SF 风类型图标；缩进树线；区域/页面/分组可折叠（按项目记 localStorage）；图像/引用缩略图 + 引用角标；装饰显示填充色块。不改层序与拖拽规则。
+
+**验收**：`npm test` / `typecheck` 通过；寿司大页可折叠扫视。
+
 ### 助手会话区 UI ✅
 
 规格见 `docs/specs/assistant-chat-ui.md`。助手栏默认约 420px（可拖 320–560，本机记住），属性仍 272；Cursor/Codex 风布局（列表吃满、底栏大输入、建议芯片）；助手消息基础 Markdown；上翻不抢滚、「跳到最新」。不改助手能力。
