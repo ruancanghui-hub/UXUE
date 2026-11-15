@@ -61,7 +61,7 @@ describe('parseProject', () => {
       ...prompt,
       inputs: ['c1'],
       outputCardId: null,
-      settings: { count: 4, size: 'match', quality: 'high', useTheme: true },
+      settings: { count: 4, size: 'match', quality: 'high', useTheme: true, feelings: [] },
       groupId: null,
       purpose: null,
       styleRefCardId: null,

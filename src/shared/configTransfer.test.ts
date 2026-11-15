@@ -13,7 +13,7 @@ const settings = {
   newapiAssistantModel: 'claude-sonnet-5-5',
 };
 const keys = { openai: null, siliconflow: 'sk-sf', newapi: 'sk-na' };
-const templates = [{ id: 't1', name: '3D 图标', text: '把 {{Image 1}} 做成 3D 图标', defaultSettings: { count: 1, size: 'match' as const, quality: 'medium' as const, useTheme: true } }];
+const templates = [{ id: 't1', name: '3D 图标', text: '把 {{Image 1}} 做成 3D 图标', defaultSettings: { count: 1, size: 'match' as const, quality: 'medium' as const, useTheme: true, feelings: [] } }];
 
 describe('配置迁移文件', () => {
   it('导出再读回完全一致，只带白名单里的设置（不带校准系数）', () => {

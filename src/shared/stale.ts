@@ -11,6 +11,7 @@ import {
   type PromptCard,
   type ThemeCard,
 } from './project';
+import { feelingSuffix } from './uiFeelings';
 
 export interface DocLike {
   cards: readonly CanvasCard[];
@@ -24,10 +25,15 @@ export function activeThemeOf(state: DocLike): ThemeCard | null {
   return card && isThemeCard(card) ? card : null;
 }
 
-/** 当前若提交生成会发出去的全文（提示词正文 + 可选主题后缀） */
+/** 当前若提交生成会发出去的全文（提示词正文 + 可选主题后缀 + 可选界面感觉） */
 export function expectedPromptText(prompt: PromptCard, state: DocLike): string {
   const theme = prompt.settings.useTheme ? activeThemeOf(state) : null;
-  return renderPrompt(prompt.text, 'image').text + (theme ? `\n\n${themeSuffix(theme)}` : '');
+  const feelings = feelingSuffix(prompt.settings.feelings ?? []);
+  return (
+    renderPrompt(prompt.text, 'image').text +
+    (theme ? `\n\n${themeSuffix(theme)}` : '') +
+    (feelings ? `\n\n${feelings}` : '')
+  );
 }
 
 /**

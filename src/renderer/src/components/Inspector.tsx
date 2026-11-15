@@ -48,6 +48,7 @@ import {
   type ThemeRules,
 } from '../../../shared/project';
 import { isImageCardStale, regenPromptIdsForSelection } from '../../../shared/stale';
+import { UI_FEELINGS, feelingSuffix, toggleFeeling, type UiFeelingId } from '../../../shared/uiFeelings';
 import type { DocumentStore } from '../document/DocumentStore';
 import {
   blockHasOutput,
@@ -473,6 +474,7 @@ function PromptInfo(props: InspectorProps & { card: PromptCard; textareaRef: Rea
           <p className="hint">NewAPI 中转：改图请用 gpt-image 系模型；DALL·E 只支持文生图。费用以中转站为准。</p>
         )}
         <ThemeToggle card={card} state={state} onSettings={props.onSettings} />
+        <FeelingToggle card={card} onSettings={props.onSettings} />
         <Field label="费用估算" value={costLabel} />
         <button className="primary" disabled={!!problem || busy} onClick={() => props.onGenerate(card.id)}>
           {busy ? '生成中…' : `生成 ×${card.settings.count}  ⌘↩`}
@@ -1166,6 +1168,41 @@ function ThemeToggle({ card, state, onSettings }: { card: PromptCard; state: Doc
         <details className="theme-preview">
           <summary>查看会附加的内容</summary>
           <pre>{themeSuffix(theme)}</pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function FeelingToggle({ card, onSettings }: { card: PromptCard; onSettings: InspectorProps['onSettings'] }) {
+  const feelings = card.settings.feelings ?? [];
+  const suffix = feelingSuffix(feelings);
+  return (
+    <div className="feeling-toggle">
+      <div className="field">
+        <span className="field-label">界面感觉</span>
+        <div className="segmented small feeling-segmented">
+          {UI_FEELINGS.map((feeling) => {
+            const active = feelings.includes(feeling.id);
+            return (
+              <button
+                key={feeling.id}
+                type="button"
+                className={active ? 'active' : ''}
+                title={feeling.title}
+                onClick={() => onSettings(card.id, { feelings: toggleFeeling(feelings, feeling.id as UiFeelingId) })}
+              >
+                {feeling.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <p className="hint">可多选；生成时按「秩序 → 克制 → 从容」附加。与主题规则独立。</p>
+      {suffix && (
+        <details className="theme-preview">
+          <summary>查看会附加的感觉</summary>
+          <pre>{suffix}</pre>
         </details>
       )}
     </div>

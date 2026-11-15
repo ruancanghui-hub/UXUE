@@ -1,5 +1,7 @@
 /** 生成相关的规则：主进程和渲染进程共用，保证估算、校验和实际请求一致 */
 
+import type { UiFeelingId } from './uiFeelings';
+
 export type ProviderId = 'openai' | 'siliconflow' | 'newapi' | 'mock';
 export type AssistantProviderId = 'openai' | 'newapi' | 'mock';
 export type Currency = 'USD' | 'CNY';
@@ -117,9 +119,17 @@ export interface PromptSettings {
   quality: Quality;
   /** 生成时是否附加生效主题卡的规则 */
   useTheme: boolean;
+  /** 界面感觉（可多选）；空 = 不附加 */
+  feelings: UiFeelingId[];
 }
 
-export const DEFAULT_PROMPT_SETTINGS: PromptSettings = { count: 2, size: 'match', quality: 'medium', useTheme: true };
+export const DEFAULT_PROMPT_SETTINGS: PromptSettings = {
+  count: 2,
+  size: 'match',
+  quality: 'medium',
+  useTheme: true,
+  feelings: [],
+};
 
 /** OpenAI 图像接口对自定义尺寸的限制 */
 const SIZE_STEP = 16;

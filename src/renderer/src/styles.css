@@ -354,6 +354,16 @@ kbd {
   font-size: 12px;
 }
 
+.feeling-toggle {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.feeling-segmented {
+  flex-wrap: wrap;
+}
+
 .button.small,
 button.small {
   font-size: 11px;

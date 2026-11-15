@@ -17,6 +17,7 @@ import {
   type ThemeCard,
   type Version,
 } from '../../../shared/project';
+import { feelingSuffix } from '../../../shared/uiFeelings';
 import type { PromptJobView } from '../canvas/PromptNode';
 import { applyGenerationResult, outputPlacement, setCurrentVersion, type DocState } from '../document/operations';
 import type { ProjectSession } from './ProjectSession';
@@ -107,7 +108,11 @@ export class GenerationTracker {
     const theme = prompt.settings.useTheme ? activeTheme(state) : null;
     const firstInputSize = inputs[0] ? { width: inputs[0].width, height: inputs[0].height } : null;
     const finalPlan = planGeneration(config, prompt.settings, firstInputSize, inputs.length);
-    const rendered = renderPrompt(prompt.text, finalPlan.promptStyle).text + (theme ? `\n\n${themeSuffix(theme)}` : '');
+    const feelings = feelingSuffix(prompt.settings.feelings ?? []);
+    const rendered =
+      renderPrompt(prompt.text, finalPlan.promptStyle).text +
+      (theme ? `\n\n${themeSuffix(theme)}` : '') +
+      (feelings ? `\n\n${feelings}` : '');
     const size = finalPlan.size ?? firstInputSize ?? { width: 1024, height: 1024 };
     const request: GenerationRequest = {
       jobId: crypto.randomUUID(),

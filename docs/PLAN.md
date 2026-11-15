@@ -449,6 +449,12 @@ ADR-0009：页面内固定带为区块 → 草图 → 可叠层栈；装饰与�
 
 **验收**：`projectDocs.test.ts`；`npm test` / `typecheck` 通过。
 
+### 界面感觉（秩序 · 克制 · 从容） ✅
+
+规格见 `docs/specs/ui-feelings.md`。提示词卡生成参数可多选气质后缀，与主题独立；转线框等专用路径不带。
+
+**验收**：`uiFeelings.test.ts`；`npm test` / `typecheck` 通过。
+
 ### 助手会话区 UI ✅
 
 规格见 `docs/specs/assistant-chat-ui.md`。助手栏默认约 420px（可拖 320–560，本机记住），属性仍 272；Cursor/Codex 风布局（列表吃满、底栏大输入、建议芯片）；助手消息基础 Markdown；上翻不抢滚、「跳到最新」。不改助手能力。

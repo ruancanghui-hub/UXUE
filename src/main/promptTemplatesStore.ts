@@ -3,6 +3,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { PromptTemplate } from '../shared/api';
 import { DEFAULT_PROMPT_SETTINGS, MAX_COUNT, MIN_COUNT, QUALITIES, SIZE_OPTIONS, type PromptSettings } from '../shared/generation';
+import { normalizeFeelings } from '../shared/uiFeelings';
 
 /**
  * 全局提示词模板，存在 userData/prompt-templates.json，跨项目复用。
@@ -106,5 +107,6 @@ function normalizeSettings(settings: PromptSettings): PromptSettings {
     size: SIZE_OPTIONS.some((o) => o.id === settings.size) ? settings.size : DEFAULT_PROMPT_SETTINGS.size,
     quality: QUALITIES.some((q) => q.id === settings.quality) ? settings.quality : DEFAULT_PROMPT_SETTINGS.quality,
     useTheme: settings.useTheme !== false,
+    feelings: normalizeFeelings(settings.feelings),
   };
 }

@@ -1,4 +1,5 @@
 import { DEFAULT_PROMPT_SETTINGS, MAX_COUNT, MIN_COUNT, QUALITIES, SIZE_OPTIONS, type PromptSettings } from './generation';
+import { normalizeFeelings } from './uiFeelings';
 
 export const PROJECT_FILE = 'project.json';
 /** 当前写入版本；打开时兼容 schema 1–3（3 = 页面可叠层栈混排） */
@@ -969,6 +970,7 @@ function parsePromptCard(value: Record<string, unknown>): PromptCard | null {
         ? (settings.quality as PromptSettings['quality'])
         : DEFAULT_PROMPT_SETTINGS.quality,
       useTheme: typeof settings.useTheme === 'boolean' ? settings.useTheme : DEFAULT_PROMPT_SETTINGS.useTheme,
+      feelings: normalizeFeelings(settings.feelings),
     },
     groupId: parseGroupId(value.groupId),
     purpose: value.purpose === 'wireframe' || value.purpose === 'sketch' || value.purpose === 'element' ? value.purpose : null,

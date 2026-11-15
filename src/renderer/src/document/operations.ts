@@ -317,7 +317,9 @@ export function updatePrompt(state: DocState, id: string, patch: Partial<Pick<Pr
       next.name === card.name &&
       next.settings.count === card.settings.count &&
       next.settings.size === card.settings.size &&
-      next.settings.quality === card.settings.quality;
+      next.settings.quality === card.settings.quality &&
+      next.settings.useTheme === card.settings.useTheme &&
+      (next.settings.feelings ?? []).join() === (card.settings.feelings ?? []).join();
     return unchanged ? card : next;
   });
 }
@@ -1266,7 +1268,7 @@ export function applyElementList(
         text: draft.text,
         inputs: [],
         outputCardId: null,
-        settings: { count: 1, size: ELEMENT_SIZE[draft.category], quality: 'medium', useTheme: true },
+        settings: { count: 1, size: ELEMENT_SIZE[draft.category], quality: 'medium', useTheme: true, feelings: [] },
         groupId,
         purpose: 'element',
         styleRefCardId: null,
@@ -1338,7 +1340,7 @@ export const WIREFRAME_PROMPT = [
   '【不要】渐变、阴影、质感、光效、照片纹理；不要增加或删除元素，画面比例与原图一致。',
 ].join('\n');
 
-const WIREFRAME_SETTINGS: PromptSettings = { count: 1, size: 'match', quality: 'medium', useTheme: false };
+const WIREFRAME_SETTINGS: PromptSettings = { count: 1, size: 'match', quality: 'medium', useTheme: false, feelings: [] };
 
 /** 在图像卡右侧建一张转线框提示词卡：固定提示词、绑定这张图、不附加主题规则 */
 export function createWireframePrompt(
