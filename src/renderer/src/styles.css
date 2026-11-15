@@ -898,6 +898,85 @@ button.icon:hover:not(:disabled) {
   color: var(--good);
 }
 
+.minimap {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 4;
+  width: 212px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(18px) saturate(140%);
+  overflow: hidden;
+  user-select: none;
+}
+
+.minimap.collapsed {
+  width: auto;
+}
+
+.minimap-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px 2px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.minimap-toggle {
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 999px;
+}
+
+.minimap-toggle.ghost {
+  padding: 0 6px;
+  min-width: 22px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+}
+
+.minimap-svg {
+  display: block;
+  margin: 0 6px 6px;
+  border-radius: 6px;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.minimap-bg {
+  fill: rgba(0, 0, 0, 0.35);
+}
+
+.minimap-label {
+  fill: rgba(220, 220, 230, 0.55);
+  font-size: 9px;
+  pointer-events: none;
+}
+
+.minimap-card {
+  stroke: transparent;
+  stroke-width: 1;
+  pointer-events: none;
+}
+
+.minimap-card.selected {
+  stroke: #fff;
+  stroke-width: 1.25;
+  fill-opacity: 1;
+}
+
+.minimap-view {
+  fill: rgba(124, 140, 255, 0.12);
+  stroke: var(--accent-strong);
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+
 .queue-panel {
   position: absolute;
   left: 12px;

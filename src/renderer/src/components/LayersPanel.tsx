@@ -396,7 +396,7 @@ const LayerRow = memo(function LayerRow({
         const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
         onDrop(event.clientY < rect.top + rect.height / 2 ? 'before' : 'after');
       }}
-      title={canDrag ? '拖拽调整上下层；单击选中，双击定位' : '单击选中，双击定位到画布'}
+      title={canDrag ? '拖拽调整上下层；单击选中并定位，双击缩放到对象' : '单击选中并定位，双击缩放到对象'}
       role="button"
       tabIndex={0}
       onKeyDown={(event) => {

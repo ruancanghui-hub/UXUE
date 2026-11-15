@@ -74,6 +74,7 @@ import { snapPoint, snapRectMove, snapThresholdCanvas, type SnapGuide } from './
 import { ThemeNode } from './ThemeNode';
 import { TextureManager, type TextureStats } from './TextureManager';
 import { clamp, MAX_ZOOM, MIN_ZOOM, Viewport } from './Viewport';
+import { panCenterToReveal } from './viewReveal';
 
 /** block：区块；decor：页面装饰；pen / text / eraser：布局草图 */
 export type Tool = 'select' | 'hand' | 'block' | 'decor' | 'pen' | 'text' | 'eraser';
@@ -553,6 +554,32 @@ export class CanvasEngine {
   zoomToCard(id: string): void {
     const card = this.doc.get().cards.find((c) => c.id === id);
     if (card) this.animateToRect(card, true, 0.6);
+  }
+
+  /** 不改缩放；对象已完整在视口内则不动。用于图层面板单击定位。 */
+  revealCard(id: string): void {
+    const card = this.doc.get().cards.find((c) => c.id === id);
+    if (!card) return;
+    const view = this.viewport.visibleWorldRect();
+    const padding = 64 / this.viewport.zoom;
+    const next = panCenterToReveal(view, card, padding);
+    if (!next) return;
+    this.animateTo(next.x, next.y, this.viewport.zoom);
+  }
+
+  /** 把视口中心移到世界坐标；可选短动画。缩放不变。 */
+  centerViewOn(worldX: number, worldY: number, animate = false): void {
+    if (animate) {
+      this.animateTo(worldX, worldY, this.viewport.zoom);
+      return;
+    }
+    this.animation = null;
+    this.viewport.centerOn(worldX, worldY);
+    this.viewChanged = true;
+  }
+
+  visibleWorldRect(): Rect {
+    return this.viewport.visibleWorldRect();
   }
 
   flyToRegion(id: RegionId): void {

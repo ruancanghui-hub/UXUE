@@ -461,6 +461,12 @@ ADR-0009：页面内固定带为区块 → 草图 → 可叠层栈；装饰与�
 
 **验收**：`selectionModifiers.test.ts`；`npm test` / `typecheck` 通过。
 
+### 图层 reveal · 画布鸟瞰 ✅
+
+规格见 `docs/specs/canvas-minimap.md`。图层面板单击：对象不在视口内则平移进视口（不改缩放）；双击仍缩放。右下角画布鸟瞰：区域+卡片示意、视口框可拖、点击跳转、可收起并本机记住。
+
+**验收**：`viewReveal.test.ts`、`minimapLayout.test.ts`；`npm test` / `typecheck` 通过。
+
 ### 助手会话区 UI ✅
 
 规格见 `docs/specs/assistant-chat-ui.md`。助手栏默认约 420px（可拖 320–560，本机记住），属性仍 272；Cursor/Codex 风布局（列表吃满、底栏大输入、建议芯片）；助手消息基础 Markdown；上翻不抢滚、「跳到最新」。不改助手能力。

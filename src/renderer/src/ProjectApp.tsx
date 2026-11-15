@@ -11,6 +11,7 @@ import { CommandPalette, type PaletteCommand } from './components/CommandPalette
 import { Inspector, type InspectorHandle } from './components/Inspector';
 import { DocsPanel } from './components/DocsPanel';
 import { LayersPanel } from './components/LayersPanel';
+import { Minimap } from './components/Minimap';
 import { PerfPanel } from './components/PerfPanel';
 import { ProjectTopBar } from './components/ProjectTopBar';
 import { QueuePanel } from './components/QueuePanel';
@@ -772,6 +773,7 @@ export function ProjectApp() {
             </div>
           )}
           <CanvasView onEngine={handleEngine} />
+          {session && engine && <Minimap engine={engine} doc={session.doc} selection={session.selection} />}
           {showPerf && status && <PerfPanel status={status} uncapped={false} firstPaintMs={null} />}
           {session && status?.itemCount === 0 && importing === 0 && (
             <div className="empty-hint">
@@ -875,8 +877,12 @@ const LeftPanel = memo(function LeftPanel({
   const state = useCommittedDoc(session.doc);
   const selectedIds = useSelectionIds(session.selection);
   const onSelect = useCallback(
-    (id: string, additive: boolean) => (additive ? session.selection.toggle(id) : session.selection.set([id])),
-    [session],
+    (id: string, additive: boolean) => {
+      if (additive) session.selection.toggle(id);
+      else session.selection.set([id]);
+      engine.revealCard(id);
+    },
+    [session, engine],
   );
   const onFocusCard = useCallback(
     (id: string) => {
