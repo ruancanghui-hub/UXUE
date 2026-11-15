@@ -48,7 +48,7 @@
 
 - 三个"菜单"就是三个**区域**：点击顶栏的区域按钮（或 Cmd+1/2/3），画布平滑飞到该区域；"聚焦"（Cmd+Shift+F）会淡化其他区域。
 - 选中图像卡时，属性面板显示**版本栈**（新版本在前，点一下切换当前版本）。
-- 快捷键照搬 Figma：空格拖动画布、双指平移与捏合缩放、Cmd + 滚轮缩放、V / H、框选、Shift 加选、拖动四角等比缩放、方向键微调（Shift 一次 10）、Delete、Cmd+Z / Shift+Cmd+Z、Cmd+A、Cmd+D 创建副本、Cmd+Shift+] / [ 移到最前 / 最后、Shift+1 缩放到全部、Shift+2 缩放到选中、Shift+0 回到 100%、Cmd+= / Cmd+- 放大缩小、Cmd+Shift+K 导入图片、Cmd+Alt+P 性能面板。
+- 快捷键照搬 Figma：空格拖动画布、双指平移与捏合缩放、Cmd + 滚轮缩放、V / H、框选、**Shift/⌘ 点选或框选加减**、**⌥ 框选减选**、拖动四角等比缩放、方向键微调（Shift 一次 10）、Delete、Cmd+Z / Shift+Cmd+Z、Cmd+A、Cmd+D 创建副本、Cmd+Shift+] / [ 移到最前 / 最后、Shift+1 缩放到全部、Shift+2 缩放到选中、Shift+0 回到 100%、Cmd+= / Cmd+- 放大缩小、Cmd+Shift+K 导入图片、Cmd+Alt+P 性能面板。详见 `docs/specs/canvas-selection.md`。
 - 撤销、重做、全选由菜单转发给渲染进程：菜单快捷键会先于网页收到按键，焦点在输入框里时转成输入框自己的撤销和全选。Shift+1 这类画布专用键只在菜单里显示、不注册，避免在输入框里打 "!" 时被截走。
 
 ## 4. 架构
@@ -454,6 +454,12 @@ ADR-0009：页面内固定带为区块 → 草图 → 可叠层栈；装饰与�
 规格见 `docs/specs/ui-feelings.md`。提示词卡生成参数可多选气质后缀，与主题独立；转线框等专用路径不带。
 
 **验收**：`uiFeelings.test.ts`；`npm test` / `typecheck` 通过。
+
+### 画布多选加减（点选 · 框选） ✅
+
+规格见 `docs/specs/canvas-selection.md`。画布与图层一致：Shift/⌘ 加减选；⌥ 框选从选区减去。
+
+**验收**：`selectionModifiers.test.ts`；`npm test` / `typecheck` 通过。
 
 ### 助手会话区 UI ✅
 

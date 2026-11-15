@@ -69,6 +69,7 @@ import { Selection } from '../document/Selection';
 import { expandRect, intersects, rectFromPoints, unionRects, type Rect } from './geometry';
 import { PerfMonitor } from './PerfMonitor';
 import { PromptNode, type PromptJobView } from './PromptNode';
+import { applyMarqueeSelection, marqueeMode, selectionAdditive, type MarqueeMode } from './selectionModifiers';
 import { snapPoint, snapRectMove, snapThresholdCanvas, type SnapGuide } from './snap';
 import { ThemeNode } from './ThemeNode';
 import { TextureManager, type TextureStats } from './TextureManager';
@@ -115,7 +116,14 @@ type Interaction =
       /** 拖着图像卡经过的页面框：松手就放进去变成引用 */
       dropPageId: string | null;
     }
-  | { kind: 'marquee'; startWorldX: number; startWorldY: number; base: Set<string>; rect: Rect }
+  | {
+      kind: 'marquee';
+      startWorldX: number;
+      startWorldY: number;
+      base: Set<string>;
+      mode: MarqueeMode;
+      rect: Rect;
+    }
   | {
       kind: 'resize';
       corner: Corner;
@@ -1771,13 +1779,15 @@ export class CanvasEngine {
     const hit = this.hitTest(world.x, world.y);
 
     if (!hit) {
-      const base = event.shiftKey ? new Set(this.selection.get()) : new Set<string>();
-      if (!event.shiftKey) this.selection.set([]);
+      const mode = marqueeMode(event);
+      const base = mode === 'replace' ? new Set<string>() : new Set(this.selection.get());
+      if (mode === 'replace') this.selection.set([]);
       this.interaction = {
         kind: 'marquee',
         startWorldX: world.x,
         startWorldY: world.y,
         base,
+        mode,
         rect: { x: world.x, y: world.y, width: 0, height: 0 },
       };
       return;
@@ -1792,7 +1802,7 @@ export class CanvasEngine {
     }
 
     let toggleOnClickId: string | null = null;
-    if (event.shiftKey) {
+    if (selectionAdditive(event)) {
       if (this.selection.has(hit.id)) toggleOnClickId = hit.id;
       else this.selection.toggle(hit.id);
     } else if (!this.selection.has(hit.id)) {
@@ -1855,9 +1865,11 @@ export class CanvasEngine {
       case 'marquee': {
         const world = this.viewport.screenToWorld(x, y);
         interaction.rect = rectFromPoints(interaction.startWorldX, interaction.startWorldY, world.x, world.y);
-        const ids = new Set(interaction.base);
-        for (const card of this.doc.get().cards) if (intersects(card, interaction.rect) && !this.isHiddenSketch(card)) ids.add(card.id);
-        this.selection.set(ids);
+        const hitIds: string[] = [];
+        for (const card of this.doc.get().cards) {
+          if (intersects(card, interaction.rect) && !this.isHiddenSketch(card)) hitIds.push(card.id);
+        }
+        this.selection.set(applyMarqueeSelection(interaction.base, hitIds, interaction.mode));
         this.overlayDirty = true;
         return;
       }
