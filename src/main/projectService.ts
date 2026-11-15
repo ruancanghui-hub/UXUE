@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { watch, type FSWatcher } from 'node:fs';
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
-import { basename, join } from 'node:path';
-import type { ImportResult, ImportSource, OpenedProject, ProjectFsChange, RecentProject } from '../shared/api';
+import { basename, dirname, join } from 'node:path';
+import type { ImportResult, ImportSource, OpenedProject, ProjectDocSnapshot, ProjectFsChange, RecentProject } from '../shared/api';
 import { safeFileName } from '../shared/export';
+import { PROJECT_DOCS, projectDocTemplate, type ProjectDocRole } from '../shared/projectDocs';
 import { emptyProject, isImageCard, isPageCard, parseProject, PROJECT_FILE, type ProjectFile, type Version } from '../shared/project';
 import type { EnsureCacheResult, ImportedImage } from '../shared/workerProtocol';
 import type { ImageWorkerClient } from './imageWorkerClient';
@@ -78,6 +79,7 @@ export class ProjectService {
 
     this.current = { dir };
     this.onRootChanged(dir);
+    await this.ensureProjectDocs(dir);
     this.startWatch(dir);
     if (this.trackRecent) await this.touchRecent(dir);
 
@@ -131,6 +133,43 @@ export class ProjectService {
     const path = join(dir, THEMES_DIR, `${safeFileName(name)}.md`);
     await writeFile(path, markdown);
     return path;
+  }
+
+  async listProjectDocs(): Promise<ProjectDocSnapshot[]> {
+    const dir = this.requireDir();
+    await this.ensureProjectDocs(dir);
+    return Promise.all(PROJECT_DOCS.map((meta) => this.readDocAt(dir, meta.role)));
+  }
+
+  async readProjectDoc(role: ProjectDocRole): Promise<ProjectDocSnapshot> {
+    const dir = this.requireDir();
+    await this.ensureProjectDocs(dir);
+    return this.readDocAt(dir, role);
+  }
+
+  async writeProjectDoc(role: ProjectDocRole, content: string): Promise<ProjectDocSnapshot> {
+    const dir = this.requireDir();
+    const meta = PROJECT_DOCS.find((doc) => doc.role === role);
+    if (!meta) throw new Error('未知的文稿类型');
+    const absolutePath = join(dir, meta.relativePath);
+    this.ignoreUntil = Date.now() + OWN_SAVE_IGNORE_MS;
+    await mkdir(dirname(absolutePath), { recursive: true });
+    await writeFile(absolutePath, content.replace(/\r\n/g, '\n'), 'utf8');
+    this.ignoreUntil = Date.now() + OWN_SAVE_IGNORE_MS;
+    return this.readDocAt(dir, role);
+  }
+
+  /** 缺失的四类文稿写入简短中文模板；已有文件不动 */
+  async ensureProjectDocs(dir: string): Promise<void> {
+    const projectName = basename(dir);
+    for (const meta of PROJECT_DOCS) {
+      const absolutePath = join(dir, meta.relativePath);
+      if (await exists(absolutePath)) continue;
+      this.ignoreUntil = Date.now() + OWN_SAVE_IGNORE_MS;
+      await mkdir(dirname(absolutePath), { recursive: true });
+      await writeFile(absolutePath, projectDocTemplate(meta.role, projectName), 'utf8');
+      this.ignoreUntil = Date.now() + OWN_SAVE_IGNORE_MS;
+    }
   }
 
   async importImages(sources: ImportSource[]): Promise<ImportResult> {
@@ -208,6 +247,10 @@ export class ProjectService {
         }
         if (relative === 'assets' || relative.startsWith('assets/')) {
           this.events.onFsChange({ kind: 'assets', path: join(dir, relative) });
+          return;
+        }
+        if (relative === 'AGENTS.md' || relative === 'docs' || relative.startsWith('docs/')) {
+          this.events.onFsChange({ kind: 'docs', path: join(dir, relative) });
         }
       });
       this.watcher.on('error', (error) => console.warn('[watch]', error));
@@ -261,6 +304,30 @@ export class ProjectService {
     await writeFile(join(dir, PROJECT_FILE), text);
     this.lastSavedHash = hashProjectText(text);
     if (!(await exists(join(dir, '.gitignore')))) await writeFile(join(dir, '.gitignore'), PROJECT_GITIGNORE);
+    await this.ensureProjectDocs(dir);
+  }
+
+  private requireDir(): string {
+    const dir = this.current?.dir;
+    if (!dir) throw new Error('还没有打开项目');
+    return dir;
+  }
+
+  private async readDocAt(dir: string, role: ProjectDocRole): Promise<ProjectDocSnapshot> {
+    const meta = PROJECT_DOCS.find((doc) => doc.role === role);
+    if (!meta) throw new Error('未知的文稿类型');
+    const absolutePath = join(dir, meta.relativePath);
+    const content = await readFile(absolutePath, 'utf8').catch(() => '');
+    const fileExists = await exists(absolutePath);
+    return {
+      role: meta.role,
+      relativePath: meta.relativePath,
+      label: meta.label,
+      description: meta.description,
+      exists: fileExists,
+      content,
+      absolutePath,
+    };
   }
 
   private async touchRecent(dir: string): Promise<void> {

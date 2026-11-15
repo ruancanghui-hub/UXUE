@@ -9,6 +9,7 @@ import { AssistantPanel } from './components/AssistantPanel';
 import { CanvasView } from './components/CanvasView';
 import { CommandPalette, type PaletteCommand } from './components/CommandPalette';
 import { Inspector, type InspectorHandle } from './components/Inspector';
+import { DocsPanel } from './components/DocsPanel';
 import { LayersPanel } from './components/LayersPanel';
 import { PerfPanel } from './components/PerfPanel';
 import { ProjectTopBar } from './components/ProjectTopBar';
@@ -19,6 +20,7 @@ import {
   addBlock,
   addCards,
   addVersions,
+  createPromptCard,
   createWireframePrompt,
   fitIntoPage,
   newPageFromImageCard,
@@ -45,6 +47,7 @@ import {
   updatePrompt,
   updateTheme,
 } from './document/operations';
+import { designSpecImagePromptFallback, designSpecSummarizeMessage } from '../../shared/projectDocs';
 import { AssistantSession } from './project/AssistantSession';
 import { GenerationTracker, type TrackedJob } from './project/GenerationTracker';
 import { useCommittedDoc, useSelectionIds } from './project/hooks';
@@ -358,6 +361,57 @@ export function ProjectApp() {
       }
     },
     [toast, tracker],
+  );
+
+  const [generatingDesignSpec, setGeneratingDesignSpec] = useState(false);
+  const generateDesignSpecImage = useCallback(
+    async (markdown: string) => {
+      const current = sessionRef.current;
+      const canvas = engineRef.current;
+      if (!current || !canvas) return;
+      setGeneratingDesignSpec(true);
+      try {
+        let promptText = designSpecImagePromptFallback(markdown);
+        try {
+          const response = await window.anye.askAssistant({
+            projectDir: current.dir,
+            projectName: current.name,
+            message: designSpecSummarizeMessage(markdown),
+            history: [],
+            images: [],
+            activeTheme: null,
+            selectedPrompts: [],
+            task: 'chat',
+          });
+          const fromDraft = response.prompts[0]?.text?.trim();
+          const fromReply = response.reply?.trim();
+          if (fromDraft) promptText = fromDraft;
+          else if (fromReply && fromReply.length > 40) promptText = fromReply;
+        } catch {
+          // 助手失败则用本地截断模板
+        }
+        const assets = current.doc.get().regions.find((region) => region.id === 'assets');
+        const center = assets
+          ? { x: assets.x + assets.width / 2, y: assets.y + Math.min(800, assets.height / 3) }
+          : canvas.viewCenterWorld();
+        const { state, card } = createPromptCard(current.doc.get(), [], center, () => crypto.randomUUID());
+        const named = updatePrompt(state, card.id, {
+          name: '设计规范图',
+          text: promptText,
+          settings: { count: 1 },
+        });
+        current.doc.apply('从设计规范生成提示词', named);
+        current.selection.set([card.id]);
+        canvas.zoomToCard(card.id);
+        await generate(card.id);
+        toast('已提交「设计规范图」生成');
+      } catch (error) {
+        toast(error instanceof Error ? error.message : String(error), 'error');
+      } finally {
+        setGeneratingDesignSpec(false);
+      }
+    },
+    [generate, toast],
   );
 
   /** 按拓扑顺序依次提交；前一个完成后再发下一个，保证下游吃到新版本 */
@@ -681,7 +735,15 @@ export function ProjectApp() {
       )}
 
       <div className="workspace-row">
-        {session && engine && <LeftPanel session={session} engine={engine} cacheBust={cacheBust} />}
+        {session && engine && (
+          <LeftPanel
+            session={session}
+            engine={engine}
+            cacheBust={cacheBust}
+            onGenerateDesignSpec={(markdown) => generateDesignSpecImage(markdown)}
+            generatingDesignSpec={generatingDesignSpec}
+          />
+        )}
 
         <main
           className={`workspace ${dropActive ? 'drop-active' : ''}`}
@@ -793,11 +855,23 @@ interface PanelProps {
   cacheBust: ReadonlyMap<string, number>;
 }
 
+interface LeftPanelProps extends PanelProps {
+  onGenerateDesignSpec(markdown: string): Promise<void>;
+  generatingDesignSpec: boolean;
+}
+
 /**
  * 面板只订阅提交后的文档，拖动过程中不会重渲染；
  * 用 memo 隔开 ProjectApp 每秒 4 次的状态刷新，否则图层列表会跟着整体重渲染、挤占画布的帧。
  */
-const LeftPanel = memo(function LeftPanel({ session, engine, cacheBust }: PanelProps) {
+const LeftPanel = memo(function LeftPanel({
+  session,
+  engine,
+  cacheBust,
+  onGenerateDesignSpec,
+  generatingDesignSpec,
+}: LeftPanelProps) {
+  const [leftTab, setLeftTab] = useState<'layers' | 'docs'>('layers');
   const state = useCommittedDoc(session.doc);
   const selectedIds = useSelectionIds(session.selection);
   const onSelect = useCallback(
@@ -818,16 +892,31 @@ const LeftPanel = memo(function LeftPanel({ session, engine, cacheBust }: PanelP
     [session],
   );
   return (
-    <LayersPanel
-      state={state}
-      projectDir={session.dir}
-      selectedIds={selectedIds}
-      missingVersionIds={session.missingVersionIds}
-      cacheBust={cacheBust}
-      onSelect={onSelect}
-      onFocusCard={onFocusCard}
-      onReorderPageStack={onReorderPageStack}
-    />
+    <aside className="side-panel left-shell">
+      <div className="left-tabs segmented small">
+        <button type="button" className={leftTab === 'layers' ? 'active' : ''} onClick={() => setLeftTab('layers')}>
+          图层
+        </button>
+        <button type="button" className={leftTab === 'docs' ? 'active' : ''} onClick={() => setLeftTab('docs')}>
+          文稿
+        </button>
+      </div>
+      {leftTab === 'layers' ? (
+        <LayersPanel
+          state={state}
+          projectDir={session.dir}
+          selectedIds={selectedIds}
+          missingVersionIds={session.missingVersionIds}
+          cacheBust={cacheBust}
+          onSelect={onSelect}
+          onFocusCard={onFocusCard}
+          onReorderPageStack={onReorderPageStack}
+          embedded
+        />
+      ) : (
+        <DocsPanel onGenerateDesignSpec={onGenerateDesignSpec} generating={generatingDesignSpec} />
+      )}
+    </aside>
   );
 });
 

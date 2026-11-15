@@ -322,6 +322,11 @@ function registerIpc(): void {
   });
   ipcMain.handle('clipboard:write', (_event, text: string) => clipboard.writeText(String(text)));
   ipcMain.handle('theme:save-markdown', (_event, name: string, markdown: string) => projects.saveThemeMarkdown(name, markdown));
+  ipcMain.handle('docs:list', () => projects.listProjectDocs());
+  ipcMain.handle('docs:read', (_event, role: import('../shared/projectDocs').ProjectDocRole) => projects.readProjectDoc(role));
+  ipcMain.handle('docs:write', (_event, role: import('../shared/projectDocs').ProjectDocRole, content: string) =>
+    projects.writeProjectDoc(role, content),
+  );
   ipcMain.handle('images:import', (_event, sources: ImportSource[]) => projects.importImages(sources));
 
   ipcMain.on('shell:reveal', (_event, path: string) => shell.showItemInFolder(path));

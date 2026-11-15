@@ -20,8 +20,21 @@ export interface PromptTemplate {
 }
 
 export interface ProjectFsChange {
-  kind: 'project' | 'assets';
+  kind: 'project' | 'assets' | 'docs';
   path: string;
+}
+
+export type ProjectDocRole = import('./projectDocs').ProjectDocRole;
+
+export interface ProjectDocSnapshot {
+  role: ProjectDocRole;
+  relativePath: string;
+  label: string;
+  description: string;
+  /** 文件是否已在磁盘上（ensure 后应为 true） */
+  exists: boolean;
+  content: string;
+  absolutePath: string;
 }
 
 export type CheckPhase = 'write' | 'verify';
@@ -154,6 +167,10 @@ export interface AnyeApi {
   copyText(text: string): Promise<void>;
   /** 主题说明写到当前项目的 themes/名字.md（同名覆盖），返回完整路径 */
   saveThemeMarkdown(name: string, markdown: string): Promise<string>;
+  /** 列出四类项目文稿（缺失则先写入模板） */
+  listProjectDocs(): Promise<ProjectDocSnapshot[]>;
+  readProjectDoc(role: ProjectDocRole): Promise<ProjectDocSnapshot>;
+  writeProjectDoc(role: ProjectDocRole, content: string): Promise<ProjectDocSnapshot>;
   onCacheReady(listener: (versionId: string) => void): () => void;
   onMenuCommand(listener: (command: MenuCommand) => void): () => void;
   /** 项目目录被外部改动时（忽略自己保存后的短窗口） */

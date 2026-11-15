@@ -37,6 +37,8 @@ interface LayersPanelProps {
   onFocusCard(id: string): void;
   /** orderedIds：从下到上；仅同页可叠层（装饰 / 引用） */
   onReorderPageStack?(pageId: string, orderedIds: string[]): void;
+  /** 嵌在左侧壳里时不再包一层 aside */
+  embedded?: boolean;
 }
 
 type RowKind = 'image' | 'missing' | 'prompt' | 'theme' | 'page' | 'group' | 'ref' | 'block' | 'sketchText' | 'stroke' | 'decor';
@@ -86,6 +88,7 @@ export function LayersPanel({
   onSelect,
   onFocusCard,
   onReorderPageStack,
+  embedded = false,
 }: LayersPanelProps) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; place: 'before' | 'after' } | null>(null);
@@ -272,9 +275,9 @@ export function LayersPanel({
     setDropTarget(null);
   };
 
-  return (
-    <aside className="side-panel layers-panel">
-      <div className="panel-title">图层</div>
+  const body = (
+    <>
+      {!embedded && <div className="panel-title">图层</div>}
       <div className="layers-scroll">
         {groups.map((group) => {
           const regionKey = `region:${group.id}`;
@@ -332,8 +335,10 @@ export function LayersPanel({
           );
         })}
       </div>
-    </aside>
+    </>
   );
+  if (embedded) return <div className="layers-panel layers-panel-embedded">{body}</div>;
+  return <aside className="side-panel layers-panel">{body}</aside>;
 }
 
 const LayerRow = memo(function LayerRow({

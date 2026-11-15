@@ -108,7 +108,13 @@ interface ModelProvider {
 ```
 寿司点餐/
 ├── project.json        # 画布结构：所有对象、连线、视口、生效主题卡
+├── AGENTS.md           # 代理说明文稿（给外部 Agent）
 ├── .gitignore          # 新建项目时写入，忽略 .cache/
+├── docs/               # 项目文稿：PRD / 界面简报 / 设计规范
+│   ├── PRD.md
+│   ├── 界面简报.md
+│   └── 设计规范.md
+├── themes/             # 主题说明 Markdown（可选）
 ├── assets/             # 原图：导入的参考图、低保真原型、每个生成版本
 │   └── <版本id>.png / .jpg / .webp
 ├── exports/            # 导出产物
@@ -436,6 +442,12 @@ ADR-0009：页面内固定带为区块 → 草图 → 可叠层栈；装饰与�
 规格见 `docs/specs/layers-panel-ui.md`。内嵌 SF 风类型图标；缩进树线；区域/页面/分组可折叠（按项目记 localStorage）；图像/引用缩略图 + 引用角标；装饰显示填充色块。不改层序与拖拽规则。
 
 **验收**：`npm test` / `typecheck` 通过；寿司大页可折叠扫视。
+
+### 项目文稿（PRD · 简报 · 设计规范 · AGENTS） ✅
+
+规格见 `docs/specs/project-docs.md`（ADR-0010）。左侧「图层 | 文稿」；四类 Markdown 落盘可读写复制；设计规范可生成规范图到核心素材区。本轮不做 PRD→写简报整条流水线。
+
+**验收**：`projectDocs.test.ts`；`npm test` / `typecheck` 通过。
 
 ### 助手会话区 UI ✅
 
