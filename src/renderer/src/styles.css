@@ -271,6 +271,33 @@ kbd {
   background: #26262c;
 }
 
+.layer-swatch {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.size-input {
+  width: 64px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2, #1c1c22);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text);
+  margin: 6px 0;
+}
+
 .layer-thumb.missing,
 .version-missing {
   display: flex;

@@ -37,7 +37,10 @@ import {
   setActiveTheme,
   setCurrentVersion,
   setRefLockedVersion,
+  nudgeSiblingOrder,
+  resizeRefLogical,
   updateBlock,
+  updateDecor,
   updatePrompt,
   updateTheme,
 } from './document/operations';
@@ -878,6 +881,13 @@ const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function Ri
       onRegenDownstream={onRegenDownstream}
       onLockRef={(refId, lockedVersionId) =>
         doc.apply(lockedVersionId ? '锁定版本' : '解锁版本', setRefLockedVersion(doc.get(), refId, lockedVersionId))
+      }
+      onResizeRef={(refId, logical, lockAspect) =>
+        doc.apply('调整引用尺寸', resizeRefLogical(doc.get(), refId, logical, lockAspect))
+      }
+      onUpdateDecor={(id, patch) => doc.apply('编辑页面装饰', updateDecor(doc.get(), id, patch))}
+      onNudgeSiblingOrder={(id, direction) =>
+        doc.apply(direction === 'forward' ? '上移一层' : '下移一层', nudgeSiblingOrder(doc.get(), id, direction))
       }
       onRemoveInput={(id, index) => doc.apply('解除绑定', removePromptInput(doc.get(), id, index))}
       onMoveInput={(id, index, delta) => doc.apply('调整输入顺序', movePromptInput(doc.get(), id, index, delta))}

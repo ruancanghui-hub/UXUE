@@ -78,6 +78,13 @@ export function ProjectTopBar(props: ProjectTopBarProps) {
         >
           区块 <kbd>B</kbd>
         </button>
+        <button
+          className={tool === 'decor' ? 'active' : ''}
+          onClick={() => props.onTool('decor')}
+          title="装饰（R）：在页面框里拖出圆角有填充的底板"
+        >
+          装饰 <kbd>R</kbd>
+        </button>
         <button className={tool === 'pen' ? 'active' : ''} onClick={() => props.onTool('pen')} title="画笔（D）：在页面框里手绘布局草图">
           画笔 <kbd>D</kbd>
         </button>

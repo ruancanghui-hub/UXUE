@@ -1,7 +1,7 @@
 {
   "name": "anye-jingling",
   "productName": "暗夜精灵",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "私人用的 AI 设计稿编排画布",
   "private": true,
   "main": "out/main/index.js",

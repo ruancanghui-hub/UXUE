@@ -20,6 +20,7 @@ import {
   DEVICE_PRESETS,
   isBlockCard,
   isBlockCropStale,
+  isDecorCard,
   isGroupCard,
   isSketchTextCard,
   isStrokeCard,
@@ -35,6 +36,7 @@ import {
   themeSuffix,
   type BlockCard,
   type BlockType,
+  type DecorCard,
   type SketchTextCard,
   type GroupCard,
   type ImageCard,
@@ -53,10 +55,14 @@ import {
   elementPrompts,
   isWireframeOutput,
   pageBlocks,
+  pageDecors,
+  refLogicalSize,
   sketchMarks,
   updatePrompt,
   type DocState,
 } from '../document/operations';
+
+const REF_SIZE_PRESETS = [24, 48, 64, 80];
 import { activeTheme, effectiveConfig } from '../project/GenerationTracker';
 import type { TrackedJob } from '../project/GenerationTracker';
 import { thumbnailUrl } from '../project/thumbnails';
@@ -101,6 +107,9 @@ interface InspectorProps {
   onExportPage(pageId: string): void;
   onPlaceInPage(imageCardId: string, pageId: string): void;
   onLockRef(refId: string, lockedVersionId: string | null): void;
+  onResizeRef(refId: string, logical: { width?: number; height?: number }, lockAspect: boolean): void;
+  onUpdateDecor(id: string, patch: Partial<Pick<DecorCard, 'fill' | 'cornerRadius' | 'width' | 'height' | 'x' | 'y'>>): void;
+  onNudgeSiblingOrder(id: string, direction: 'forward' | 'backward'): void;
   onRegenDownstream(promptIds: string[]): void;
   exports: ReadonlyMap<string, ExportResult | 'running' | { error: string }>;
   blockActions: BlockActions;
@@ -174,6 +183,7 @@ export const Inspector = forwardRef<InspectorHandle, InspectorProps>(function In
       {only && isThemeCard(only) && <ThemeInfo card={only} {...props} />}
       {only && isPageCard(only) && <PageInfo card={only} {...props} />}
       {only && isRefCard(only) && <RefInfo card={only} {...props} />}
+      {only && isDecorCard(only) && <DecorInfo card={only} {...props} />}
       {only && isGroupCard(only) && <GroupInfo card={only} {...props} />}
       {only && isBlockCard(only) && <BlockInfo card={only} {...props} />}
       {only && isSketchTextCard(only) && <SketchTextInfo card={only} {...props} />}
@@ -623,6 +633,22 @@ function PageInfo(props: InspectorProps & { card: PageCard }) {
       </section>
 
       <section className="inspector-section">
+        <div className="panel-title">
+          页面装饰 <span className="dim">{pageDecors(state, card.id).length}</span>
+        </div>
+        {pageDecors(state, card.id).length === 0 ? (
+          <p className="hint">用装饰工具（R）在页面框里拖出圆角底板。</p>
+        ) : (
+          [...pageDecors(state, card.id)].reverse().map((decor, index, list) => (
+            <button key={decor.id} className="layer-row" onClick={() => props.onSelectCard(decor.id)}>
+              <span className="layer-swatch" style={{ background: decor.fill }} />
+              <span className="layer-name">装饰 {list.length - index}</span>
+            </button>
+          ))
+        )}
+      </section>
+
+      <section className="inspector-section">
         <div className="panel-title">低保真原型</div>
         {card.base ? (
           <img className="lowfi-thumb" src={thumbnailUrl(card.base, cacheBust.get(card.base.id))} alt="" />
@@ -665,7 +691,15 @@ function PageInfo(props: InspectorProps & { card: PageCard }) {
 
       <section className="inspector-section">
         <div className="panel-title">导出</div>
-        <p className="hint">导出到项目的 exports/{card.name}/：整页 PNG、分层 SVG（可直接拖进 Figma）、素材包（每个素材 @1x/@2x/@3x）和坐标清单。</p>
+        <p className="hint">导出到项目的 exports/{card.name}/：整页 PNG、分层 SVG（装饰矢量 + 素材，可直接拖进 Figma）、素材包和坐标清单。默认不带低保真。</p>
+        <label className="check-row">
+          <input
+            type="checkbox"
+            checked={card.exportIncludeBase}
+            onChange={(e) => props.onUpdatePage(card.id, { exportIncludeBase: e.target.checked })}
+          />
+          包含低保真原型
+        </label>
         <button className="primary" disabled={exported === 'running'} onClick={() => props.onExportPage(card.id)}>
           {exported === 'running' ? '导出中…' : '导出页面  ⌘⇧E'}
         </button>
@@ -906,9 +940,20 @@ function BlockInfo(props: InspectorProps & { card: BlockCard }) {
 function RefInfo(props: InspectorProps & { card: RefCard }) {
   const { card, state, cacheBust } = props;
   const source = state.cards.find((c) => c.id === card.imageCardId);
-  const page = card.pageId ? state.cards.find((c) => c.id === card.pageId) : undefined;
+  const page = card.pageId ? state.cards.find((c): c is PageCard => c.id === card.pageId && isPageCard(c)) : undefined;
   const shown = source && isImageCard(source) ? refDisplayVersion(card, source) : null;
   const locked = !!card.lockedVersionId;
+  const logical = refLogicalSize(card, page);
+  const [lockAspect, setLockAspect] = useState(true);
+  const [widthText, setWidthText] = useState(String(logical.width));
+  const [heightText, setHeightText] = useState(String(logical.height));
+  useEffect(() => {
+    setWidthText(String(logical.width));
+    setHeightText(String(logical.height));
+  }, [logical.width, logical.height, card.id]);
+  const commitSize = (next: { width?: number; height?: number }) => {
+    props.onResizeRef(card.id, next, lockAspect);
+  };
   return (
     <>
       <section className="inspector-section">
@@ -940,8 +985,148 @@ function RefInfo(props: InspectorProps & { card: RefCard }) {
         ) : (
           <p className="warning">引用的图像卡已经不在了{card.lockedVersionId ? '，或锁定的版本已丢失' : ''}</p>
         )}
-        <Field label="所在页面" value={page && isPageCard(page) ? page.name : '不在任何页面里'} />
-        <Field label="画布尺寸" value={`${Math.round(card.width)} × ${Math.round(card.height)}`} />
+        <Field label="所在页面" value={page ? page.name : '不在任何页面里'} />
+        <div className="field">
+          <span className="field-label">逻辑尺寸</span>
+          <div className="button-row tight">
+            <input
+              className="size-input"
+              value={widthText}
+              onChange={(e) => setWidthText(e.target.value)}
+              onBlur={() => {
+                const width = Number(widthText);
+                if (Number.isFinite(width) && width > 0) commitSize({ width });
+                else setWidthText(String(logical.width));
+              }}
+              onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+            />
+            <span className="dim">×</span>
+            <input
+              className="size-input"
+              value={heightText}
+              onChange={(e) => setHeightText(e.target.value)}
+              onBlur={() => {
+                const height = Number(heightText);
+                if (Number.isFinite(height) && height > 0) commitSize({ height });
+                else setHeightText(String(logical.height));
+              }}
+              onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+            />
+          </div>
+        </div>
+        <label className="check-row">
+          <input type="checkbox" checked={lockAspect} onChange={(e) => setLockAspect(e.target.checked)} />
+          锁定比例
+        </label>
+        <div className="segmented small">
+          {REF_SIZE_PRESETS.map((size) => (
+            <button key={size} onClick={() => commitSize({ width: size, height: lockAspect ? undefined : size })}>
+              {size}
+            </button>
+          ))}
+        </div>
+        {page && (
+          <div className="button-row tight">
+            <button onClick={() => props.onNudgeSiblingOrder(card.id, 'forward')}>上移一层</button>
+            <button onClick={() => props.onNudgeSiblingOrder(card.id, 'backward')}>下移一层</button>
+          </div>
+        )}
+      </section>
+      <section className="inspector-section">
+        <CardActions {...props} />
+      </section>
+    </>
+  );
+}
+
+function DecorInfo(props: InspectorProps & { card: DecorCard }) {
+  const { card, state } = props;
+  const page = state.cards.find((c): c is PageCard => c.id === card.pageId && isPageCard(c));
+  const logical = page
+    ? {
+        width: Math.round((card.width / page.width) * pageLogicalSize(page).width * 100) / 100,
+        height: Math.round((card.height / page.height) * pageLogicalSize(page).height * 100) / 100,
+        radius: Math.round(card.cornerRadius * 100) / 100,
+      }
+    : { width: Math.round(card.width), height: Math.round(card.height), radius: card.cornerRadius };
+  const [widthText, setWidthText] = useState(String(logical.width));
+  const [heightText, setHeightText] = useState(String(logical.height));
+  const [radiusText, setRadiusText] = useState(String(logical.radius));
+  useEffect(() => {
+    setWidthText(String(logical.width));
+    setHeightText(String(logical.height));
+    setRadiusText(String(logical.radius));
+  }, [logical.width, logical.height, logical.radius, card.id]);
+  const toCanvas = (logicalW: number, logicalH: number) => {
+    if (!page) return { width: logicalW, height: logicalH };
+    const size = pageLogicalSize(page);
+    return { width: (logicalW / size.width) * page.width, height: (logicalH / size.height) * page.height };
+  };
+  return (
+    <>
+      <section className="inspector-section">
+        <div className="panel-title">页面装饰</div>
+        <p className="hint">圆角填充矩形，垫在素材引用下面；导出 SVG 时是矢量层。</p>
+        <Field label="所在页面" value={page?.name ?? '（页面已不在）'} />
+        <div className="field">
+          <span className="field-label">填充色</span>
+          <ColorInput value={card.fill} onCommit={(fill) => props.onUpdateDecor(card.id, { fill })} />
+        </div>
+        <div className="field">
+          <span className="field-label">逻辑尺寸</span>
+          <div className="button-row tight">
+            <input
+              className="size-input"
+              value={widthText}
+              onChange={(e) => setWidthText(e.target.value)}
+              onBlur={() => {
+                const width = Number(widthText);
+                if (!Number.isFinite(width) || width <= 0) {
+                  setWidthText(String(logical.width));
+                  return;
+                }
+                props.onUpdateDecor(card.id, toCanvas(width, logical.height));
+              }}
+              onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+            />
+            <span className="dim">×</span>
+            <input
+              className="size-input"
+              value={heightText}
+              onChange={(e) => setHeightText(e.target.value)}
+              onBlur={() => {
+                const height = Number(heightText);
+                if (!Number.isFinite(height) || height <= 0) {
+                  setHeightText(String(logical.height));
+                  return;
+                }
+                props.onUpdateDecor(card.id, toCanvas(logical.width, height));
+              }}
+              onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+            />
+          </div>
+        </div>
+        <div className="field">
+          <span className="field-label">圆角</span>
+          <input
+            className="size-input"
+            value={radiusText}
+            onChange={(e) => setRadiusText(e.target.value)}
+            onBlur={() => {
+              const cornerRadius = Number(radiusText);
+              if (!Number.isFinite(cornerRadius) || cornerRadius < 0) {
+                setRadiusText(String(logical.radius));
+                return;
+              }
+              props.onUpdateDecor(card.id, { cornerRadius });
+            }}
+            onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+          />
+        </div>
+        <div className="button-row tight">
+          <button onClick={() => props.onNudgeSiblingOrder(card.id, 'forward')}>上移一层</button>
+          <button onClick={() => props.onNudgeSiblingOrder(card.id, 'backward')}>下移一层</button>
+        </div>
       </section>
       <section className="inspector-section">
         <CardActions {...props} />

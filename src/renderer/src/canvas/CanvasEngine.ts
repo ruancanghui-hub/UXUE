@@ -7,6 +7,7 @@ import {
   defaultRegions,
   isBlockCard,
   isBlockCropStale,
+  isDecorCard,
   isGroupCard,
   isSketchMark,
   isSketchTextCard,
@@ -17,11 +18,15 @@ import {
   isPromptCard,
   isRefCard,
   isThemeCard,
+  normalizeHex,
   pageLogicalSize,
+  type BlockCard,
   type CanvasCard,
+  type DecorCard,
   type ImageCard,
   type PageCard,
   type PromptCard,
+  type RefCard,
   type RegionId,
   type SketchTextCard,
   type StrokeCard,
@@ -35,6 +40,7 @@ import {
   addPromptInput,
   blockHasOutput,
   createBlockAt,
+  createDecorAt,
   createPromptCard,
   createSketchText,
   createStroke,
@@ -62,12 +68,13 @@ import { Selection } from '../document/Selection';
 import { expandRect, intersects, rectFromPoints, unionRects, type Rect } from './geometry';
 import { PerfMonitor } from './PerfMonitor';
 import { PromptNode, type PromptJobView } from './PromptNode';
+import { snapPoint, snapRectMove, snapThresholdCanvas, type SnapGuide } from './snap';
 import { ThemeNode } from './ThemeNode';
 import { TextureManager, type TextureStats } from './TextureManager';
 import { clamp, MAX_ZOOM, MIN_ZOOM, Viewport } from './Viewport';
 
-/** block：在页面框里拖出区块；pen / text / eraser：画布局草图的画笔、文字和橡皮 */
-export type Tool = 'select' | 'hand' | 'block' | 'pen' | 'text' | 'eraser';
+/** block：区块；decor：页面装饰；pen / text / eraser：布局草图 */
+export type Tool = 'select' | 'hand' | 'block' | 'decor' | 'pen' | 'text' | 'eraser';
 export type PenWidth = 'thin' | 'thick';
 /** 画笔粗细（画布单位）；页面框宽 480 时细线约 1 个像素宽的笔触 */
 const PEN_WIDTHS: Record<PenWidth, number> = { thin: 2, thick: 5 };
@@ -119,6 +126,7 @@ type Interaction =
     }
   | { kind: 'link'; promptId: string; fromX: number; fromY: number; x: number; y: number; targetId: string | null }
   | { kind: 'drawBlock'; pageId: string; startWorldX: number; startWorldY: number; rect: Rect }
+  | { kind: 'drawDecor'; pageId: string; startWorldX: number; startWorldY: number; rect: Rect }
   | { kind: 'drawStroke'; pageId: string; points: number[]; lastScreenX: number; lastScreenY: number }
   | { kind: 'erase'; removed: number };
 
@@ -144,6 +152,8 @@ const MISSING_OUTLINE = 0xff6b7a;
 const ACCENT = 0x7c8cff;
 const OUTPUT_LINK = 0x5ad19a;
 const BLOCK_COLOR = 0xffb547;
+const DECOR_PREVIEW = 0x7c8cff;
+const GUIDE_COLOR = 0xff4d6a;
 /** 拖出的框太小（多半是误点）就不建区块，画布单位 */
 const MIN_DRAWN_BLOCK = 6;
 const REGION_FILL = 0x17171c;
@@ -218,6 +228,8 @@ export class CanvasEngine {
   private lastJobTick = 0;
 
   private tool: Tool = 'select';
+  private snapGuides: SnapGuide[] = [];
+  private readonly decorGraphics = new Map<string, Graphics>();
   private penWidth: PenWidth = 'thin';
   private spaceHeld = false;
   private interaction: Interaction = { kind: 'none' };
@@ -500,7 +512,7 @@ export class CanvasEngine {
 
   setTool(tool: Tool): void {
     this.tool = tool;
-    if (this.interaction.kind === 'drawBlock' || this.interaction.kind === 'drawStroke') {
+    if (this.interaction.kind === 'drawBlock' || this.interaction.kind === 'drawDecor' || this.interaction.kind === 'drawStroke') {
       this.interaction = { kind: 'none' };
       this.overlayDirty = true;
     }
@@ -805,6 +817,7 @@ export class CanvasEngine {
       else if (isThemeCard(card)) this.syncThemeCard(card);
       else if (isGroupCard(card)) this.ensureGroupNode(card);
       else if (isBlockCard(card)) this.ensureBlockNode(card);
+      else if (isDecorCard(card)) this.syncDecorCard(card);
       else if (isSketchMark(card)) this.syncSketchMark(card);
       else this.ensureSpriteNode(card);
       if (keyChanged) this.rebindTexture(card.id, version);
@@ -894,6 +907,25 @@ export class CanvasEngine {
   private ensureBlockNode(card: CanvasCard): void {
     if (this.nodes.has(card.id)) return;
     this.nodes.set(card.id, new Container());
+  }
+
+  /** 页面装饰：圆角填充矩形 */
+  private syncDecorCard(card: DecorCard): void {
+    let g = this.decorGraphics.get(card.id);
+    if (!g) {
+      g = new Graphics();
+      const node = new Container();
+      node.addChild(g);
+      this.nodes.set(card.id, node);
+      this.decorGraphics.set(card.id, g);
+    }
+    g.clear();
+    const page = this.rendered.get(card.pageId) ?? this.doc.get().cards.find((c) => c.id === card.pageId);
+    const logical = page && isPageCard(page) ? pageLogicalSize(page) : { width: card.width, height: card.height };
+    const pageW = page && isPageCard(page) ? page.width : card.width;
+    const radius = Math.min((card.cornerRadius / logical.width) * pageW, card.width / 2, card.height / 2);
+    const color = parseInt((normalizeHex(card.fill) ?? '#E8E8ED').slice(1), 16);
+    g.roundRect(0, 0, card.width, card.height, Math.max(0, radius)).fill({ color });
   }
 
   private ensureGroupNode(card: CanvasCard): void {
@@ -1030,6 +1062,7 @@ export class CanvasEngine {
     this.blockLabels.get(id)?.destroy();
     this.blockLabels.delete(id);
     this.strokeGraphics.delete(id);
+    this.decorGraphics.delete(id);
     this.sketchTexts.delete(id);
     this.spriteLayers.delete(id);
     this.pageBackgrounds.delete(id);
@@ -1147,14 +1180,27 @@ export class CanvasEngine {
       }
       g.stroke({ color: SKETCH_INK, width: PEN_WIDTHS[this.penWidth] * this.viewport.zoom, cap: 'round', join: 'round' });
     }
-    if (this.interaction.kind === 'drawBlock') {
+    if (this.interaction.kind === 'drawBlock' || this.interaction.kind === 'drawDecor') {
       const { rect } = this.interaction;
       const a = this.viewport.worldToScreen(rect.x, rect.y);
       const w = rect.width * this.viewport.zoom;
       const h = rect.height * this.viewport.zoom;
-      g.rect(a.x, a.y, w, h).fill({ color: BLOCK_COLOR, alpha: 0.12 });
+      const color = this.interaction.kind === 'drawBlock' ? BLOCK_COLOR : DECOR_PREVIEW;
+      g.rect(a.x, a.y, w, h).fill({ color, alpha: 0.12 });
       dashedRect(g, a.x, a.y, w, h);
-      g.stroke({ color: BLOCK_COLOR, width: 1.5, alpha: 0.95 });
+      g.stroke({ color, width: 1.5, alpha: 0.95 });
+    }
+    for (const guide of this.snapGuides) {
+      if (guide.orientation === 'v') {
+        const a = this.viewport.worldToScreen(guide.position, guide.from);
+        const b = this.viewport.worldToScreen(guide.position, guide.to);
+        g.moveTo(a.x, a.y).lineTo(b.x, b.y);
+      } else {
+        const a = this.viewport.worldToScreen(guide.from, guide.position);
+        const b = this.viewport.worldToScreen(guide.to, guide.position);
+        g.moveTo(a.x, a.y).lineTo(b.x, b.y);
+      }
+      g.stroke({ color: GUIDE_COLOR, width: 1.5, alpha: 1, pixelLine: true });
     }
     if (this.interaction.kind === 'link') {
       const { fromX, fromY, x, y, targetId } = this.interaction;
@@ -1253,6 +1299,50 @@ export class CanvasEngine {
     if (!cards.some(isImageCard) || cards.some(isPageCard)) return null;
     const page = this.hitTest(worldX, worldY, (card) => isPageCard(card) && !origins.has(card.id));
     return page?.id ?? null;
+  }
+
+  /** 页面里可参与对齐的对象：素材引用、区块、页面装饰 */
+  private isPageSnapCard(card: CanvasCard): card is RefCard | BlockCard | DecorCard {
+    return (isRefCard(card) || isBlockCard(card) || isDecorCard(card)) && !!card.pageId;
+  }
+
+  /** 同页引用 / 区块 / 装饰拖动时，吸附其它同页对象与页面框边缘/中心 */
+  private computeDragSnap(
+    origins: ReadonlyMap<string, CanvasCard>,
+    dx: number,
+    dy: number,
+  ): { dx: number; dy: number; guides: SnapGuide[] } {
+    // 拖着页面框一起动时不吸附，避免整页乱跳
+    if ([...origins.values()].some(isPageCard)) return { dx: 0, dy: 0, guides: [] };
+    const moving = [...origins.values()].filter((card) => this.isPageSnapCard(card));
+    if (moving.length === 0) return { dx: 0, dy: 0, guides: [] };
+    const pageId = moving[0].pageId!;
+    if (!moving.every((card) => card.pageId === pageId)) return { dx: 0, dy: 0, guides: [] };
+    const state = this.doc.get();
+    const page = state.cards.find((card): card is PageCard => card.id === pageId && isPageCard(card));
+    if (!page) return { dx: 0, dy: 0, guides: [] };
+    const movingIds = new Set(origins.keys());
+    const siblings = state.cards
+      .filter((card) => this.isPageSnapCard(card) && card.pageId === pageId && !movingIds.has(card.id))
+      .map((card) => ({ x: card.x, y: card.y, width: card.width, height: card.height }));
+    const bounds = unionRects(moving.map((card) => ({ x: card.x + dx, y: card.y + dy, width: card.width, height: card.height })));
+    if (!bounds) return { dx: 0, dy: 0, guides: [] };
+    const logical = pageLogicalSize(page);
+    const threshold = snapThresholdCanvas(page.width, logical.width, this.viewport.zoom);
+    return snapRectMove(bounds, [page, ...siblings], threshold);
+  }
+
+  /** 拖画区块 / 装饰时：自由角吸附到同页对象与页面框 */
+  private computeDrawSnap(pageId: string, worldX: number, worldY: number): { x: number; y: number; guides: SnapGuide[] } {
+    const state = this.doc.get();
+    const page = state.cards.find((card): card is PageCard => card.id === pageId && isPageCard(card));
+    if (!page) return { x: worldX, y: worldY, guides: [] };
+    const targets = state.cards
+      .filter((card) => this.isPageSnapCard(card) && card.pageId === pageId)
+      .map((card) => ({ x: card.x, y: card.y, width: card.width, height: card.height }));
+    const logical = pageLogicalSize(page);
+    const threshold = snapThresholdCanvas(page.width, logical.width, this.viewport.zoom);
+    return snapPoint(worldX, worldY, [page, ...targets], threshold);
   }
 
   /**
@@ -1624,14 +1714,18 @@ export class CanvasEngine {
       }
     }
 
-    // 区块工具：在页面框空白处拖出新框；按在已有区块或选中框的角上，照常移动 / 缩放
-    if (this.tool === 'block' && !this.hitCorner(x, y)) {
+    // 区块 / 装饰工具：在页面框空白处拖出新框；按在已有同名对象或选中框的角上，照常移动 / 缩放
+    if ((this.tool === 'block' || this.tool === 'decor') && !this.hitCorner(x, y)) {
       const world = this.viewport.screenToWorld(x, y);
       const top = this.hitTest(world.x, world.y);
-      if (!top || !isBlockCard(top)) {
+      const hittingOwn = this.tool === 'block' ? top && isBlockCard(top) : top && isDecorCard(top);
+      if (!hittingOwn) {
         const page = this.hitTest(world.x, world.y, isPageCard);
         if (page) {
-          this.interaction = { kind: 'drawBlock', pageId: page.id, startWorldX: world.x, startWorldY: world.y, rect: { x: world.x, y: world.y, width: 0, height: 0 } };
+          this.interaction =
+            this.tool === 'block'
+              ? { kind: 'drawBlock', pageId: page.id, startWorldX: world.x, startWorldY: world.y, rect: { x: world.x, y: world.y, width: 0, height: 0 } }
+              : { kind: 'drawDecor', pageId: page.id, startWorldX: world.x, startWorldY: world.y, rect: { x: world.x, y: world.y, width: 0, height: 0 } };
         }
         return;
       }
@@ -1738,14 +1832,18 @@ export class CanvasEngine {
           this.doc.beginGesture('移动');
         }
         const world = this.viewport.screenToWorld(x, y);
-        this.doc.updateGesture(
-          moveCards(this.doc.get(), interaction.origins, world.x - interaction.startWorldX, world.y - interaction.startWorldY),
-        );
+        let dx = world.x - interaction.startWorldX;
+        let dy = world.y - interaction.startWorldY;
+        const snap = this.computeDragSnap(interaction.origins, dx, dy);
+        dx += snap.dx;
+        dy += snap.dy;
+        this.snapGuides = snap.guides;
+        this.doc.updateGesture(moveCards(this.doc.get(), interaction.origins, dx, dy));
         const dropPageId = event.altKey ? null : this.dropTargetFor(interaction.origins, world.x, world.y);
         if (dropPageId !== interaction.dropPageId) {
           interaction.dropPageId = dropPageId;
-          this.overlayDirty = true;
         }
+        this.overlayDirty = true;
         return;
       }
       case 'marquee': {
@@ -1790,13 +1888,21 @@ export class CanvasEngine {
         this.eraseAt(world.x, world.y);
         return;
       }
-      case 'drawBlock': {
+      case 'drawBlock':
+      case 'drawDecor': {
         const world = this.viewport.screenToWorld(x, y);
         const page = this.rendered.get(interaction.pageId);
         if (!page) return;
         const clampX = (v: number): number => Math.min(page.x + page.width, Math.max(page.x, v));
         const clampY = (v: number): number => Math.min(page.y + page.height, Math.max(page.y, v));
-        interaction.rect = rectFromPoints(interaction.startWorldX, interaction.startWorldY, clampX(world.x), clampY(world.y));
+        const snapped = this.computeDrawSnap(interaction.pageId, world.x, world.y);
+        this.snapGuides = snapped.guides;
+        interaction.rect = rectFromPoints(
+          interaction.startWorldX,
+          interaction.startWorldY,
+          clampX(snapped.x),
+          clampY(snapped.y),
+        );
         this.overlayDirty = true;
         return;
       }
@@ -1818,6 +1924,10 @@ export class CanvasEngine {
     const canvas = this.app.canvas;
     if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
     const interaction = this.interaction;
+    if (interaction.kind === 'drag' || interaction.kind === 'drawBlock' || interaction.kind === 'drawDecor') {
+      this.snapGuides = [];
+      this.overlayDirty = true;
+    }
     if (interaction.kind === 'drag') {
       if (interaction.moved && interaction.dropPageId) this.dropIntoPage(interaction.origins, interaction.dropPageId);
       else if (interaction.moved) {
@@ -1842,6 +1952,13 @@ export class CanvasEngine {
         this.doc.apply('画区块', created.state);
         this.selection.set([created.blockId]);
         for (const listener of this.editListeners) listener(created.blockId);
+      }
+    }
+    if (interaction.kind === 'drawDecor' && interaction.rect.width >= MIN_DRAWN_BLOCK && interaction.rect.height >= MIN_DRAWN_BLOCK) {
+      const created = createDecorAt(this.doc.get(), interaction.pageId, interaction.rect, () => crypto.randomUUID());
+      if (created) {
+        this.doc.apply('画页面装饰', created.state);
+        this.selection.set([created.decorId]);
       }
     }
     if (interaction.kind === 'link' && interaction.targetId) {
@@ -1895,6 +2012,8 @@ export class CanvasEngine {
       this.setTool('hand');
     } else if (event.key.toLowerCase() === 'b') {
       this.setTool('block');
+    } else if (event.key.toLowerCase() === 'r') {
+      this.setTool('decor');
     } else if (event.key.toLowerCase() === 'd') {
       this.setTool('pen');
     } else if (event.key.toLowerCase() === 't') {
@@ -1940,7 +2059,7 @@ export class CanvasEngine {
     if (this.interaction.kind === 'pan') canvas.style.cursor = 'grabbing';
     else if (this.interaction.kind === 'link' || this.hoverPortId) canvas.style.cursor = 'crosshair';
     else if (this.tool === 'hand' || this.spaceHeld) canvas.style.cursor = 'grab';
-    else if (this.tool === 'block' || this.tool === 'pen') canvas.style.cursor = 'crosshair';
+    else if (this.tool === 'block' || this.tool === 'decor' || this.tool === 'pen') canvas.style.cursor = 'crosshair';
     else if (this.tool === 'text') canvas.style.cursor = 'text';
     else if (this.tool === 'eraser') canvas.style.cursor = 'cell';
     else if (this.hoverCorner === 'nw' || this.hoverCorner === 'se') canvas.style.cursor = 'nwse-resize';

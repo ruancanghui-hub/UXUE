@@ -1,5 +1,6 @@
 import {
   isBlockCard,
+  isDecorCard,
   isImageCard,
   isRefCard,
   pageLogicalSize,
@@ -22,6 +23,17 @@ export interface ExportLayer {
   height: number;
 }
 
+export interface ExportShape {
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  fill: string;
+  /** 导出像素圆角 */
+  cornerRadius: number;
+}
+
 export interface PageExportPlan {
   pageName: string;
   /** 导出像素尺寸 */
@@ -33,13 +45,15 @@ export interface PageExportPlan {
   exportScale: number;
   background: string;
   base: { file: string } | null;
+  /** 从下到上的页面装饰（矢量） */
+  shapes: ExportShape[];
   /** 从下到上 */
   layers: ExportLayer[];
   /** 区块只写进坐标清单（逻辑坐标），不画进 PNG / SVG */
   blocks: { name: string; type: string; group: string | null; x: number; y: number; width: number; height: number }[];
 }
 
-/** 页面框 + 里面的素材引用 → 导出用的像素坐标；画布单位按页面宽度换算 */
+/** 页面框 + 里面的素材引用 / 页面装饰 → 导出用的像素坐标；画布单位按页面宽度换算 */
 export function planPageExport(page: PageCard, cards: readonly CanvasCard[]): PageExportPlan {
   const logical = pageLogicalSize(page);
   const width = Math.max(1, Math.round(logical.width * page.exportScale));
@@ -48,6 +62,23 @@ export function planPageExport(page: PageCard, cards: readonly CanvasCard[]): Pa
   const scaleY = height / page.height;
   const byId = new Map(cards.map((card) => [card.id, card]));
   const used = new Map<string, number>();
+
+  const shapes: ExportShape[] = [];
+  let decorIndex = 0;
+  for (const card of cards) {
+    if (!isDecorCard(card) || card.pageId !== page.id) continue;
+    decorIndex += 1;
+    const rx = Math.min(card.cornerRadius, logical.width, logical.height);
+    shapes.push({
+      name: decorIndex === 1 ? '装饰' : `装饰 ${decorIndex}`,
+      x: Math.round((card.x - page.x) * scaleX),
+      y: Math.round((card.y - page.y) * scaleY),
+      width: Math.max(1, Math.round(card.width * scaleX)),
+      height: Math.max(1, Math.round(card.height * scaleY)),
+      fill: card.fill,
+      cornerRadius: Math.max(0, Math.round(rx * page.exportScale)),
+    });
+  }
 
   const layers: ExportLayer[] = [];
   for (const card of cards) {
@@ -77,7 +108,8 @@ export function planPageExport(page: PageCard, cards: readonly CanvasCard[]): Pa
     logicalHeight: logical.height,
     exportScale: page.exportScale,
     background: page.background,
-    base: page.base ? { file: page.base.file } : null,
+    base: page.exportIncludeBase && page.base ? { file: page.base.file } : null,
+    shapes,
     layers,
     blocks: cards
       .filter((card): card is BlockCard => isBlockCard(card) && card.pageId === page.id)

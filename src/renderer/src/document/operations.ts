@@ -11,7 +11,9 @@ import {
   fitRegionHeights,
   regionColumnOf,
   isBlockCard,
+  isDecorCard,
   isGroupCard,
+  isPageBoundChild,
   isSketchMark,
   isSketchTextCard,
   SKETCH_FONT_SIZES,
@@ -20,9 +22,12 @@ import {
   isPromptCard,
   isRefCard,
   isThemeCard,
+  normalizeHex,
+  pageLogicalSize,
   refDisplayVersion,
   type BlockCard,
   type CanvasCard,
+  type DecorCard,
   type SketchFontSize,
   type SketchTextCard,
   type StrokeCard,
@@ -126,7 +131,7 @@ export function removeCards(state: DocState, requested: ReadonlySet<string>): Do
   const ids = new Set(requested);
   for (const card of state.cards) {
     if (isRefCard(card) && ((card.pageId && requested.has(card.pageId)) || requested.has(card.imageCardId))) ids.add(card.id);
-    if ((isBlockCard(card) || isSketchMark(card)) && requested.has(card.pageId)) ids.add(card.id);
+    if (isPageBoundChild(card) && requested.has(card.pageId)) ids.add(card.id);
   }
   const activeThemeCardId = state.activeThemeCardId && ids.has(state.activeThemeCardId) ? null : state.activeThemeCardId;
   const cards = state.cards
@@ -210,8 +215,8 @@ export function duplicateCards(state: DocState, ids: ReadonlySet<string>, makeId
   // 复制页面框时一起复制里面的引用和区块（单独选中的已经在上面复制过）；区块副本不带截图和提示词
   const childCopies = state.cards
     .filter(
-      (card): card is RefCard | BlockCard | StrokeCard | SketchTextCard =>
-        (isRefCard(card) || isBlockCard(card) || isSketchMark(card)) && !!card.pageId && pageCopies.has(card.pageId) && !ids.has(card.id),
+      (card): card is RefCard | BlockCard | StrokeCard | SketchTextCard | DecorCard =>
+        (isRefCard(card) || isPageBoundChild(card)) && !!card.pageId && pageCopies.has(card.pageId) && !ids.has(card.id),
     )
     .map((card): CanvasCard => {
       const moved = { ...card, id: makeId(), x: card.x + DUPLICATE_OFFSET, y: card.y + DUPLICATE_OFFSET, pageId: pageCopies.get(card.pageId!)! };
@@ -576,6 +581,7 @@ export function newPageCard(
     baseCardId: null,
     wireframePromptId: null,
     sketchHidden: false,
+    exportIncludeBase: false,
   };
 }
 
@@ -627,7 +633,7 @@ export function withPageChildren(state: DocState, ids: Iterable<string>): Set<st
   const groups = new Set(state.cards.filter((card) => result.has(card.id) && isGroupCard(card)).map((card) => card.id));
   if (pages.size === 0 && groups.size === 0) return result;
   for (const card of state.cards) {
-    if ((isRefCard(card) || isBlockCard(card) || isSketchMark(card)) && card.pageId && pages.has(card.pageId)) result.add(card.id);
+    if ((isRefCard(card) || isPageBoundChild(card)) && card.pageId && pages.has(card.pageId)) result.add(card.id);
     const gid = cardGroupId(card);
     if (gid && groups.has(gid)) result.add(card.id);
   }
@@ -682,13 +688,13 @@ export function reassignRefPages(state: DocState, refIds: ReadonlySet<string>): 
   });
 }
 
-/** 绘制和命中顺序：页面框之后依次是区块、草图笔迹和文字、引用（放好的素材盖在最上面）；组成员紧跟分组框 */
+/** 绘制和命中顺序：页面框之后依次是区块、草图、页面装饰、引用（素材盖在最上面）；组成员紧跟分组框 */
 export function renderOrder(cards: readonly CanvasCard[]): CanvasCard[] {
   const pageIds = new Set(cards.filter(isPageCard).map((card) => card.id));
   const groupIds = new Set(cards.filter(isGroupCard).map((card) => card.id));
   const pageChildren = new Map<string, CanvasCard[]>();
   const groupChildren = new Map<string, CanvasCard[]>();
-  for (const kindOf of [isBlockCard, isSketchMark] as const) {
+  for (const kindOf of [isBlockCard, isSketchMark, isDecorCard] as const) {
     for (const card of cards) {
       if (kindOf(card) && pageIds.has(card.pageId)) {
         const list = pageChildren.get(card.pageId) ?? [];
@@ -714,7 +720,7 @@ export function renderOrder(cards: readonly CanvasCard[]): CanvasCard[] {
   const ordered: CanvasCard[] = [];
   for (const card of cards) {
     if (isRefCard(card) && card.pageId && pageIds.has(card.pageId)) continue;
-    if ((isBlockCard(card) || isSketchMark(card)) && pageIds.has(card.pageId)) continue;
+    if (isPageBoundChild(card) && pageIds.has(card.pageId)) continue;
     if (cardGroupId(card) && groupIds.has(cardGroupId(card)!)) continue;
     ordered.push(card);
     if (isPageCard(card)) ordered.push(...(pageChildren.get(card.id) ?? []));
@@ -823,6 +829,133 @@ export function createBlockAt(state: DocState, pageId: string, rect: Rect, makeI
     promptCardId: null,
   };
   return { state: addCards(state, [block]), blockId: block.id };
+}
+
+const DEFAULT_DECOR_FILL = '#E8E8ED';
+const DEFAULT_DECOR_RADIUS = 12;
+const MIN_DRAWN_DECOR = 6;
+
+/** 生效主题的第一色；没有主题或没有色板时用中性灰 */
+export function defaultDecorFill(state: DocState): string {
+  const theme = state.activeThemeCardId
+    ? state.cards.find((card): card is ThemeCard => card.id === state.activeThemeCardId && isThemeCard(card))
+    : undefined;
+  const hex = theme?.palette[0]?.hex;
+  return hex && normalizeHex(hex) ? hex : DEFAULT_DECOR_FILL;
+}
+
+/** R 工具拖出的页面装饰 */
+export function createDecorAt(
+  state: DocState,
+  pageId: string,
+  rect: Rect,
+  makeId: () => string,
+  options?: { fill?: string; cornerRadius?: number },
+): { state: DocState; decorId: string } | null {
+  if (!state.cards.some((card) => card.id === pageId && isPageCard(card))) return null;
+  if (rect.width < MIN_DRAWN_DECOR || rect.height < MIN_DRAWN_DECOR) return null;
+  const decor: DecorCard = {
+    kind: 'decor',
+    id: makeId(),
+    x: rect.x,
+    y: rect.y,
+    width: rect.width,
+    height: rect.height,
+    pageId,
+    fill: normalizeHex(options?.fill ?? '') ?? defaultDecorFill(state),
+    cornerRadius: options?.cornerRadius ?? DEFAULT_DECOR_RADIUS,
+  };
+  return { state: addCards(state, [decor]), decorId: decor.id };
+}
+
+export function updateDecor(
+  state: DocState,
+  id: string,
+  patch: Partial<Pick<DecorCard, 'fill' | 'cornerRadius' | 'width' | 'height' | 'x' | 'y'>>,
+): DocState {
+  return mapCards(state, (card) => {
+    if (card.id !== id || !isDecorCard(card)) return card;
+    const next = { ...card, ...patch };
+    if (patch.fill !== undefined) {
+      const fill = normalizeHex(patch.fill);
+      if (!fill) return card;
+      next.fill = fill;
+    }
+    if (patch.cornerRadius !== undefined) next.cornerRadius = Math.max(0, patch.cornerRadius);
+    if (patch.width !== undefined) next.width = Math.max(MIN_CARD_EDGE, patch.width);
+    if (patch.height !== undefined) next.height = Math.max(MIN_CARD_EDGE, patch.height);
+    return next;
+  });
+}
+
+export function pageDecors(state: DocState, pageId: string): DecorCard[] {
+  return state.cards.filter((card): card is DecorCard => isDecorCard(card) && card.pageId === pageId);
+}
+
+/** 同类同页里上移 / 下移一层（数组里往后 = 画在上面） */
+export function nudgeSiblingOrder(state: DocState, id: string, direction: 'forward' | 'backward'): DocState {
+  const card = state.cards.find((c) => c.id === id);
+  if (!card || (!isDecorCard(card) && !isRefCard(card))) return state;
+  const pageId = card.pageId;
+  if (!pageId) return state;
+  const sameKind = (c: CanvasCard): boolean =>
+    isDecorCard(card) ? isDecorCard(c) && c.pageId === pageId : isRefCard(c) && c.pageId === pageId;
+  const siblingIds = state.cards.filter(sameKind).map((c) => c.id);
+  const index = siblingIds.indexOf(id);
+  if (index < 0) return state;
+  const swapWith = direction === 'forward' ? index + 1 : index - 1;
+  if (swapWith < 0 || swapWith >= siblingIds.length) return state;
+  const a = siblingIds[index];
+  const b = siblingIds[swapWith];
+  const cards = [...state.cards];
+  const ia = cards.findIndex((c) => c.id === a);
+  const ib = cards.findIndex((c) => c.id === b);
+  if (ia < 0 || ib < 0) return state;
+  [cards[ia], cards[ib]] = [cards[ib], cards[ia]];
+  return { ...state, cards };
+}
+
+/** 素材引用按逻辑像素改宽高；默认左上角不动；lockAspect 时以宽为准改高 */
+export function resizeRefLogical(
+  state: DocState,
+  refId: string,
+  logical: { width?: number; height?: number },
+  lockAspect: boolean,
+): DocState {
+  const ref = state.cards.find((card): card is RefCard => card.id === refId && isRefCard(card));
+  if (!ref) return state;
+  const page = ref.pageId ? state.cards.find((card): card is PageCard => card.id === ref.pageId && isPageCard(card)) : undefined;
+  const logicalSize = page ? pageLogicalSize(page) : { width: ref.width, height: ref.height };
+  const pageW = page?.width ?? logicalSize.width;
+  const pageH = page?.height ?? logicalSize.height;
+  const scaleX = pageW / logicalSize.width;
+  const scaleY = pageH / logicalSize.height;
+  const currentLogicalW = ref.width / scaleX;
+  const currentLogicalH = ref.height / scaleY;
+  let nextLogicalW = logical.width ?? currentLogicalW;
+  let nextLogicalH = logical.height ?? currentLogicalH;
+  if (lockAspect && logical.width !== undefined && logical.height === undefined) {
+    nextLogicalH = nextLogicalW * (currentLogicalH / currentLogicalW);
+  } else if (lockAspect && logical.height !== undefined && logical.width === undefined) {
+    nextLogicalW = nextLogicalH * (currentLogicalW / currentLogicalH);
+  }
+  nextLogicalW = Math.max(1, nextLogicalW);
+  nextLogicalH = Math.max(1, nextLogicalH);
+  return mapCards(state, (card) =>
+    card.id === refId && isRefCard(card)
+      ? { ...card, width: nextLogicalW * scaleX, height: nextLogicalH * scaleY }
+      : card,
+  );
+}
+
+/** 画布坐标 → 相对所在页面的逻辑像素尺寸 */
+export function refLogicalSize(ref: RefCard, page: PageCard | undefined): { width: number; height: number } {
+  if (!page) return { width: Math.round(ref.width), height: Math.round(ref.height) };
+  const logical = pageLogicalSize(page);
+  return {
+    width: Math.round((ref.width / page.width) * logical.width * 100) / 100,
+    height: Math.round((ref.height / page.height) * logical.height * 100) / 100,
+  };
 }
 
 /** 画笔画完的一笔：按世界坐标的点算外接框，点归一化到外接框里 */

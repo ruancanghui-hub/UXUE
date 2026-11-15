@@ -267,6 +267,19 @@ async function exportPage({ dir, folder, plan }: ExportRequest): Promise<ExportR
   // 整页 PNG：超出页面的部分裁掉（sharp 不允许叠加图超出底图）
   const composites: OverlayOptions[] = [];
   if (base) composites.push({ input: base, left: 0, top: 0 });
+  for (const shape of plan.shapes ?? []) {
+    const shapePng = await roundedRectPng(shape.width, shape.height, shape.fill, shape.cornerRadius);
+    const left = Math.max(0, -shape.x);
+    const top = Math.max(0, -shape.y);
+    const visibleWidth = Math.min(shape.width, width - shape.x) - left;
+    const visibleHeight = Math.min(shape.height, height - shape.y) - top;
+    if (visibleWidth <= 0 || visibleHeight <= 0) continue;
+    const input =
+      left === 0 && top === 0 && visibleWidth === shape.width && visibleHeight === shape.height
+        ? shapePng
+        : await sharp(shapePng).extract({ left, top, width: visibleWidth, height: visibleHeight }).toBuffer();
+    composites.push({ input, left: shape.x + left, top: shape.y + top });
+  }
   for (const { layer, png } of layers) {
     const left = Math.max(0, -layer.x);
     const top = Math.max(0, -layer.y);
@@ -285,8 +298,12 @@ async function exportPage({ dir, folder, plan }: ExportRequest): Promise<ExportR
     .png()
     .toFile(join(out, pagePng));
 
-  // 分层 SVG：每个素材一个 <image>，id 就是 Figma 里的图层名
+  // 分层 SVG：装饰是矢量 rect；每个素材一个 <image>，id 就是 Figma 里的图层名
   const dataUrl = (buffer: Buffer): string => `data:image/png;base64,${buffer.toString('base64')}`;
+  const svgShapes = (plan.shapes ?? []).map(
+    (shape) =>
+      `      <rect id="${xmlAttr(shape.name)}" x="${shape.x}" y="${shape.y}" width="${shape.width}" height="${shape.height}" rx="${shape.cornerRadius}" ry="${shape.cornerRadius}" fill="${xmlAttr(shape.fill)}"/>`,
+  );
   const svgLayers = layers.map(
     ({ layer, png }) =>
       `      <image id="${xmlAttr(layer.name)}" x="${layer.x}" y="${layer.y}" width="${layer.width}" height="${layer.height}" preserveAspectRatio="none" href="${dataUrl(png)}"/>`,
@@ -296,6 +313,9 @@ async function exportPage({ dir, folder, plan }: ExportRequest): Promise<ExportR
     `  <g id="${xmlAttr(plan.pageName)}">`,
     `    <rect id="背景" width="${width}" height="${height}" fill="${plan.background}"/>`,
     base ? `    <image id="低保真原型" width="${width}" height="${height}" preserveAspectRatio="none" href="${dataUrl(base)}"/>` : '',
+    svgShapes.length ? `    <g id="装饰">` : '',
+    ...svgShapes,
+    svgShapes.length ? `    </g>` : '',
     `    <g id="素材">`,
     ...svgLayers,
     `    </g>`,
@@ -346,6 +366,15 @@ async function exportPage({ dir, folder, plan }: ExportRequest): Promise<ExportR
         logicalHeight: plan.logicalHeight,
         exportScale: plan.exportScale,
         layers: manifest,
+        shapes: (plan.shapes ?? []).map((shape) => ({
+          name: shape.name,
+          x: round2(shape.x / plan.exportScale),
+          y: round2(shape.y / plan.exportScale),
+          width: round2(shape.width / plan.exportScale),
+          height: round2(shape.height / plan.exportScale),
+          fill: shape.fill,
+          cornerRadius: round2(shape.cornerRadius / plan.exportScale),
+        })),
         blocks: plan.blocks ?? [],
       },
       null,
@@ -359,6 +388,15 @@ async function exportPage({ dir, folder, plan }: ExportRequest): Promise<ExportR
     png: { width, height },
     svg: { layers: layers.map(({ layer }) => layer.name), bytes: Buffer.byteLength(svg) },
   };
+}
+
+async function roundedRectPng(width: number, height: number, fill: string, cornerRadius: number): Promise<Buffer> {
+  const w = Math.max(1, Math.round(width));
+  const h = Math.max(1, Math.round(height));
+  const r = Math.max(0, Math.min(cornerRadius, w / 2, h / 2));
+  const safeFill = fill.replace(/[<>&'"]/g, '');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}"><rect width="${w}" height="${h}" rx="${r}" ry="${r}" fill="${safeFill}"/></svg>`;
+  return sharp(Buffer.from(svg)).png().toBuffer();
 }
 
 function xmlAttr(text: string): string {

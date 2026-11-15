@@ -162,6 +162,8 @@ export interface PageCard {
   wireframePromptId: string | null;
   /** 草图笔迹和草图文字是否隐藏；草图转线框出图后自动隐藏 */
   sketchHidden: boolean;
+  /** 导出时是否带上低保真原型层；默认不带，方便拖进 Figma 精修 */
+  exportIncludeBase: boolean;
 }
 
 /** 布局草图里手绘的一笔：points 归一化到外接框 [x0, y0, x1, y1, …]，缩放时不用改点 */
@@ -257,7 +259,32 @@ export interface RefCard {
   lockedVersionId: string | null;
 }
 
-export type CanvasCard = ImageCard | PromptCard | ThemeCard | PageCard | RefCard | GroupCard | BlockCard | StrokeCard | SketchTextCard;
+/** 页面框里的圆角填充矩形底板；不是图像卡 */
+export interface DecorCard {
+  kind: 'decor';
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  pageId: string;
+  /** #RRGGBB */
+  fill: string;
+  /** 逻辑像素圆角；画布上按页面宽高比换算 */
+  cornerRadius: number;
+}
+
+export type CanvasCard =
+  | ImageCard
+  | PromptCard
+  | ThemeCard
+  | PageCard
+  | RefCard
+  | GroupCard
+  | BlockCard
+  | StrokeCard
+  | SketchTextCard
+  | DecorCard;
 
 export function isPageCard(card: CanvasCard): card is PageCard {
   return card.kind === 'page';
@@ -275,9 +302,18 @@ export function isSketchTextCard(card: CanvasCard): card is SketchTextCard {
   return card.kind === 'sketchText';
 }
 
+export function isDecorCard(card: CanvasCard): card is DecorCard {
+  return card.kind === 'decor';
+}
+
 /** 草图笔迹和草图文字：只属于一个页面框的草图素材 */
 export function isSketchMark(card: CanvasCard): card is StrokeCard | SketchTextCard {
   return card.kind === 'stroke' || card.kind === 'sketchText';
+}
+
+/** 只属于一个页面框、页面框删了就带走的子卡（不含可拖出页面的素材引用） */
+export function isPageBoundChild(card: CanvasCard): card is BlockCard | StrokeCard | SketchTextCard | DecorCard {
+  return isBlockCard(card) || isSketchMark(card) || isDecorCard(card);
 }
 
 /** 区块现在相对页面框的位置 */
@@ -543,7 +579,9 @@ export function parseProject(raw: unknown): ParseResult {
                     ? parseStrokeCard(value)
                     : value.kind === 'sketchText'
                       ? parseSketchTextCard(value)
-                      : parseCard(value);
+                      : value.kind === 'decor'
+                        ? parseDecorCard(value)
+                        : parseCard(value);
     if (!card) {
       warnings.push(`第 ${index + 1} 个对象结构不完整，已跳过`);
       continue;
@@ -597,11 +635,11 @@ export function parseProject(raw: unknown): ParseResult {
     }
   }
 
-  // 草图笔迹和文字：页面框不在就丢掉
+  // 草图笔迹、文字、页面装饰：页面框不在就丢掉
   for (let index = cards.length - 1; index >= 0; index--) {
     const card = cards[index];
-    if (isSketchMark(card) && !pageIds.has(card.pageId)) {
-      warnings.push('一条草图笔迹或文字所在的页面框不存在，已去掉');
+    if ((isSketchMark(card) || isDecorCard(card)) && !pageIds.has(card.pageId)) {
+      warnings.push(isDecorCard(card) ? '一块页面装饰所在的页面框不存在，已去掉' : '一条草图笔迹或文字所在的页面框不存在，已去掉');
       cards.splice(index, 1);
     }
   }
@@ -723,6 +761,25 @@ function parsePageCard(value: Record<string, unknown>): PageCard | null {
     baseCardId: typeof value.baseCardId === 'string' ? value.baseCardId : null,
     wireframePromptId: typeof value.wireframePromptId === 'string' ? value.wireframePromptId : null,
     sketchHidden: value.sketchHidden === true,
+    exportIncludeBase: value.exportIncludeBase === true,
+  };
+}
+
+function parseDecorCard(value: Record<string, unknown>): DecorCard | null {
+  if (typeof value.id !== 'string' || typeof value.pageId !== 'string' || !isRect(value)) return null;
+  if (value.width <= 0 || value.height <= 0) return null;
+  const fill = normalizeHex(typeof value.fill === 'string' ? value.fill : '') ?? '#E8E8ED';
+  const cornerRadius = isFiniteNumber(value.cornerRadius) ? Math.max(0, value.cornerRadius) : 12;
+  return {
+    kind: 'decor',
+    id: value.id,
+    x: value.x,
+    y: value.y,
+    width: value.width,
+    height: value.height,
+    pageId: value.pageId,
+    fill,
+    cornerRadius,
   };
 }
 

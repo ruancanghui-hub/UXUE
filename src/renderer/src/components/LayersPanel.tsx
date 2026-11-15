@@ -3,6 +3,7 @@ import {
   currentVersion,
   isBlockCard,
   isBlockCropStale,
+  isDecorCard,
   isGroupCard,
   isSketchMark,
   isSketchTextCard,
@@ -15,6 +16,7 @@ import {
   refDisplayVersion,
   type BlockCard,
   type CanvasCard,
+  type DecorCard,
   type SketchTextCard,
   type RefCard,
   type RegionId,
@@ -32,7 +34,7 @@ interface LayersPanelProps {
   onFocusCard(id: string): void;
 }
 
-type RowKind = 'image' | 'missing' | 'prompt' | 'theme' | 'page' | 'group' | 'ref' | 'block' | 'sketchText';
+type RowKind = 'image' | 'missing' | 'prompt' | 'theme' | 'page' | 'group' | 'ref' | 'block' | 'sketchText' | 'decor';
 
 interface Row {
   id: string;
@@ -47,12 +49,12 @@ interface Row {
 export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, onSelect, onFocusCard }: LayersPanelProps) {
   const groups = useMemo(() => {
     const byId = new Map(state.cards.map((card) => [card.id, card]));
-    const pageChildren = new Map<string, (RefCard | BlockCard | SketchTextCard)[]>();
+    const pageChildren = new Map<string, (RefCard | BlockCard | SketchTextCard | DecorCard)[]>();
     const strokeCounts = new Map<string, number>();
     const groupChildren = new Map<string, CanvasCard[]>();
     for (const card of state.cards) {
       if (isStrokeCard(card)) strokeCounts.set(card.pageId, (strokeCounts.get(card.pageId) ?? 0) + 1);
-      if ((isRefCard(card) || isBlockCard(card) || isSketchTextCard(card)) && card.pageId && byId.has(card.pageId)) {
+      if ((isRefCard(card) || isBlockCard(card) || isSketchTextCard(card) || isDecorCard(card)) && card.pageId && byId.has(card.pageId)) {
         const list = pageChildren.get(card.pageId) ?? [];
         list.unshift(card);
         pageChildren.set(card.pageId, list);
@@ -98,6 +100,7 @@ export function LayersPanel({ state, selectedIds, missingVersionIds, cacheBust, 
       if (isSketchTextCard(card)) {
         return { id: card.id, label: card.text.split('\n')[0] || '（空文字）', kind: 'sketchText', indent };
       }
+      if (isDecorCard(card)) return { id: card.id, label: '页面装饰', kind: 'decor', indent };
       if (isStrokeCard(card)) return { id: card.id, label: '草图笔迹', kind: 'sketchText', indent };
       if (isPageCard(card)) {
         const refs = pageChildren.get(card.id)?.filter(isRefCard).length ?? 0;
