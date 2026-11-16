@@ -49,6 +49,12 @@ import {
 } from '../../../shared/project';
 import { isImageCardStale, regenPromptIdsForSelection } from '../../../shared/stale';
 import { UI_FEELINGS, feelingSuffix, toggleFeeling, type UiFeelingId } from '../../../shared/uiFeelings';
+import {
+  ALIGN_LABELS,
+  alignableFromSelection,
+  canAlign,
+  type AlignAction,
+} from '../document/alignDistribute';
 import type { DocumentStore } from '../document/DocumentStore';
 import {
   blockHasOutput,
@@ -92,6 +98,7 @@ interface InspectorProps {
   onDuplicate(): void;
   onDelete(): void;
   onBringToFront(): void;
+  onAlign(action: AlignAction): void;
   onReveal(path: string): void;
   onGenerate(promptId: string): void;
   onRemoveInput(promptId: string, index: number): void;
@@ -198,6 +205,7 @@ export const Inspector = forwardRef<InspectorHandle, InspectorProps>(function In
       {selected.length > 1 && (
         <section className="inspector-section">
           <div className="panel-title">已选 {selected.length} 个对象</div>
+          <AlignToolbar selectedIds={props.selectedIds} cards={props.state.cards} onAlign={props.onAlign} />
           {selected.every(isImageCard) && <button onClick={props.onNewPrompt}>用这些图新建提示词卡（P）</button>}
           {regenPromptIdsForSelection(props.state, props.selectedIds).length > 0 && (
             <button onClick={() => props.onRegenDownstream(regenPromptIdsForSelection(props.state, props.selectedIds))}>
@@ -221,6 +229,77 @@ function CardActions({ onDuplicate, onBringToFront, onDelete }: InspectorProps) 
       </button>
     </div>
   );
+}
+
+const ALIGN_ROW: AlignAction[] = ['left', 'centerX', 'right', 'top', 'centerY', 'bottom'];
+const DISTRIBUTE_ROW: AlignAction[] = ['distributeX', 'distributeY'];
+
+function AlignToolbar({
+  selectedIds,
+  cards,
+  onAlign,
+}: {
+  selectedIds: ReadonlySet<string>;
+  cards: DocState['cards'];
+  onAlign(action: AlignAction): void;
+}) {
+  const eligible = alignableFromSelection(cards, selectedIds).length;
+  return (
+    <div className="align-toolbar">
+      <div className="align-row" role="group" aria-label="对齐">
+        {ALIGN_ROW.map((action) => (
+          <button
+            key={action}
+            type="button"
+            className="align-btn"
+            disabled={!canAlign(eligible, action)}
+            title={ALIGN_LABELS[action]}
+            onClick={() => onAlign(action)}
+          >
+            {alignGlyph(action)}
+          </button>
+        ))}
+      </div>
+      <div className="align-row" role="group" aria-label="均分">
+        {DISTRIBUTE_ROW.map((action) => (
+          <button
+            key={action}
+            type="button"
+            className="align-btn"
+            disabled={!canAlign(eligible, action)}
+            title={ALIGN_LABELS[action]}
+            onClick={() => onAlign(action)}
+          >
+            {alignGlyph(action)}
+          </button>
+        ))}
+      </div>
+      {eligible < selectedIds.size && (
+        <p className="hint">已忽略页面框 / 分组 / 笔迹（{eligible} 个可排齐）</p>
+      )}
+    </div>
+  );
+}
+
+function alignGlyph(action: AlignAction): string {
+  switch (action) {
+    case 'left':
+      return '左';
+    case 'centerX':
+      return '水平中';
+    case 'right':
+      return '右';
+    case 'top':
+      return '上';
+    case 'centerY':
+      return '垂直中';
+    case 'bottom':
+      return '下';
+    case 'distributeX':
+      return '横均分';
+    case 'distributeY':
+      return '竖均分';
+  }
 }
 
 function ProjectInfo({ state, projectName, projectDir, onReveal, onCreatePromptFromTemplate }: InspectorProps) {

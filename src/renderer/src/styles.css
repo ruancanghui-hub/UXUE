@@ -760,6 +760,29 @@ button.small {
   padding-top: 12px;
 }
 
+.align-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+
+.align-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.align-btn {
+  min-width: 40px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.align-btn:disabled {
+  opacity: 0.35;
+}
+
 button.danger {
   color: var(--bad);
 }

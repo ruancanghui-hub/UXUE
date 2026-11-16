@@ -86,6 +86,14 @@ const PALETTE_COMMANDS: PaletteCommand[] = [
   { id: 'exportPage', label: '导出选中的页面', hint: '⌘⇧E' },
   { id: 'groupSelection', label: '编组', hint: '⌘G' },
   { id: 'ungroupSelection', label: '解组', hint: '⌘⇧G' },
+  { id: 'alignLeft', label: '左对齐' },
+  { id: 'alignCenterX', label: '水平居中对齐' },
+  { id: 'alignRight', label: '右对齐' },
+  { id: 'alignTop', label: '上对齐' },
+  { id: 'alignCenterY', label: '垂直居中对齐' },
+  { id: 'alignBottom', label: '下对齐' },
+  { id: 'distributeX', label: '水平均分间距' },
+  { id: 'distributeY', label: '垂直均分间距' },
   { id: 'newPrompt', label: '新建提示词卡', hint: 'P' },
   { id: 'selectAll', label: '全选', hint: '⌘A' },
   { id: 'duplicate', label: '创建副本', hint: '⌘D' },
@@ -575,6 +583,30 @@ export function ProjectApp() {
         case 'ungroupSelection':
           if (!typing) canvas.ungroupSelection();
           break;
+        case 'alignLeft':
+          if (!typing) canvas.alignSelection('left');
+          break;
+        case 'alignCenterX':
+          if (!typing) canvas.alignSelection('centerX');
+          break;
+        case 'alignRight':
+          if (!typing) canvas.alignSelection('right');
+          break;
+        case 'alignTop':
+          if (!typing) canvas.alignSelection('top');
+          break;
+        case 'alignCenterY':
+          if (!typing) canvas.alignSelection('centerY');
+          break;
+        case 'alignBottom':
+          if (!typing) canvas.alignSelection('bottom');
+          break;
+        case 'distributeX':
+          if (!typing) canvas.alignSelection('distributeX');
+          break;
+        case 'distributeY':
+          if (!typing) canvas.alignSelection('distributeY');
+          break;
         case 'bringToFront':
           canvas.reorderSelection('front');
           break;
@@ -1037,6 +1069,7 @@ const RightPanel = memo(forwardRef<InspectorHandle, RightPanelProps>(function Ri
       onDuplicate={() => engine.duplicateSelection()}
       onDelete={() => engine.deleteSelection()}
       onBringToFront={() => engine.reorderSelection('front')}
+      onAlign={(action) => engine.alignSelection(action)}
       onReveal={(path) => window.anye.revealInFinder(path)}
       onGenerate={onGenerate}
       onRegenDownstream={onRegenDownstream}

@@ -36,6 +36,7 @@ import {
 } from '../../../shared/project';
 import { texturedImage } from '../../../shared/textures';
 import { DocumentStore, type DocChange } from '../document/DocumentStore';
+import { ALIGN_LABELS, alignCards, type AlignAction } from '../document/alignDistribute';
 import {
   addPromptInput,
   blockHasOutput,
@@ -462,6 +463,13 @@ export class CanvasEngine {
   nudgeSelection(dx: number, dy: number): void {
     if (this.selection.size === 0) return;
     this.doc.apply('微调位置', moveCards(this.doc.get(), this.selectedOrigins(true), dx, dy));
+  }
+
+  /** 多选排齐：对齐或均分间距 */
+  alignSelection(action: AlignAction): void {
+    const next = alignCards(this.doc.get(), this.selection.get(), action);
+    if (!next) return;
+    this.doc.apply(ALIGN_LABELS[action], next);
   }
 
   selectAll(): void {

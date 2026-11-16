@@ -467,6 +467,12 @@ ADR-0009：页面内固定带为区块 → 草图 → 可叠层栈；装饰与�
 
 **验收**：`viewReveal.test.ts`、`minimapLayout.test.ts`；`npm test` / `typecheck` 通过。
 
+### 多选排齐 ✅
+
+规格见 `docs/specs/multi-align.md`。多选对象可相对选区包围盒做六向对齐，以及水平/垂直均分外边缘间隙；忽略页面框/分组/笔迹。属性面板 + ⌘K；每动一条撤销。
+
+**验收**：`alignDistribute.test.ts`；`npm test` / `typecheck` 通过。
+
 ### 助手会话区 UI ✅
 
 规格见 `docs/specs/assistant-chat-ui.md`。助手栏默认约 420px（可拖 320–560，本机记住），属性仍 272；Cursor/Codex 风布局（列表吃满、底栏大输入、建议芯片）；助手消息基础 Markdown；上翻不抢滚、「跳到最新」。不改助手能力。
